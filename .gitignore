@@ -29,3 +29,6 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# Tooling / scan artifacts (stray local state, never committed)
+.semgrep/
