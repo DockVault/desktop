@@ -15,9 +15,9 @@ test('normalizeServer accepts an https remote and derives the wss origin', () =>
 });
 
 test('normalizeServer allows http only for loopback', () => {
-  const r = normalizeServer('http://localhost:8295');
-  assert.strictEqual(r.origin, 'http://localhost:8295');
-  assert.strictEqual(r.wssOrigin, 'ws://localhost:8295');
+  const r = normalizeServer('http://localhost:7777');
+  assert.strictEqual(r.origin, 'http://localhost:7777');
+  assert.strictEqual(r.wssOrigin, 'ws://localhost:7777');
   assert.strictEqual(r.isLoopback, true);
   assert.throws(() => normalizeServer('http://vault.example.com'), /https/);
 });
@@ -40,9 +40,9 @@ test('write/read round-trips a normalized origin in a temp userData dir', () => 
 test('the DOCKVAULT_SERVER env override wins over stored config', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dv-cfg-'));
   writeServerOrigin(dir, 'https://stored.example.com');
-  process.env.DOCKVAULT_SERVER = 'http://localhost:8295';
+  process.env.DOCKVAULT_SERVER = 'http://localhost:7777';
   try {
-    assert.strictEqual(readServerOrigin(dir), 'http://localhost:8295');
+    assert.strictEqual(readServerOrigin(dir), 'http://localhost:7777');
   } finally {
     delete process.env.DOCKVAULT_SERVER;
     fs.rmSync(dir, { recursive: true, force: true });

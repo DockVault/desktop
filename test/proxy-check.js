@@ -5,7 +5,7 @@
  * forwards the reused UI's API calls to the configured server over the custom scheme, against a
  * live instance. Reuses the real scheme + proxy + server-config modules.
  *
- *   DOCKVAULT_SERVER=http://localhost:8295 node_modules/electron/dist/electron.exe test/proxy-check.js
+ *   DOCKVAULT_SERVER=http://localhost:PORT node_modules/electron/dist/electron.exe test/proxy-check.js
  *
  * Asserts: the UI loads over the scheme; a same-origin fetch of a public endpoint returns the
  * server's real JSON THROUGH the proxy (proving forwarding works); the UI's main script ran; and it

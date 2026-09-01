@@ -6,7 +6,7 @@
  * central question for the session layer — does verbatim-UI auth survive serving the UI from the
  * shell's own origin.
  *
- *   DOCKVAULT_SERVER=http://localhost:8295 DV_USER=<u> DV_PASS=<p> \
+ *   DOCKVAULT_SERVER=http://localhost:PORT DV_USER=<u> DV_PASS=<p> \
  *     node_modules/electron/dist/electron.exe test/login-check.js
  *
  * Credentials are read from the environment in the main process and injected into the renderer for
