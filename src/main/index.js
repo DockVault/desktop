@@ -391,28 +391,10 @@ function mustActBody(item) {
 
 function storedConfig() { return syncConfigStore.loadConfig(safeStorage, app.getPath('userData')); }
 
-// A minimal main-side JSON GET matching the injected-fetch contract the sync modules expect. Used
-// only to list the account's vaults over the account session; never carries or returns a credential.
-// A request timeout and a response-size cap keep a hung or oversized server from hanging the tray flow.
-function mainHttpJson(url, headers) {
-  const mod = url.startsWith('https:') ? require('node:https') : require('node:http');
-  const TIMEOUT_MS = 15000;
-  const MAX_BYTES = 5 * 1024 * 1024;
-  return new Promise((resolve, reject) => {
-    const req = mod.request(url, { method: 'GET', headers }, (res) => {
-      let s = ''; let bytes = 0; let capped = false;
-      res.on('data', (c) => {
-        bytes += c.length;
-        if (bytes > MAX_BYTES) { capped = true; req.destroy(new Error('response too large')); return; }
-        s += c;
-      });
-      res.on('end', () => { if (!capped) resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, json: async () => JSON.parse(s || 'null') }); });
-    });
-    req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error('request timed out')));
-    req.on('error', reject);
-    req.end();
-  });
-}
+// The account-session vault list is fetched through the shared JSON GET, which conforms to the
+// injected-fetch (url, init) contract the sync modules call with — so the Authorization header they set
+// in init.headers is actually sent. Used only to list the account's vaults; never carries a credential.
+const mainHttpJson = require('./http-json').httpJson;
 
 // Re-resolve the account session at the moment a flow needs it — never the boot-time snapshot, which
 // goes stale (a first-run user who just signed in would otherwise get a false "not signed in" until a
