@@ -34,6 +34,7 @@ const { APP_ORIGIN } = require('./config');
 const schemeMod = require('./scheme');
 const { buildCsp } = require('./csp');
 const selftest = require('./selftest');
+const serverConfig = require('./server-config');
 
 const STATIC_ROOT = path.resolve(__dirname, '..', '..', 'vendor', 'vault', 'static');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'index.js');
@@ -84,7 +85,7 @@ async function boot() {
   hardenSession(session.defaultSession);
   bootSelfTest = await selftest.runInMain();
   status.mainSelfTest = bootSelfTest;
-  schemeMod.installHandler(STATIC_ROOT, buildCsp());
+  schemeMod.installHandler(STATIC_ROOT, buildCsp(), () => serverConfig.readServerOrigin(app.getPath('userData')));
   registerIpc();
   setupTray();
   await showOrCreateWindow();

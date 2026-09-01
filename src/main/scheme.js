@@ -1,22 +1,24 @@
 'use strict';
 
 /*
- * The custom privileged secure scheme that serves the reused web UI.
+ * The custom privileged secure scheme that serves the reused web UI and forwards its API calls.
  *
  * registerPrivileged() must run before the app 'ready' event (an Electron requirement).
- * installHandler() wires the responder afterwards. The responder:
- *   - serves the bundled UI from the pinned vendored tree,
- *   - injects the shell's own tightened policy header on the HTML document,
- *   - contains itself to the static root (no path traversal),
- *   - returns clean 404s for anything else. Proxying the UI's API/auth calls to the configured
- *     server is added with the session layer; until then those calls fail as network errors, which
- *     is the expected state for a shell that only has to prove it can load and gate the UI.
+ * installHandler() wires the responder afterwards. The responder routes by path:
+ *   - asset paths ('/', '/index.html', '/static/...') are served from the pinned vendored tree,
+ *     contained to the static root (no path traversal), with the shell's own tightened policy header
+ *     injected on the HTML document;
+ *   - every other path is forwarded to the configured server through the transparent proxy (the UI
+ *     computes its API base from its own origin, so its API/auth calls arrive here). With no server
+ *     configured yet, those paths return a clean 404.
+ * Asset serving and forwarding are kept strictly separate, and neither path handles deep links.
  */
 
-const { protocol } = require('electron');
+const { protocol, net } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { APP_SCHEME } = require('./config');
+const proxy = require('./proxy');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -27,6 +29,8 @@ const MIME = {
   '.map': 'application/json; charset=utf-8', '.txt': 'text/plain; charset=utf-8',
 };
 function contentType(p) { return MIME[path.extname(p).toLowerCase()] || 'application/octet-stream'; }
+
+function isAssetPath(p) { return p === '/' || p === '/index.html' || p.startsWith('/static/'); }
 
 function registerPrivileged() {
   protocol.registerSchemesAsPrivileged([{
@@ -44,8 +48,9 @@ function registerPrivileged() {
 /**
  * @param {string} staticRoot absolute path to the bundled web-UI root
  * @param {string} cspHeader  the policy string from buildCsp()
+ * @param {() => (string|null)} [resolveServerOrigin] returns the configured server origin, or null
  */
-function installHandler(staticRoot, cspHeader) {
+function installHandler(staticRoot, cspHeader, resolveServerOrigin) {
   const ROOT = path.resolve(staticRoot);
 
   function resolveFile(urlPath) {
@@ -57,13 +62,8 @@ function installHandler(staticRoot, cspHeader) {
     return file;
   }
 
-  protocol.handle(APP_SCHEME, (request) => {
-    let file;
-    try {
-      file = resolveFile(new URL(request.url).pathname);
-    } catch {
-      return new Response('bad request', { status: 400 });
-    }
+  function serveAsset(pathname) {
+    const file = resolveFile(pathname);
     if (!file || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
       return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } });
     }
@@ -72,7 +72,21 @@ function installHandler(staticRoot, cspHeader) {
     // The shell owns the policy for the UI document (the bundled UI ships none of its own).
     if (type.startsWith('text/html')) headers['Content-Security-Policy'] = cspHeader;
     return new Response(fs.readFileSync(file), { headers });
+  }
+
+  protocol.handle(APP_SCHEME, (request) => {
+    let pathname;
+    try {
+      pathname = new URL(request.url).pathname;
+    } catch {
+      return new Response('bad request', { status: 400 });
+    }
+    if (isAssetPath(pathname)) return serveAsset(pathname);
+
+    const origin = resolveServerOrigin ? resolveServerOrigin() : null;
+    if (origin) return proxy.proxyRequest(request, origin, net);
+    return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } });
   });
 }
 
-module.exports = { registerPrivileged, installHandler, contentType };
+module.exports = { registerPrivileged, installHandler, contentType, isAssetPath };
