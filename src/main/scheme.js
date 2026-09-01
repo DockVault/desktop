@@ -49,8 +49,11 @@ function registerPrivileged() {
  * @param {string} staticRoot absolute path to the bundled web-UI root
  * @param {string} cspHeader  the policy string from buildCsp()
  * @param {() => (string|null)} [resolveServerOrigin] returns the configured server origin, or null
+ * @param {Electron.Session} [ses] register on this session's protocol (e.g. the in-memory UI
+ *   partition); defaults to the app-level protocol (the default session)
  */
-function installHandler(staticRoot, cspHeader, resolveServerOrigin) {
+function installHandler(staticRoot, cspHeader, resolveServerOrigin, ses) {
+  const target = (ses && ses.protocol) ? ses.protocol : protocol;
   const ROOT = path.resolve(staticRoot);
 
   function resolveFile(urlPath) {
@@ -74,7 +77,7 @@ function installHandler(staticRoot, cspHeader, resolveServerOrigin) {
     return new Response(fs.readFileSync(file), { headers });
   }
 
-  protocol.handle(APP_SCHEME, (request) => {
+  target.handle(APP_SCHEME, (request) => {
     let pathname;
     try {
       pathname = new URL(request.url).pathname;

@@ -41,6 +41,12 @@ const PRELOAD = path.join(__dirname, '..', 'preload', 'index.js');
 const FAIL_HTML = path.join(__dirname, '..', 'renderer', 'selftest-fail.html');
 const TRAY_ICON = path.join(STATIC_ROOT, 'assets', 'logo-small.png');
 const SMOKE = process.env.DOCKVAULT_SMOKE === '1';
+// A NON-persistent (in-memory) partition, held by the main process for the app's lifetime: the UI's
+// web storage never touches disk (so the account bearer the UI keeps in localStorage is never at
+// rest on disk), yet it survives window destroy -> recreate on close-to-tray, resetting only on a
+// full quit/relaunch. Durable session persistence is handled separately by the encrypted store.
+const UI_PARTITION = 'dockvault-ui';
+let uiSession = null;
 
 let mainWindow = null;
 let tray = null;
@@ -82,10 +88,12 @@ function writeState(patch) {
 
 // ---------------------------------------------------------------------------------------------
 async function boot() {
-  hardenSession(session.defaultSession);
+  uiSession = session.fromPartition(UI_PARTITION); // in-memory; created once, reused by every window
+  hardenSession(uiSession);
   bootSelfTest = await selftest.runInMain();
   status.mainSelfTest = bootSelfTest;
-  schemeMod.installHandler(STATIC_ROOT, buildCsp(), () => serverConfig.readServerOrigin(app.getPath('userData')));
+  schemeMod.installHandler(STATIC_ROOT, buildCsp(),
+    () => serverConfig.readServerOrigin(app.getPath('userData')), uiSession);
   registerIpc();
   setupTray();
   await showOrCreateWindow();
@@ -152,6 +160,7 @@ async function showOrCreateWindow() {
     show: false,
     backgroundColor: '#0a0f18',
     webPreferences: {
+      partition: UI_PARTITION,
       preload: PRELOAD,
       contextIsolation: true,
       sandbox: true,
