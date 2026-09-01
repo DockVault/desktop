@@ -72,15 +72,21 @@ class RcloneRunner {
 
   // The single spawn chokepoint. NOTHING spawns rclone unless the binary's checksum has been verified
   // (so a tampered binary is never run), and no forbidden flag/subcommand (--force, any rc server) reaches it.
-  _launch(args, { timeoutMs = 30000, onLine } = {}) {
+  _launch(args, { timeoutMs = 30000, onLine, input, config } = {}) {
     if (!this._binaryVerified) return Promise.reject(new Error('rclone binary not verified; call ready() first'));
     const bad = forbiddenIn(args);
     if (bad) return Promise.reject(new Error(`refusing to run rclone with ${bad}`));
-    const full = [...(args || []), '--config', ''];
+    // `--config` points at the per-run ephemeral config when a path is given (a sync run using the
+    // temp-cred remote), else the empty string so no rclone.conf is read or written.
+    const full = [...(args || []), '--config', config != null ? config : ''];
     return new Promise((resolve, reject) => {
       let child;
-      try { child = this._spawn(this.bin, full, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); }
+      // `input`, when given, is written to the child's stdin (an in-memory pipe) — used to hand a
+      // secret to rclone WITHOUT placing it on argv or in the environment.
+      const stdin = input != null ? 'pipe' : 'ignore';
+      try { child = this._spawn(this.bin, full, { stdio: [stdin, 'pipe', 'pipe'], windowsHide: true }); }
       catch (e) { return reject(e); }
+      if (input != null && child.stdin) { try { child.stdin.end(input); } catch { /* child gone */ } }
       let stdout = '';
       let stderr = '';
       let done = false;
@@ -99,6 +105,17 @@ class RcloneRunner {
   run(args, opts) {
     if (!this._verified) return Promise.reject(new Error('rclone not verified; call ready() first'));
     return this._launch(args, opts);
+  }
+
+  // Encode a password into rclone's "obscure" config form. The plaintext is fed on STDIN (an in-memory
+  // pipe), NEVER on argv, so it is not exposed in the process table. Note: obscure is REVERSIBLE
+  // obfuscation, not encryption — this is a config-FORMAT step only; the credential's protection comes
+  // from its short-lived scope and the 0600 ephemeral file, never from being "obscured".
+  async obscure(plaintext) {
+    const { code, stdout } = await this.run(['obscure', '-'], { input: String(plaintext), timeoutMs: 10000 });
+    const out = (stdout || '').trim();
+    if (code !== 0 || !out) throw new Error('rclone obscure failed');
+    return out;
   }
 
   // The version probe runs during ready() (after the checksum gate, before full readiness), so it uses

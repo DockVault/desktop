@@ -27,6 +27,16 @@ function readyRunner(stdout, code, rec = {}) {
   r._binaryVerified = true; r._verified = true;
   return r;
 }
+// A fake child that also captures anything written to stdin.
+function fakeChildWithStdin(stdout, code, rec) {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.stdin = { end: (d) => { rec.stdin = String(d); } };
+  child.kill = () => {};
+  setImmediate(() => { if (stdout) child.stdout.emit('data', Buffer.from(stdout)); child.emit('exit', code); });
+  return child;
+}
 
 test('run() appends --config "" (no rclone.conf) and never starts a server', async () => {
   const rec = {};
@@ -64,6 +74,19 @@ test('run() refuses rc-server flags and the rcd/serve subcommands (no listener, 
   await assert.rejects(() => r.run(['lsd', 'r:', '--rc-web-gui']), /refusing to run rclone with --rc-web-gui/);
 });
 
+test('run() uses an ephemeral --config path when given, else the empty (no-conf) form', async () => {
+  const rec = {};
+  const r = readyRunner('', 0, rec);
+  await r.run(['lsd', 'vault:'], { config: '/run/dir/sync-abc.conf' });
+  const ci = rec.args.indexOf('--config');
+  assert.strictEqual(rec.args[ci + 1], '/run/dir/sync-abc.conf', 'the per-run config path is passed');
+  const rec2 = {};
+  const r2 = readyRunner('', 0, rec2);
+  await r2.run(['version']);
+  const ci2 = rec2.args.indexOf('--config');
+  assert.strictEqual(rec2.args[ci2 + 1], '', 'no config path -> empty (no rclone.conf)');
+});
+
 test('run() resolves the child exit code + captured stdout', async () => {
   const r = readyRunner('hello\n', 0);
   const out = await r.run(['version']);
@@ -87,6 +110,17 @@ test('verifyBinary() passes + marks verified on a matching SHA-256, and FAILS CL
   const bad = new RcloneRunner({ rcloneBin: '/pinned/rclone', expectSha256: 'deadbeef', readFileFn: () => bytes });
   assert.throws(() => bad.verifyBinary(), /checksum mismatch/);
   assert.strictEqual(bad._binaryVerified, false, 'a mismatch leaves the binary unverified');
+});
+
+test('obscure() feeds the plaintext on STDIN (never argv) and returns the obscured form', async () => {
+  const rec = {};
+  const r = new RcloneRunner({ rcloneBin: '/pinned/rclone', spawnFn: (bin, args) => { rec.args = args; return fakeChildWithStdin('OBSCURED_abc\n', 0, rec); } });
+  r._binaryVerified = true; r._verified = true;
+  const out = await r.obscure('secretpass123');
+  assert.strictEqual(out, 'OBSCURED_abc', 'returns the trimmed obscured value');
+  assert.strictEqual(rec.stdin, 'secretpass123', 'the plaintext is written to stdin');
+  assert.ok(rec.args.includes('obscure') && rec.args.includes('-'), 'invokes `obscure -`');
+  assert.ok(!rec.args.includes('secretpass123'), 'the plaintext is NEVER on argv');
 });
 
 test('ready() fails closed on a version mismatch, and on success enables run()', async () => {

@@ -50,6 +50,13 @@ app.whenReady().then(async () => {
   out.rcloneConfigured = !!(rc && rc.bin);
   out.syncStatus = await mgr.syncStatus(12000);
 
+  // Hand the daemon a (fake) per-run SFTP cred over the PRIVATE channel; it obscures the password JIT
+  // and prepares the config in memory, acking readiness only (never echoing the cred/config).
+  out.sftpCredAck = rc
+    ? await mgr.sendSftpCred({ host: 'h.invalid', port: 2222, user: 'tc_test', password: 'fake-temp-pass', hostKeys: 'ssh-ed25519 AAAATESTKEY' }, 12000)
+    : { ok: true, error: null };
+  out.credAckLeaksNothing = !JSON.stringify(out.sftpCredAck || {}).includes('fake-temp-pass');
+
   const dbFile = path.join(dir, 'state.db');
   out.dbExists = fs.existsSync(dbFile);
   if (out.dbExists) {
@@ -64,9 +71,10 @@ app.whenReady().then(async () => {
   // If rclone is available on this machine, the daemon must verify it and report the version; if it is
   // not installed, sync being unconfigured is acceptable (not a failure of the daemon itself).
   const syncOk = out.rcloneConfigured ? !!(out.syncStatus && out.syncStatus.ok && out.syncStatus.version) : true;
+  const credOk = out.rcloneConfigured ? !!(out.sftpCredAck && out.sftpCredAck.ok && out.credAckLeaksNothing) : true;
 
   out.ok = !!(out.ready && out.ready.type === 'ready' && out.ready.encrypted === true
-    && out.pong === true && out.zkLockAck === true && syncOk && out.dbExists && out.dbEncrypted && dbkExists);
+    && out.pong === true && out.zkLockAck === true && syncOk && credOk && out.dbExists && out.dbEncrypted && dbkExists);
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
   clearTimeout(watchdog);
   dump();

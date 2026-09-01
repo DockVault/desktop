@@ -36,6 +36,8 @@ class DaemonManager {
     this._lockPending = new Map(); // zk-lock id -> resolve
     this._statusSeq = 0;
     this._statusPending = new Map(); // sync-status id -> { resolve, timer }
+    this._credSeq = 0;
+    this._credPending = new Map(); // sftp-cred id -> { resolve, timer }
   }
 
   start() { if (!this.child) this._spawn(); return this; }
@@ -70,6 +72,11 @@ class DaemonManager {
         if (e) { this._statusPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, version: m.version || null, error: m.error || null }); }
         break;
       }
+      case 'sftp-cred-ack': {
+        const e = this._credPending.get(m.id);
+        if (e) { this._credPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, error: m.error || null }); }
+        break;
+      }
       case 'error': this._emit('error', m); break;
       default: break;
     }
@@ -99,6 +106,8 @@ class DaemonManager {
     // A dead daemon can't answer a status request — resolve any in-flight one as not-ok, never hang.
     for (const e of this._statusPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, version: null, error: 'daemon exited' }); }
     this._statusPending.clear();
+    for (const e of this._credPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, error: 'daemon exited' }); }
+    this._credPending.clear();
     if (this.stopping) { this.status = 'stopped'; return; }
     this.status = 'crashed';
     const backoff = Math.min(MAX_BACKOFF_MS, 500 * 2 ** this.restarts);
@@ -154,6 +163,24 @@ class DaemonManager {
       this._statusPending.set(id, { resolve, timer });
       try { this.child.postMessage({ type: 'sync-status', id }); }
       catch { this._statusPending.delete(id); clearTimeout(timer); return resolve({ ok: false, version: null, error: 'send failed' }); }
+    });
+  }
+
+  /**
+   * Hand the daemon a per-run scoped SFTP credential bundle over the PRIVATE parent<->child channel
+   * (in-memory, like the DB key) — never disk, argv, or environment. The daemon obscures the password
+   * just-in-time and holds only the prepared config; the ack reports readiness, never the credential.
+   * Resolves { ok, error } — ok=false when unconfigured, dead, prepare failed, or the request timed out.
+   */
+  sendSftpCred(bundle, timeoutMs = 12000) {
+    return new Promise((resolve) => {
+      if (!this.child) return resolve({ ok: false, error: 'no daemon' });
+      const id = ++this._credSeq;
+      const timer = setTimeout(() => { if (this._credPending.delete(id)) resolve({ ok: false, error: 'timeout' }); }, timeoutMs);
+      if (timer.unref) timer.unref();
+      this._credPending.set(id, { resolve, timer });
+      try { this.child.postMessage({ type: 'sftp-cred', id, bundle }); }
+      catch { this._credPending.delete(id); clearTimeout(timer); return resolve({ ok: false, error: 'send failed' }); }
     });
   }
 
