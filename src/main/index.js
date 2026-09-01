@@ -120,6 +120,13 @@ function resolveRcloneConfig() {
 
 // ---------------------------------------------------------------------------------------------
 async function boot() {
+  // Verify the crypto primitives FIRST — before the session partition, safeStorage, or any vault
+  // content is touched. The self-test is meant to run before any vault content, and running it first
+  // also keeps its async WebCrypto known-answer test on a pristine crypto error state (an earlier
+  // safeStorage / OSCrypt initialisation can otherwise leave the shared error queue dirty for it).
+  bootSelfTest = await selftest.runInMain();
+  status.mainSelfTest = bootSelfTest;
+
   uiSession = session.fromPartition(UI_PARTITION); // in-memory; created once, reused by every window
   hardenSession(uiSession);
   // Restore the account session from the encrypted store (null on a non-secure keychain or none):
@@ -129,8 +136,6 @@ async function boot() {
   // session (the in-memory partition already survives close-to-tray within a run).
   captureTimer = setInterval(() => { void captureSession(); }, 30000);
   if (captureTimer.unref) captureTimer.unref();
-  bootSelfTest = await selftest.runInMain();
-  status.mainSelfTest = bootSelfTest;
   // OS key-protection posture. With no real secret store (Mode C: Linux 'basic_text' or no keychain)
   // the app still runs in a memory-only degraded mode — only at-rest persistence and the background
   // daemon are withheld (the session store and DB key already fail closed there). Hardware backing
