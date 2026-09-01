@@ -49,3 +49,23 @@ test('an upstream transport failure surfaces as a 502, not a crash', async () =>
   const res = await proxyRequest({ url: 'dockvault://app/x', method: 'GET', headers: new Headers() }, 'https://v.example', fakeNet);
   assert.strictEqual(res.status, 502);
 });
+
+// The host is fixed by the configured origin; a hostile renderer-supplied path must never reach a
+// different host. The string concatenation (origin + pathname + search) is the secure form — a
+// pathname always begins with '/', so the authority is closed and nothing in the path can reach the
+// host. (Do NOT refactor to new URL(pathname, origin): '//evil.com/x' would resolve to evil.com.)
+test('buildTargetUrl cannot be steered off the configured host by a hostile path', () => {
+  for (const u of ['dockvault://app//evil.com/x', 'dockvault://app/@evil.com/x',
+                   'dockvault://app/%2f%2fevil.com/x', 'dockvault://app/x?next=//evil.com']) {
+    assert.strictEqual(new URL(buildTargetUrl(u, 'https://vault.example.com')).host, 'vault.example.com');
+  }
+});
+
+// A cross-origin redirect from the server must not be auto-followed by the proxy (that would be an
+// SSRF the renderer never sees). 'manual' keeps net.fetch from chasing it.
+test('proxyRequest does not auto-follow redirects (anti-SSRF)', async () => {
+  let seen;
+  const fakeNet = { fetch: async (_t, init) => { seen = init; return new Response('', { status: 200 }); } };
+  await proxyRequest({ url: 'dockvault://app/x', method: 'GET', headers: new Headers() }, 'https://v.example', fakeNet);
+  assert.strictEqual(seen.redirect, 'manual');
+});
