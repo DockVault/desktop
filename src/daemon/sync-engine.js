@@ -25,6 +25,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { getRunState, recordRun } = require('../main/state-db');
+const { classifyBisyncOutcome } = require('./bisync-outcome');
 
 // The excessive-delete guard: bisync aborts the run if more than this percentage of files on either side
 // would be deleted. (bisync interprets --max-delete as a PERCENTAGE, unlike plain `sync`, where it is a
@@ -33,6 +34,12 @@ const { getRunState, recordRun } = require('../main/state-db');
 // it. Tuning it, if ever warranted, is a deliberate edit here, not a runtime option: the guard is
 // structural, not defaultal.
 const MAX_DELETE_PERCENT = 50;
+// The vault issues short-TTL, per-run scoped SFTP credentials and fail-closes an auth throttle, so a
+// credential admits only a single concurrent SSH connection — bisync's default parallelism opens several
+// at once and the extras are refused. Pin the transfer and check concurrency to one connection: robust
+// against that limit and gentle on the server. It can be revisited upward only if throughput proves
+// inadequate AND a higher concurrent-connection budget is confirmed.
+const SFTP_CONNECTIONS = 1;
 // bisync can legitimately run long over SFTP; bound it generously rather than leaving it unbounded.
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -53,7 +60,10 @@ function bisyncWorkdir(runDir, vault) {
  */
 function buildBisyncArgs({ local, remote, workdir, resync = false }) {
   if (!local || !remote || !workdir) throw new Error('bisync needs local, remote, and workdir');
-  const args = ['bisync', String(local), String(remote), '--workdir', String(workdir), '--max-delete', String(MAX_DELETE_PERCENT)];
+  const args = ['bisync', String(local), String(remote),
+    '--workdir', String(workdir),
+    '--max-delete', String(MAX_DELETE_PERCENT),
+    '--transfers', String(SFTP_CONNECTIONS), '--checkers', String(SFTP_CONNECTIONS)];
   if (resync) args.push('--resync'); // only ever on an explicit, user-initiated resync
   return args;
 }
@@ -74,7 +84,7 @@ function buildBisyncArgs({ local, remote, workdir, resync = false }) {
  * @param {boolean} [o.resync] request a resync (the only thing that satisfies the blocked gate)
  * @param {() => number} [o.now]           injectable clock for the recorded timestamp
  * @param {number} [o.timeoutMs]
- * @returns {Promise<{ran:boolean, code?:number, result:string, resyncRequired:boolean, stdout?:string, stderr?:string}>}
+ * @returns {Promise<{ran:boolean, code?:number, result:string, resyncRequired:boolean, needsAttention?:boolean, stdout?:string, stderr?:string}>}
  */
 async function runBisync(o) {
   const now = o.now || (() => Date.now());
@@ -83,22 +93,21 @@ async function runBisync(o) {
   // Fail-closed gate: never run a normal, delete-capable bisync while a resync is required. The caller
   // must surface this and let the user initiate the resync deliberately (nothing auto-resyncs here).
   if (state.resyncRequired && !o.resync) {
-    return { ran: false, result: 'blocked-needs-resync', resyncRequired: true, stdout: '', stderr: '' };
+    return { ran: false, result: 'blocked-needs-resync', resyncRequired: true, needsAttention: true, stdout: '', stderr: '' };
   }
 
   fs.mkdirSync(o.workdir, { recursive: true });
   const args = buildBisyncArgs({ local: o.local, remote: o.remote, workdir: o.workdir, resync: !!o.resync });
   const { code, stdout, stderr } = await o.runner.run(args, { config: o.config, timeoutMs: o.timeoutMs || DEFAULT_TIMEOUT_MS });
 
-  const ok = code === 0;
-  // s1 coarse outcome: a clean run clears the resync block; a non-clean run leaves the block as it was
-  // (a normal run that errored had no block to begin with, so it simply retries next time). The
-  // excessive-delete safety abort — which must SET the block regardless — is classified in the next
-  // slice; until then a failed run never silently clears the block.
-  const result = ok ? (o.resync ? 'resync-ok' : 'ok') : 'error';
-  const resyncRequired = ok ? false : state.resyncRequired;
-  if (o.db) recordRun(o.db, o.vault, { result, resyncRequired, atUtc: now() });
-  return { ran: true, code, result, resyncRequired, stdout, stderr };
+  // Classify into ONE typed result. A safety abort (excessive delete) and a critical/needs-resync outcome
+  // SET the resync block; a completed run clears it; a connection-level block (host-key mismatch) or a
+  // plain error leaves the prior block untouched (resyncRequired=null => keep the prior value). Nothing
+  // here auto-resyncs or auto-forces — the abort is surfaced, and the server copy is left intact by rclone.
+  const outcome = classifyBisyncOutcome({ code, stdout, stderr, resync: !!o.resync });
+  const resyncRequired = outcome.resyncRequired === null ? state.resyncRequired : outcome.resyncRequired;
+  if (o.db) recordRun(o.db, o.vault, { result: outcome.result, resyncRequired, atUtc: now() });
+  return { ran: true, code, result: outcome.result, resyncRequired, needsAttention: outcome.needsAttention, stdout, stderr };
 }
 
 module.exports = { buildBisyncArgs, runBisync, bisyncWorkdir, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS };

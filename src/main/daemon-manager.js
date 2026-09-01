@@ -83,7 +83,7 @@ class DaemonManager {
         const e = this._syncPending.get(m.id);
         if (e) {
           this._syncPending.delete(m.id); clearTimeout(e.timer);
-          e.resolve({ ok: !!m.ok, ran: !!m.ran, result: m.result || null, resyncRequired: !!m.resyncRequired, code: typeof m.code === 'number' ? m.code : null, error: m.error || null });
+          e.resolve({ ok: !!m.ok, ran: !!m.ran, result: m.result || null, resyncRequired: !!m.resyncRequired, needsAttention: !!m.needsAttention, code: typeof m.code === 'number' ? m.code : null, error: m.error || null });
         }
         break;
       }

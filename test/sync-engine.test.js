@@ -26,6 +26,10 @@ test('buildBisyncArgs bakes in the safety controls and never emits --force/--ign
   assert.ok(!a.includes('--force'), 'never --force');
   assert.ok(!a.includes('--ignore-errors'), 'never --ignore-errors');
   assert.ok(!a.includes('--resync'), 'no resync unless asked');
+  const ti = a.indexOf('--transfers');
+  const ci = a.indexOf('--checkers');
+  assert.ok(ti >= 0 && a[ti + 1] === '1', 'transfers pinned to a single connection');
+  assert.ok(ci >= 0 && a[ci + 1] === '1', 'checkers pinned to a single connection');
 });
 
 test('buildBisyncArgs adds --resync only when requested; the delete guard is fixed + non-defeatable', () => {

@@ -47,8 +47,8 @@ test('runSync() round-trips a summarized bisync outcome (id-correlated), never r
   assert.strictEqual(sent.type, 'sync-run');
   assert.deepStrictEqual(sent.spec, { vault: 'v1', local: 'l', remotePath: 'p', resync: true });
   assert.ok(typeof sent.id === 'number');
-  mgr._onMessage({ type: 'sync-run-result', id: sent.id, ok: true, ran: true, result: 'resync-ok', resyncRequired: false, code: 0 });
-  assert.deepStrictEqual(await p, { ok: true, ran: true, result: 'resync-ok', resyncRequired: false, code: 0, error: null });
+  mgr._onMessage({ type: 'sync-run-result', id: sent.id, ok: true, ran: true, result: 'abort-excessive-delete', resyncRequired: true, needsAttention: true, code: 2 });
+  assert.deepStrictEqual(await p, { ok: true, ran: true, result: 'abort-excessive-delete', resyncRequired: true, needsAttention: true, code: 2, error: null });
 });
 
 test('runSync() resolves not-ok when there is no daemon, or the send fails', async () => {

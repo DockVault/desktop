@@ -20,12 +20,27 @@
 
 const SFTP_PORT = 2222;
 
-// A least-privilege scope granting SFTP read+write on a single vault and nothing else.
+// The file/folder capabilities a bidirectional sync needs on the ONE target vault, and nothing else:
+// list + download + upload, plus the rename/delete/folder operations bisync performs to mirror moves,
+// conflict keep-both renames, and legitimate deletions. These are the vault's own capability tokens
+// (confirmed against a live SFTP-enabled deployment). It stays least-privilege — only file/folder ops on
+// the single selected vault: no navigation pages, no permission changes, and no ability to mint further
+// credentials. Excessive deletions are held back by the sync engine's own --max-delete guard, not by
+// withholding file.delete (which the sync legitimately needs to propagate a real deletion).
+const SYNC_CAPS = Object.freeze([
+  'vault.see_files', 'file.download', 'file.upload', 'file.rename', 'file.delete', 'folder.create', 'folder.delete',
+]);
+
+// A least-privilege scope granting the sync capabilities on a single vault and nothing else. The vault
+// applies the per-vault capabilities from `vault_caps_default`, so the sync caps are set there AND on the
+// selected-vault entry (the server's own client sends them in both places); leaving vault_caps_default
+// empty grants nothing and SFTP writes are denied. Global `caps`/`pages` stay empty, and only the one
+// vault is selected, so the grant is confined to file/folder operations on that single vault.
 function buildSyncScope(vaultId, vaultPassword) {
-  const entry = { vault_id: vaultId, caps: ['read', 'write'] };
+  const entry = { vault_id: vaultId, caps: SYNC_CAPS.slice() };
   if (vaultPassword) entry.password = vaultPassword; // proof for a locked vault — used at mint only
   return {
-    scope: { v: 1, pages: [], caps: [], vault_caps_default: [], temp: {} },
+    scope: { v: 1, pages: [], caps: [], vault_caps_default: SYNC_CAPS.slice(), temp: {} },
     vault_access_mode: 'selected',
     selected_vaults: [entry],
   };
@@ -80,4 +95,4 @@ async function mintSftpAccess({ serverOrigin, sessionToken, vaultId, validityMin
   return { host, port: SFTP_PORT, user: cred.user, password: cred.password, hostKeys, expiresAt: cred.expiresAt };
 }
 
-module.exports = { buildSyncScope, mintTempCred, fetchHostKey, mintSftpAccess, SFTP_PORT };
+module.exports = { buildSyncScope, mintTempCred, fetchHostKey, mintSftpAccess, SYNC_CAPS, SFTP_PORT };

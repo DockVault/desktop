@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { buildSyncScope, mintTempCred, fetchHostKey, mintSftpAccess, SFTP_PORT } = require('../src/main/sftp-cred');
+const { buildSyncScope, mintTempCred, fetchHostKey, mintSftpAccess, SYNC_CAPS, SFTP_PORT } = require('../src/main/sftp-cred');
 
 // A mock fetch recording each call; `routes` maps a path substring to a { status, body } response.
 function mockFetch(routes) {
@@ -20,11 +20,17 @@ function mockFetch(routes) {
 const ORIGIN = 'https://vault.example';
 const TOKEN = 'ACCOUNT-SESSION-TOKEN-do-not-leak';
 
-test('buildSyncScope is least-privilege: one vault, read+write, no pages, no temp-cred caps', () => {
+test('buildSyncScope is least-privilege: one vault with the sync file/folder caps, no pages, no temp caps', () => {
   const s = buildSyncScope('vault-1');
   assert.strictEqual(s.vault_access_mode, 'selected');
-  assert.deepStrictEqual(s.selected_vaults, [{ vault_id: 'vault-1', caps: ['read', 'write'] }]);
+  // The caps sit BOTH on the entry and in vault_caps_default — the server applies per-vault caps from
+  // vault_caps_default, so an empty one grants nothing (SFTP writes denied).
+  assert.deepStrictEqual(s.selected_vaults, [{ vault_id: 'vault-1', caps: SYNC_CAPS }]);
+  assert.deepStrictEqual(s.scope.vault_caps_default, SYNC_CAPS);
+  // Only file/folder (and see-files) operations — never vault management, permissions, or temp-cred minting.
+  for (const c of SYNC_CAPS) assert.match(c, /^(file\.|folder\.|vault\.see_files)/, `${c} is a file/folder op only`);
   assert.deepStrictEqual(s.scope.pages, [], 'no navigation pages');
+  assert.deepStrictEqual(s.scope.caps, [], 'no global caps');
   assert.deepStrictEqual(s.scope.temp, {}, 'no temp-credential-management caps');
   assert.strictEqual(s.scope.v, 1);
 });

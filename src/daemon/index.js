@@ -23,8 +23,8 @@
  *                     { type: 'ready', encrypted, reason? }
  *                     { type: 'pong', t }         { type: 'sync-status', id, ok, version?, error? }
  *                     { type: 'sftp-cred-ack', id, ok, error? }   (never echoes the cred or the config)
- *                     { type: 'sync-run-result', id, ok, ran?, result?, resyncRequired?, code?, error? }
- *                        (a summarized outcome only — never raw rclone output or the cred/config)
+ *                     { type: 'sync-run-result', id, ok, ran?, result?, resyncRequired?, needsAttention?,
+ *                        code?, error? }  (a summarized, typed outcome only — never raw output or the cred)
  *                     { type: 'bye' }             { type: 'error', op, message }
  *
  * The key is used only to open the database and is then zeroized in this process; it is never logged.
@@ -123,7 +123,7 @@ async function onSyncRun(m) {
     const remote = 'vault:' + b.remotePath;
     const r = await ephemeralConfig.withEphemeralConfig(rcloneRunDir, sftpConfig, (cfgPath) =>
       syncEngine.runBisync({ runner: rclone, db, vault: b.vault, local: b.local, remote, workdir, config: cfgPath, resync: !!b.resync }));
-    reply({ type: 'sync-run-result', id: m.id, ok: true, ran: r.ran, result: r.result, resyncRequired: r.resyncRequired, code: r.code });
+    reply({ type: 'sync-run-result', id: m.id, ok: true, ran: r.ran, result: r.result, resyncRequired: r.resyncRequired, needsAttention: r.needsAttention, code: r.code });
   } catch (err) {
     reply({ type: 'sync-run-result', id: m.id, ok: false, error: String((err && err.message) || err) });
   }
