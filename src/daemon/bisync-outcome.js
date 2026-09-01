@@ -24,6 +24,7 @@ const RESULT = Object.freeze({
   ABORT_EXCESSIVE_DELETE: 'abort-excessive-delete',  // safety abort; server copy intact; resync required
   NEEDS_RESYNC: 'needs-resync',                      // missing prior listing / critical error; resync required
   HOST_KEY_MISMATCH: 'host-key-mismatch',            // pinned != presented (MITM signal) — block, no auto-TOFU
+  AUTH_FAILED: 'auth-failed',                        // SFTP auth refused (e.g. a lapsed credential) — sign-in-needed
   PATH_TOO_LONG: 'path-too-long',                    // a file skipped for OS path length — surface which one
   ERROR: 'error',                                    // any other non-zero exit
 });
@@ -42,6 +43,9 @@ const SIG = Object.freeze({
   // key MISMATCH ("knownhosts: key mismatch" matches via `key mismatch`), not a bare mention of knownhosts
   // — a false MITM alarm on a benign line desensitizes users to a real one (anti-cry-wolf).
   hostKeyMismatch: /host key mismatch|key mismatch|host key .*(changed|does ?n[o']?t match)/i,
+  // SFTP authentication refused — the ssh handshake got past host-key verification but auth failed (e.g. a
+  // lapsed/rotated temp-cred): "ssh: unable to authenticate, attempted methods [none password] ...".
+  authFailed: /unable to authenticate|no supported methods remain|permission denied \(publickey,?password/i,
   // An individual file rejected for path/name length (Windows and POSIX wordings).
   pathTooLong: /path too long|file ?name too long|filename or extension is too long|name too long/i,
   // A keep-both conflict rename (bisync's safe default): both copies preserved, neither overwritten.
@@ -61,6 +65,9 @@ function classifyBisyncOutcome(o) {
 
   // Most serious first: an identity-change (MITM) signal and a data-safety abort outrank a plain error.
   if (SIG.hostKeyMismatch.test(text)) return { result: RESULT.HOST_KEY_MISMATCH, resyncRequired: null, needsAttention: true };
+  // A connection-level auth failure (e.g. a credential that lapsed mid-run): surface it as its own state so
+  // the status layer can prompt sign-in, and leave the resync baseline untouched. Fail-closed, never silent.
+  if (SIG.authFailed.test(text)) return { result: RESULT.AUTH_FAILED, resyncRequired: null, needsAttention: true };
   if (SIG.excessiveDelete.test(text)) return { result: RESULT.ABORT_EXCESSIVE_DELETE, resyncRequired: true, needsAttention: true };
   if (SIG.needsResync.test(text)) return { result: RESULT.NEEDS_RESYNC, resyncRequired: true, needsAttention: true };
 

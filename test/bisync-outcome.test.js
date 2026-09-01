@@ -47,6 +47,19 @@ test('anti-cry-wolf: a bare knownhosts mention on a clean run is NOT flagged as 
   assert.strictEqual(real.result, RESULT.HOST_KEY_MISMATCH);
 });
 
+test('an SFTP auth failure (e.g. a lapsed cred) -> its own auth-failed result, not a generic error', () => {
+  const authErr = 'ssh: handshake failed: ssh: unable to authenticate, attempted methods [none password], no supported methods remain';
+  const o = classifyBisyncOutcome({ code: 1, stderr: authErr });
+  assert.strictEqual(o.result, RESULT.AUTH_FAILED);
+  assert.strictEqual(o.resyncRequired, null, 'an auth failure does not touch the resync baseline');
+  assert.strictEqual(o.needsAttention, true);
+  // a host-key MISMATCH still outranks auth-failed (it is the more specific handshake failure)
+  const mm = classifyBisyncOutcome({ code: 1, stderr: 'ssh: handshake failed: sftp: host key mismatch for h: server offered ...' });
+  assert.strictEqual(mm.result, RESULT.HOST_KEY_MISMATCH);
+  // a clean run is never flagged as auth-failed
+  assert.strictEqual(classifyBisyncOutcome({ code: 0, stdout: 'INFO  : Bisync successful' }).result, RESULT.OK);
+});
+
 test('an individual path-too-long -> its own surfaced result, not a generic error', () => {
   const o = classifyBisyncOutcome({ code: 1, stderr: TOOLONG });
   assert.strictEqual(o.result, RESULT.PATH_TOO_LONG);
