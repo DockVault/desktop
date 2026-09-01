@@ -73,10 +73,17 @@ schemeMod.registerPrivileged();
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
+  // A second launch only brings the running app forward; any dockvault:// argument it carries is
+  // deliberately NOT acted upon (deep links are default-deny — see open-url below).
   app.on('second-instance', () => { void showOrCreateWindow(); });
   app.on('activate', () => { void showOrCreateWindow(); });       // macOS dock reopen
   app.on('window-all-closed', () => { /* tray-resident: never auto-quit here */ });
   app.on('before-quit', () => { isQuitting = true; });
+  // Deep links are DEFAULT-DENY in this version: the app is not registered as the OS handler for the
+  // scheme, and if a dockvault:// URL is delivered anyway it is consumed here and NO action is taken
+  // on it (no navigation, no intent). A future version that supports deep links will enumerate the
+  // exact allowed actions rather than acting on an arbitrary URL.
+  app.on('open-url', (event) => { event.preventDefault(); });
   app.whenReady().then(boot).catch((e) => {
     status.failCode = 'BOOT-' + String((e && e.code) || 'THREW');
     void finishSmokeIfNeeded();
