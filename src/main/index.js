@@ -109,6 +109,15 @@ function writeState(patch) {
   return next;
 }
 
+// Standard-vault sync uses a pinned rclone binary. Its path + version + SHA-256 are configuration
+// (sourced from the environment here; a bundled-binary manifest supplies them once packaging lands).
+// Absent a configured binary the daemon simply offers no standard sync — it is never a fatal condition.
+function resolveRcloneConfig() {
+  const bin = process.env.DOCKVAULT_RCLONE;
+  if (!bin) return null;
+  return { bin, version: process.env.DOCKVAULT_RCLONE_VERSION || null, sha256: process.env.DOCKVAULT_RCLONE_SHA256 || null };
+}
+
 // ---------------------------------------------------------------------------------------------
 async function boot() {
   uiSession = session.fromPartition(UI_PARTITION); // in-memory; created once, reused by every window
@@ -141,7 +150,7 @@ async function boot() {
   // window). It forks a utility child, is handed the DB key once, and auto-restarts on an unexpected exit.
   // The background daemon owns the encrypted state store, so it starts only with a real secret store;
   // under a memory-only posture there is nothing durable for it and background sync is withheld.
-  if (!SMOKE && keyProtect.hasSecureStore(keyMode)) { daemon = new DaemonManager(app.getPath('userData')); daemon.start(); }
+  if (!SMOKE && keyProtect.hasSecureStore(keyMode)) { daemon = new DaemonManager(app.getPath('userData'), resolveRcloneConfig()); daemon.start(); }
   // The lock-state single source of truth (main-owned): the window and daemon observe it, and it
   // drives the atomic key purge on a lock. Indicators reflect it honestly (never "syncing" while locked).
   lockState = new LockState({

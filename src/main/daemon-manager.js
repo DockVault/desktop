@@ -21,8 +21,9 @@ const DAEMON_ENTRY = path.join(__dirname, '..', 'daemon', 'index.js');
 const MAX_BACKOFF_MS = 30000;
 
 class DaemonManager {
-  constructor(userDataDir) {
+  constructor(userDataDir, rcloneConfig = null) {
     this.dir = userDataDir;
+    this.rcloneConfig = rcloneConfig; // { bin, version, sha256 } for standard-vault sync, or null
     this.child = null;
     this.stopping = false;
     this.restarts = 0;
@@ -33,6 +34,8 @@ class DaemonManager {
     this._pending = new Map(); // ping id -> resolve
     this._lockSeq = 0;
     this._lockPending = new Map(); // zk-lock id -> resolve
+    this._statusSeq = 0;
+    this._statusPending = new Map(); // sync-status id -> { resolve, timer }
   }
 
   start() { if (!this.child) this._spawn(); return this; }
@@ -62,6 +65,11 @@ class DaemonManager {
         if (e) { this._lockPending.delete(m.id); clearTimeout(e.timer); e.resolve(true); }
         break;
       }
+      case 'sync-status': {
+        const e = this._statusPending.get(m.id);
+        if (e) { this._statusPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, version: m.version || null, error: m.error || null }); }
+        break;
+      }
       case 'error': this._emit('error', m); break;
       default: break;
     }
@@ -72,7 +80,7 @@ class DaemonManager {
   _sendInit() {
     const dbk = stateDb.loadOrMintDBK(safeStorage, this.dir);
     const view = dbk ? new Uint8Array(dbk) : null;
-    try { this.child.postMessage({ type: 'init', dir: this.dir, dbk: view }); }
+    try { this.child.postMessage({ type: 'init', dir: this.dir, dbk: view, rclone: this.rcloneConfig }); }
     finally {
       if (dbk) dbk.fill(0);
       if (view) view.fill(0);
@@ -88,6 +96,9 @@ class DaemonManager {
     // holds: the caller only reports "locked" once this resolves, and a dead process has no key).
     for (const e of this._lockPending.values()) { clearTimeout(e.timer); e.resolve(true); }
     this._lockPending.clear();
+    // A dead daemon can't answer a status request — resolve any in-flight one as not-ok, never hang.
+    for (const e of this._statusPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, version: null, error: 'daemon exited' }); }
+    this._statusPending.clear();
     if (this.stopping) { this.status = 'stopped'; return; }
     this.status = 'crashed';
     const backoff = Math.min(MAX_BACKOFF_MS, 500 * 2 ** this.restarts);
@@ -126,6 +137,23 @@ class DaemonManager {
       this._lockPending.set(id, { resolve, timer });
       try { this.child.postMessage({ type: 'zk-lock', id }); }
       catch { this._lockPending.delete(id); clearTimeout(timer); return resolve(false); }
+    });
+  }
+
+  /**
+   * Ask the daemon to verify + report the standard-vault sync runner (pinned rclone binary + version)
+   * and round-trip its version. Resolves { ok, version, error }: ok=false when rclone is unconfigured,
+   * the daemon is dead, verification fails closed, or the request times out.
+   */
+  syncStatus(timeoutMs = 12000) {
+    return new Promise((resolve) => {
+      if (!this.child) return resolve({ ok: false, version: null, error: 'no daemon' });
+      const id = ++this._statusSeq;
+      const timer = setTimeout(() => { if (this._statusPending.delete(id)) resolve({ ok: false, version: null, error: 'timeout' }); }, timeoutMs);
+      if (timer.unref) timer.unref();
+      this._statusPending.set(id, { resolve, timer });
+      try { this.child.postMessage({ type: 'sync-status', id }); }
+      catch { this._statusPending.delete(id); clearTimeout(timer); return resolve({ ok: false, version: null, error: 'send failed' }); }
     });
   }
 
