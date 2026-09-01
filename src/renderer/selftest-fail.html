@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- Shell-owned screen: strict, no scripts, no network. The reference code is injected by the
+       main process via executeJavaScript (so this file needs no inline script of its own). -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'">
+  <title>DockVault — stopped</title>
+  <style>
+    :root { color-scheme: light dark; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #0a0f18; color: #e6edf6;
+      display: flex; align-items: center; justify-content: center; padding: 2rem;
+    }
+    .card { max-width: 30rem; }
+    h1 { font-size: 1.25rem; margin: 0 0 .75rem; }
+    p { margin: 0 0 1rem; color: #b9c4d4; }
+    .code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; color: #8aa0bd; font-size: .85rem; }
+    .row { display: flex; gap: .6rem; margin-top: 1.25rem; }
+    .btn { border: 1px solid #2b3a52; border-radius: 8px; padding: .5rem .9rem; color: #e6edf6; background: #14203a; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>DockVault has stopped to protect your data</h1>
+    <p>A required security check did not pass, so DockVault will not open your vaults. This protects
+       your data — it is safer to stop than to continue with a crypto engine that failed its check.</p>
+    <p>Reinstalling DockVault usually resolves this. If it keeps happening, please reach out for help.</p>
+    <p class="code">Reference: SELFTEST-<span id="code">unknown</span></p>
+  </main>
+</body>
+</html>

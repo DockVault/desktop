@@ -1,0 +1,17 @@
+{
+  "name": "dockvault-desktop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "DockVault desktop client — a tray-resident Electron shell that reuses the vault web UI and client-side crypto verbatim.",
+  "license": "AGPL-3.0-only",
+  "repository": "github:DockVault/desktop",
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "devDependencies": {
+    "electron": "^44.1.0"
+  }
+}
