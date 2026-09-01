@@ -126,6 +126,11 @@ function hardenSession(ses) {
   // No renderer-initiated permission (camera, geolocation, notifications, etc.) is granted.
   ses.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
   ses.setPermissionCheckHandler(() => false);
+  // The reused UI derives its live-monitor WebSocket URL from the origin, which over this scheme is
+  // an unreachable host (ws://app/...). Cancel it deterministically so it fails fast to the UI's
+  // own "disconnected" state instead of churning host lookups; live push is simply unavailable in
+  // the shell (data still loads over the request path), which the UI shows honestly.
+  ses.webRequest.onBeforeRequest({ urls: ['ws://app/*', 'wss://app/*'] }, (_details, cb) => cb({ cancel: true }));
 }
 
 function registerIpc() {
