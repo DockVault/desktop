@@ -44,7 +44,7 @@ const keyProtect = require('./key-protection');
 const STATIC_ROOT = path.resolve(__dirname, '..', '..', 'vendor', 'vault', 'static');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'index.js');
 const FAIL_HTML = path.join(__dirname, '..', 'renderer', 'selftest-fail.html');
-const TRAY_ICON = path.join(STATIC_ROOT, 'assets', 'logo-small.png');
+const APP_ICON = path.join(__dirname, '..', '..', 'build', 'icon.png'); // the DockVault window + tray icon
 const SMOKE = process.env.DOCKVAULT_SMOKE === '1';
 // A NON-persistent (in-memory) partition, held by the main process for the app's lifetime: the UI's
 // web storage never touches disk (so the account bearer the UI keeps in localStorage is never at
@@ -73,6 +73,11 @@ const status = { mainSelfTest: null, rendererProbe: null, shown: false, failCode
 
 // A GUI crypto client needs no GPU rasterization; disabling it drops the GPU process.
 app.disableHardwareAcceleration();
+
+// Windows taskbar identity: without an explicit AppUserModelID a dev/unpackaged run groups under the
+// generic Electron identity and shows its icon. Setting it ties the taskbar button (and notifications)
+// to DockVault so the window icon is used. (Kept in step with the packaged app id at packaging time.)
+if (process.platform === 'win32') app.setAppUserModelId('DockVault');
 
 // The scheme must be registered before the 'ready' event.
 schemeMod.registerPrivileged();
@@ -247,8 +252,8 @@ async function seedRestoredSession(win) {
 // ---------------------------------------------------------------------------------------------
 function trayImage() {
   try {
-    if (fs.existsSync(TRAY_ICON)) {
-      const img = nativeImage.createFromPath(TRAY_ICON);
+    if (fs.existsSync(APP_ICON)) {
+      const img = nativeImage.createFromPath(APP_ICON);
       if (!img.isEmpty()) return img.resize({ width: 16, height: 16 });
     }
   } catch { /* fall through */ }
@@ -289,6 +294,7 @@ async function showOrCreateWindow() {
     height: bounds.height || 860,
     x: bounds.x, y: bounds.y,
     show: false,
+    icon: APP_ICON, // taskbar + minimized (+ title-bar on Windows/Linux) show the DockVault icon
     backgroundColor: '#0a0f18',
     webPreferences: {
       partition: UI_PARTITION,

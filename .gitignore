@@ -1,10 +1,11 @@
 # Dependencies
 node_modules/
 
-# Build / packaging output
+# Build / packaging output (but keep the committed app-icon source under build/)
 dist/
 out/
-build/
+build/*
+!build/icon.png
 release/
 *.asar
 
