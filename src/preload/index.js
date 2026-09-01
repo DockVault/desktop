@@ -20,7 +20,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 // Enumerated event channels the renderer may subscribe to (main -> renderer). No wildcard.
-const EVENT_CHANNELS = Object.freeze(['deeplink']);
+const EVENT_CHANNELS = Object.freeze(['deeplink', 'lockstate']);
 
 function subscribe(channel, cb) {
   if (!EVENT_CHANNELS.includes(channel)) throw new Error('unknown event channel');
@@ -37,6 +37,12 @@ const api = Object.freeze({
     // Deep-link (dockvault://) events. Handling is benign navigation only and is default-deny in the
     // main process; it never auto-triggers a confirmation-gated action. Returns an unsubscribe fn.
     onDeepLink: (cb) => subscribe('deeplink', cb),
+  }),
+  lock: Object.freeze({
+    // Observe the authoritative lock state (main -> renderer). The main process is the single source
+    // of truth; the renderer only reflects it and never holds a divergent unlocked state. The payload
+    // carries no key material — only { state, reason }. Returns an unsubscribe fn.
+    onState: (cb) => subscribe('lockstate', cb),
   }),
 });
 

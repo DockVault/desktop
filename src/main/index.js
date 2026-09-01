@@ -24,10 +24,10 @@
  * not hard-wire destroy-always with no reopen path.
  *
  * DOCKVAULT_SMOKE=1 runs a headless functional check (boot self-test, UI load over the scheme,
- * renderer secure-context probe), writes .local/d1-smoke-result.json, and exits.
+ * renderer secure-context probe), writes .local/shell-smoke-result.json, and exits.
  */
 
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, session, dialog, safeStorage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, session, dialog, safeStorage, powerMonitor } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { APP_ORIGIN } = require('./config');
@@ -36,6 +36,10 @@ const { buildCsp } = require('./csp');
 const selftest = require('./selftest');
 const serverConfig = require('./server-config');
 const tokenStore = require('./token-store');
+const { DaemonManager } = require('./daemon-manager');
+const { LockState } = require('./lock-state');
+const { AutoLock } = require('./auto-lock');
+const keyProtect = require('./key-protection');
 
 const STATIC_ROOT = path.resolve(__dirname, '..', '..', 'vendor', 'vault', 'static');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'index.js');
@@ -55,13 +59,17 @@ const SESSION_KEYS = ['authToken', 'currentUser', 'userPermissions', 'isScopedTe
 let sessionBundle = null;
 let captureTimer = null;
 let restored = false; // the session is seeded once per run (on the first window); tray reopens keep it
+let daemon = null;    // the supervised background sync daemon (a forked utility child)
+let lockState = null; // the single source of truth for lock state (main-owned)
+let autoLock = null;  // the automatic lock triggers (idle timer + OS suspend/screen-lock)
 
 let mainWindow = null;
 let tray = null;
 let trayAvailable = false;
 let bootSelfTest = null; // cached for the process lifetime; not re-run per window
+let keyMode = null;      // the OS key-protection posture: 'A' software / 'B' hardware / 'C' none (refuse)
 let isQuitting = false;
-const status = { mainSelfTest: null, rendererProbe: null, shown: false, failCode: null };
+const status = { mainSelfTest: null, rendererProbe: null, shown: false, failCode: null, keyMode: null };
 
 // A GUI crypto client needs no GPU rasterization; disabling it drops the GPU process.
 app.disableHardwareAcceleration();
@@ -78,7 +86,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on('second-instance', () => { void showOrCreateWindow(); });
   app.on('activate', () => { void showOrCreateWindow(); });       // macOS dock reopen
   app.on('window-all-closed', () => { /* tray-resident: never auto-quit here */ });
-  app.on('before-quit', () => { isQuitting = true; });
+  app.on('before-quit', () => { isQuitting = true; if (autoLock) autoLock.stop(); if (daemon) daemon.stop(); });
   // Deep links are DEFAULT-DENY in this version: the app is not registered as the OS handler for the
   // scheme, and if a dockvault:// URL is delivered anyway it is consumed here and NO action is taken
   // on it (no navigation, no intent). A future version that supports deep links will enumerate the
@@ -114,11 +122,55 @@ async function boot() {
   if (captureTimer.unref) captureTimer.unref();
   bootSelfTest = await selftest.runInMain();
   status.mainSelfTest = bootSelfTest;
+  // OS key-protection posture. With no real secret store (Mode C: Linux 'basic_text' or no keychain)
+  // the app still runs in a memory-only degraded mode — only at-rest persistence and the background
+  // daemon are withheld (the session store and DB key already fail closed there). Hardware backing
+  // (Mode B) is not asserted without a verified probe (a later phase), so a capable platform reads Mode A.
+  keyMode = keyProtect.detectMode(safeStorage, process.platform);
+  // Test hook: force the no-secure-store posture so the memory-only degraded path can be exercised. It
+  // only ever makes the posture MORE restrictive (Mode C) — it can never grant a capability — so it is
+  // safe to leave in place; there is no override that weakens protection.
+  if (process.env.DOCKVAULT_FORCE_MODE_C === '1') keyMode = keyProtect.MODE.NONE;
+  status.keyMode = keyMode;
   schemeMod.installHandler(STATIC_ROOT, buildCsp(),
     () => serverConfig.readServerOrigin(app.getPath('userData')), uiSession);
   registerIpc();
   setupTray();
   await showOrCreateWindow();
+  // Start the supervised sync daemon (skipped under the headless shell smoke, which only exercises the
+  // window). It forks a utility child, is handed the DB key once, and auto-restarts on an unexpected exit.
+  // The background daemon owns the encrypted state store, so it starts only with a real secret store;
+  // under a memory-only posture there is nothing durable for it and background sync is withheld.
+  if (!SMOKE && keyProtect.hasSecureStore(keyMode)) { daemon = new DaemonManager(app.getPath('userData')); daemon.start(); }
+  // The lock-state single source of truth (main-owned): the window and daemon observe it, and it
+  // drives the atomic key purge on a lock. Indicators reflect it honestly (never "syncing" while locked).
+  lockState = new LockState({
+    getWindow: () => mainWindow,
+    getDaemon: () => daemon,
+    onChange: (s, reason) => {
+      // The renderer observes the authoritative state — it never holds a divergent unlocked state.
+      // The payload carries no key material.
+      pushLockState(s, reason);
+      if (!tray) return;
+      // Honest indicator: "safe/locked" only when a lock has fully confirmed; "locking…" while a purge
+      // is in flight; an explicit error state if a purge could not be confirmed (never a clean face).
+      const tip = s === 'locked' ? 'DockVault — locked'
+        : s === 'locking' ? 'DockVault — locking…'
+        : s === 'lock-error' ? 'DockVault — lock error (retrying)'
+        : 'DockVault';
+      try { tray.setToolTip(tip); } catch { /* tray gone */ }
+    },
+  });
+  // Automatic lock triggers: a visibility-independent OS-idle timer plus system suspend / screen-lock,
+  // driving the same atomic purge. Skipped under the headless smoke. The idle policy is the default
+  // until the deployment's value is available (a later phase); the triggers only fire once unlocked.
+  if (!SMOKE) {
+    autoLock = new AutoLock({
+      powerMonitor, lockState, getWindow: () => mainWindow,
+      onDegraded: (code) => { console.warn('[dockvault] auto-lock posture degraded:', code); },
+    });
+    autoLock.start();
+  }
   await finishSmokeIfNeeded();
 }
 
@@ -138,6 +190,11 @@ function registerIpc() {
     version: app.getVersion(),
     platform: process.platform,
     channel: 'dev',
+    // Non-secret posture facts so the interface can show honest, graceful copy — e.g. a memory-only
+    // note when there is no secret store (nothing kept across launches; stay-unlocked unavailable),
+    // never a fail-closed takeover. No key material is exposed.
+    keyProtection: keyMode,                              // 'A' | 'B' | 'C'
+    persistence: keyProtect.hasSecureStore(keyMode),     // false => memory-only, re-auth each launch
   }));
 }
 
@@ -190,6 +247,7 @@ function setupTray() {
     tray.setToolTip('DockVault');
     tray.setContextMenu(Menu.buildFromTemplate([
       { label: 'Open DockVault', click: () => { void showOrCreateWindow(); } },
+      { label: 'Lock now', click: () => { if (lockState) void lockState.lock('manual').catch(() => { /* state machine surfaces lock-error */ }); } },
       { type: 'separator' },
       { label: 'Quit DockVault', click: () => { isQuitting = true; app.quit(); } },
     ]));
@@ -242,6 +300,9 @@ async function showOrCreateWindow() {
     return win;
   }
 
+  // With no real OS secret store the app still loads and is fully interactive (memory-only): at-rest
+  // persistence and background sync are withheld elsewhere, not the interface. The session store
+  // already returned nothing to seed in that case, so a fresh sign-in is required each launch.
   await seedRestoredSession(win);
   await win.loadURL(`${APP_ORIGIN}/`);
 
@@ -261,6 +322,10 @@ async function showOrCreateWindow() {
   if (!SMOKE) win.show();      // in smoke mode the window stays hidden; only that it would show is asserted
   wireCloseToTray(win);
   wireBoundsPersistence(win);
+  // A freshly (re-)created window starts from the authoritative state. It carries no zero-knowledge key
+  // (the renderer's key is memory-only and died with any prior window), so re-showing requires re-auth
+  // until an unlock flow marks it unlocked; the renderer is told the current state so it never assumes.
+  if (lockState) pushLockState(lockState.isUnlocked() ? 'unlocked' : 'locked', null);
   return win;
 }
 
@@ -278,6 +343,15 @@ function wireBoundsPersistence(win) {
   const save = () => { if (!win.isDestroyed()) writeState({ bounds: win.getNormalBounds() }); };
   win.on('resize', save);
   win.on('move', save);
+}
+
+// Push the authoritative lock state to the live renderer (main -> renderer). The renderer only observes
+// this — it never sources its own unlocked state — and the payload carries no key material.
+function pushLockState(state, reason) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.webContents.send('dockvault:evt:lockstate', { state, reason: reason || null }); }
+    catch { /* window gone mid-send */ }
+  }
 }
 
 function wireCloseToTray(win) {
@@ -322,7 +396,7 @@ async function finishSmokeIfNeeded() {
   try {
     const dir = path.join(__dirname, '..', '..', '.local');
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'd1-smoke-result.json'), JSON.stringify(result, null, 2));
+    fs.writeFileSync(path.join(dir, 'shell-smoke-result.json'), JSON.stringify(result, null, 2));
   } catch { /* best effort */ }
   isQuitting = true;
   app.quit();

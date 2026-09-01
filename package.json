@@ -13,5 +13,8 @@
   },
   "devDependencies": {
     "electron": "^44.1.0"
+  },
+  "dependencies": {
+    "better-sqlite3-multiple-ciphers": "13.0.3"
   }
 }
