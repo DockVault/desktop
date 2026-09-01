@@ -27,7 +27,7 @@
  * renderer secure-context probe), writes .local/d1-smoke-result.json, and exits.
  */
 
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, session, dialog } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, session, dialog, safeStorage } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { APP_ORIGIN } = require('./config');
@@ -35,6 +35,7 @@ const schemeMod = require('./scheme');
 const { buildCsp } = require('./csp');
 const selftest = require('./selftest');
 const serverConfig = require('./server-config');
+const tokenStore = require('./token-store');
 
 const STATIC_ROOT = path.resolve(__dirname, '..', '..', 'vendor', 'vault', 'static');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'index.js');
@@ -47,6 +48,13 @@ const SMOKE = process.env.DOCKVAULT_SMOKE === '1';
 // full quit/relaunch. Durable session persistence is handled separately by the encrypted store.
 const UI_PARTITION = 'dockvault-ui';
 let uiSession = null;
+// The account session bundle the shell restores on a fresh launch (loaded from the encrypted store).
+// These are the keys the reused UI keeps in localStorage; only the bearer is secret, the rest is
+// session metadata. The bundle is re-validated against the server by the UI's own boot check.
+const SESSION_KEYS = ['authToken', 'currentUser', 'userPermissions', 'isScopedTemp'];
+let sessionBundle = null;
+let captureTimer = null;
+let restored = false; // the session is seeded once per run (on the first window); tray reopens keep it
 
 let mainWindow = null;
 let tray = null;
@@ -90,6 +98,13 @@ function writeState(patch) {
 async function boot() {
   uiSession = session.fromPartition(UI_PARTITION); // in-memory; created once, reused by every window
   hardenSession(uiSession);
+  // Restore the account session from the encrypted store (null on a non-secure keychain or none):
+  // the preload seeds it into the UI's storage at document-start on a fresh launch.
+  sessionBundle = tokenStore.loadSession(safeStorage, app.getPath('userData'));
+  // Keep the encrypted store current while a window is open, so a full quit does not lose the
+  // session (the in-memory partition already survives close-to-tray within a run).
+  captureTimer = setInterval(() => { void captureSession(); }, 30000);
+  if (captureTimer.unref) captureTimer.unref();
   bootSelfTest = await selftest.runInMain();
   status.mainSelfTest = bootSelfTest;
   schemeMod.installHandler(STATIC_ROOT, buildCsp(),
@@ -112,6 +127,38 @@ function registerIpc() {
     platform: process.platform,
     channel: 'dev',
   }));
+}
+
+// Read the account session the UI keeps in its storage and mirror it to the encrypted store, so a
+// full quit does not force a re-login. Persists only while a bearer is present; clears the store
+// when the UI has none (e.g. after sign-out). Never logs the token; best-effort.
+async function captureSession() {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return;
+  const dir = app.getPath('userData');
+  try {
+    const bundle = await win.webContents.executeJavaScript(
+      `(() => { const keys = ${JSON.stringify(SESSION_KEYS)}, o = {};`
+      + ` for (const k of keys) { const v = localStorage.getItem(k); if (v != null) o[k] = v; } return o; })()`, true);
+    if (bundle && bundle.authToken) tokenStore.persistSession(safeStorage, dir, bundle);
+    else tokenStore.clearSession(dir);
+  } catch { /* best effort; the token is never logged */ }
+}
+
+// Restore a stored session once per run, before the UI loads: load a minimal same-origin seed page,
+// write the session into the origin's storage, then let showOrCreateWindow load the real UI (same
+// origin, so the storage carries over and the UI's boot picks it up + re-validates against the
+// server). Only on the first window of the run; tray reopens keep the in-memory partition's copy.
+async function seedRestoredSession(win) {
+  if (restored || !sessionBundle || !sessionBundle.authToken) return;
+  const seed = {};
+  for (const k of SESSION_KEYS) if (typeof sessionBundle[k] === 'string') seed[k] = sessionBundle[k];
+  try {
+    await win.loadURL(`${APP_ORIGIN}${schemeMod.SEED_PATH}`);
+    await win.webContents.executeJavaScript(
+      `(() => { const s = ${JSON.stringify(seed)}; for (const k of Object.keys(s)) localStorage.setItem(k, s[k]); return true; })()`, true);
+    restored = true;
+  } catch { /* best effort; a failed restore just shows the sign-in screen */ }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -183,6 +230,7 @@ async function showOrCreateWindow() {
     return win;
   }
 
+  await seedRestoredSession(win);
   await win.loadURL(`${APP_ORIGIN}/`);
 
   let probe = null;
@@ -226,8 +274,11 @@ function wireCloseToTray(win) {
     e.preventDefault();
     if (!trayAvailable) { win.minimize(); return; }  // no tray: keep the app reachable
     maybeExplainCloseToTray();
-    win.destroy();           // reclaim the renderer's memory; the tray "Open" item recreates it
-    mainWindow = null;
+    // Mirror the session to the encrypted store before the renderer is reclaimed, then destroy.
+    captureSession().finally(() => {
+      if (!win.isDestroyed()) win.destroy(); // reclaim the renderer; the tray "Open" item recreates it
+      mainWindow = null;
+    });
   });
 }
 

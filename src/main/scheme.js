@@ -32,6 +32,10 @@ function contentType(p) { return MIME[path.extname(p).toLowerCase()] || 'applica
 
 function isAssetPath(p) { return p === '/' || p === '/index.html' || p.startsWith('/static/'); }
 
+// Reserved same-origin path serving a minimal blank page, used by the main process to pre-seed the
+// origin's storage with a restored session before loading the real UI.
+const SEED_PATH = '/__dv_session_seed__';
+
 function registerPrivileged() {
   protocol.registerSchemesAsPrivileged([{
     scheme: APP_SCHEME,
@@ -84,6 +88,13 @@ function installHandler(staticRoot, cspHeader, resolveServerOrigin, ses) {
     } catch {
       return new Response('bad request', { status: 400 });
     }
+    // A minimal, script-free page on the app origin. The main process loads this first when it has a
+    // stored session, seeds the session into the origin's storage, then loads the real UI — so the
+    // storage is populated before the UI's own boot script reads it (same origin, so it carries over).
+    if (pathname === SEED_PATH) {
+      return new Response('<!doctype html><meta charset="utf-8"><title>DockVault</title>',
+        { headers: { 'content-type': 'text/html; charset=utf-8', 'Content-Security-Policy': cspHeader } });
+    }
     if (isAssetPath(pathname)) return serveAsset(pathname);
 
     const origin = resolveServerOrigin ? resolveServerOrigin() : null;
@@ -92,4 +103,4 @@ function installHandler(staticRoot, cspHeader, resolveServerOrigin, ses) {
   });
 }
 
-module.exports = { registerPrivileged, installHandler, contentType, isAssetPath };
+module.exports = { registerPrivileged, installHandler, contentType, isAssetPath, SEED_PATH };
