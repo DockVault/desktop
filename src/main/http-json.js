@@ -16,13 +16,22 @@ const MAX_BYTES = 5 * 1024 * 1024;
 
 /**
  * @param {string} url
- * @param {{ method?: string, headers?: object }} [init]  fetch-style options (NOT a flat header map)
+ * @param {{ method?: string, headers?: object, body?: string|Buffer }} [init]  fetch-style options (NOT a flat header map)
  * @returns {Promise<{ ok: boolean, status: number, json: () => Promise<any> }>}
  */
 function httpJson(url, init = {}) {
   const mod = url.startsWith('https:') ? require('node:https') : require('node:http');
   const method = init.method || 'GET';
-  const headers = init.headers || {};
+  const headers = { ...(init.headers || {}) }; // copy, so the caller's object is never mutated
+  const hasBody = init.body != null;
+  const bodyBuf = hasBody ? Buffer.from(init.body) : null; // the caller pre-serialises (e.g. JSON.stringify)
+  // A request body must actually be written AND length-declared — a fetch-style caller (e.g. the cred
+  // mint POST) sets init.body, and dropping it would send an empty request, the same failure class the
+  // vault-list auth bug was. Set Content-Length for the known-length body so it is not sent chunked;
+  // honour a Content-Type the caller already set (never override or invent one).
+  if (hasBody && !Object.keys(headers).some((k) => k.toLowerCase() === 'content-length')) {
+    headers['Content-Length'] = String(bodyBuf.length);
+  }
   return new Promise((resolve, reject) => {
     const req = mod.request(url, { method, headers }, (res) => {
       let s = ''; let bytes = 0; let capped = false;
@@ -35,6 +44,7 @@ function httpJson(url, init = {}) {
     });
     req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error('request timed out')));
     req.on('error', reject);
+    if (hasBody) req.write(bodyBuf);
     req.end();
   });
 }
