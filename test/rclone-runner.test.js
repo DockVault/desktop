@@ -64,6 +64,13 @@ test('run() REFUSES --force (exact and --force= form) so a local wipe cannot ove
   await assert.rejects(() => r.run(['bisync', 'a', 'b', '--force=true']), /refusing to run rclone with --force=true/);
 });
 
+test('run() REFUSES --ignore-errors (exact and = form) so an errored run cannot pass as a clean completion', async () => {
+  assert.ok(FORBIDDEN_FLAGS.includes('--ignore-errors'));
+  const r = readyRunner('', 0);
+  await assert.rejects(() => r.run(['bisync', 'a', 'b', '--ignore-errors']), /refusing to run rclone with --ignore-errors/);
+  await assert.rejects(() => r.run(['bisync', 'a', 'b', '--ignore-errors=true']), /refusing to run rclone with --ignore-errors=true/);
+});
+
 test('run() refuses rc-server flags and the rcd/serve subcommands (no listener, by construction)', async () => {
   const r = readyRunner('', 0);
   await assert.rejects(() => r.run(['rcd', '--rc-addr', 'x']), /refusing to run rclone with rcd/);

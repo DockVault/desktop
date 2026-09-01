@@ -88,6 +88,13 @@ function openStateDb(dir, dbk) {
     db.prepare('CREATE TABLE IF NOT EXISTS sync_state('
       + 'vault TEXT NOT NULL, rel_path TEXT NOT NULL, name_bi TEXT, blob_id TEXT,'
       + ' zk_key_version INTEGER, updated_utc INTEGER, PRIMARY KEY(vault, rel_path))').run();
+    // Per-vault standard-sync run-state: when the last run happened, its result, and whether a safe
+    // bisync is currently blocked on an explicit resync. `resync_required` defaults to 1 so a vault we
+    // have never completed a run for — and one whose last run aborted — is fail-closed to requiring a
+    // deliberate, user-initiated resync before a normal (delete-capable) bisync is allowed to run.
+    db.prepare('CREATE TABLE IF NOT EXISTS sync_run('
+      + 'vault TEXT PRIMARY KEY, last_run_utc INTEGER, last_result TEXT,'
+      + ' resync_required INTEGER NOT NULL DEFAULT 1)').run();
     // Restrict the DB and its sidecars to the owner (a no-op on Windows, correct on macOS/Linux).
     for (const f of [dbPath(dir), dbPath(dir) + '-wal', dbPath(dir) + '-shm']) {
       try { if (fs.existsSync(f)) fs.chmodSync(f, 0o600); } catch { /* best effort */ }
@@ -101,6 +108,30 @@ function openStateDb(dir, dbk) {
   }
 }
 
+/**
+ * The standard-sync run-state for one vault. A vault with no recorded run reads as fail-closed:
+ * resyncRequired=true (a first run must be a deliberate resync, never a silent delete-capable bisync).
+ * @returns {{ lastRunUtc: number|null, lastResult: string|null, resyncRequired: boolean }}
+ */
+function getRunState(db, vault) {
+  const row = db.prepare('SELECT last_run_utc, last_result, resync_required FROM sync_run WHERE vault=?').get(vault);
+  if (!row) return { lastRunUtc: null, lastResult: null, resyncRequired: true };
+  return { lastRunUtc: row.last_run_utc, lastResult: row.last_result, resyncRequired: !!row.resync_required };
+}
+
+/**
+ * Record the outcome of a run. `resyncRequired` is stored explicitly by the caller (the sync engine),
+ * so a run that aborted on a safety guard can leave the vault blocked on an explicit resync, and a clean
+ * run can clear that block. `atUtc` is supplied by the caller (the daemon) so this stays free of a wall
+ * clock and is deterministic under test.
+ */
+function recordRun(db, vault, { result, resyncRequired, atUtc }) {
+  db.prepare('INSERT INTO sync_run(vault, last_run_utc, last_result, resync_required) VALUES(?,?,?,?)'
+    + ' ON CONFLICT(vault) DO UPDATE SET last_run_utc=excluded.last_run_utc,'
+    + ' last_result=excluded.last_result, resync_required=excluded.resync_required')
+    .run(vault, atUtc, String(result), resyncRequired ? 1 : 0);
+}
+
 /** Remove the database and its wrapped key. Relationship-ends only — never on an idle-lock. */
 function wipe(dir) {
   for (const f of [dbkPath(dir), dbPath(dir), dbPath(dir) + '-wal', dbPath(dir) + '-shm']) {
@@ -108,4 +139,4 @@ function wipe(dir) {
   }
 }
 
-module.exports = { loadOrMintDBK, openStateDb, wipe, CIPHER, dbkPath, dbPath };
+module.exports = { loadOrMintDBK, openStateDb, wipe, getRunState, recordRun, CIPHER, dbkPath, dbPath };

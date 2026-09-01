@@ -38,6 +38,8 @@ class DaemonManager {
     this._statusPending = new Map(); // sync-status id -> { resolve, timer }
     this._credSeq = 0;
     this._credPending = new Map(); // sftp-cred id -> { resolve, timer }
+    this._syncSeq = 0;
+    this._syncPending = new Map(); // sync-run id -> { resolve, timer }
   }
 
   start() { if (!this.child) this._spawn(); return this; }
@@ -77,6 +79,14 @@ class DaemonManager {
         if (e) { this._credPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, error: m.error || null }); }
         break;
       }
+      case 'sync-run-result': {
+        const e = this._syncPending.get(m.id);
+        if (e) {
+          this._syncPending.delete(m.id); clearTimeout(e.timer);
+          e.resolve({ ok: !!m.ok, ran: !!m.ran, result: m.result || null, resyncRequired: !!m.resyncRequired, code: typeof m.code === 'number' ? m.code : null, error: m.error || null });
+        }
+        break;
+      }
       case 'error': this._emit('error', m); break;
       default: break;
     }
@@ -108,6 +118,10 @@ class DaemonManager {
     this._statusPending.clear();
     for (const e of this._credPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, error: 'daemon exited' }); }
     this._credPending.clear();
+    // A dead daemon can't finish a bisync — resolve any in-flight run as not-ok (never hang). It stays
+    // fail-closed: the caller sees a failed run and the resync block (if any) is untouched on disk.
+    for (const e of this._syncPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, ran: false, error: 'daemon exited' }); }
+    this._syncPending.clear();
     if (this.stopping) { this.status = 'stopped'; return; }
     this.status = 'crashed';
     const backoff = Math.min(MAX_BACKOFF_MS, 500 * 2 ** this.restarts);
@@ -181,6 +195,25 @@ class DaemonManager {
       this._credPending.set(id, { resolve, timer });
       try { this.child.postMessage({ type: 'sftp-cred', id, bundle }); }
       catch { this._credPending.delete(id); clearTimeout(timer); return resolve({ ok: false, error: 'send failed' }); }
+    });
+  }
+
+  /**
+   * Ask the daemon to run one bisync for a vault, using the config prepared by the last sendSftpCred().
+   * The daemon enforces delete-safety + the first-run/blocked resync gate; this only relays a summarized
+   * outcome. `spec` = { vault, local, remotePath, resync? }. Resolves { ok, ran, result, resyncRequired,
+   * code, error }: ok=false when unconfigured, no cred is prepared, the daemon is dead, or it timed out.
+   * The timeout exceeds the daemon-side bisync timeout so a long-but-live run is not cut short here.
+   */
+  runSync(spec, timeoutMs = 15 * 60 * 1000) {
+    return new Promise((resolve) => {
+      if (!this.child) return resolve({ ok: false, ran: false, error: 'no daemon' });
+      const id = ++this._syncSeq;
+      const timer = setTimeout(() => { if (this._syncPending.delete(id)) resolve({ ok: false, ran: false, error: 'timeout' }); }, timeoutMs);
+      if (timer.unref) timer.unref();
+      this._syncPending.set(id, { resolve, timer });
+      try { this.child.postMessage({ type: 'sync-run', id, spec }); }
+      catch { this._syncPending.delete(id); clearTimeout(timer); return resolve({ ok: false, ran: false, error: 'send failed' }); }
     });
   }
 

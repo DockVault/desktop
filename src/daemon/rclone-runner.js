@@ -24,9 +24,13 @@ const fs = require('node:fs');
 // Flags the daemon must never hand rclone, enforced by construction (not by caller discipline):
 //   --force                             overrides rclone's own data-safety aborts, so a local wipe could
 //                                       then propagate a mass deletion to the server.
+//   --ignore-errors                     would let a run that hit transfer/listing errors be treated as a
+//                                       clean completion — so a partial or mis-listed bisync could delete
+//                                       against an incomplete picture. A run with errors must fail, never
+//                                       "succeed" quietly.
 //   --rc / --rc-addr / --rc-web-gui /   would start a remote-control server (a listening endpoint) — the
 //   --rc-no-auth                        one-shot design exists precisely to have NO listener.
-const FORBIDDEN_FLAGS = ['--force', '--rc', '--rc-addr', '--rc-web-gui', '--rc-no-auth'];
+const FORBIDDEN_FLAGS = ['--force', '--ignore-errors', '--rc', '--rc-addr', '--rc-web-gui', '--rc-no-auth'];
 // Subcommands that stand up a server/listener; never run as the first argument.
 const FORBIDDEN_SUBCOMMANDS = ['rcd', 'serve'];
 

@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const nodeCrypto = require('node:crypto');
-const { loadOrMintDBK, openStateDb, wipe, dbkPath, dbPath } = require('../src/main/state-db');
+const { loadOrMintDBK, openStateDb, wipe, getRunState, recordRun, dbkPath, dbPath } = require('../src/main/state-db');
 
 // safeStorage stand-in: base64 round-trip (so the wrapped DBK is not literally the DBK on disk);
 // backend name + availability configurable to exercise the fail-closed gate.
@@ -75,5 +75,20 @@ test('encrypted state DB round-trips, is ciphertext at rest, and rejects a wrong
 
   wipe(dir);
   assert.ok(!fs.existsSync(dbPath(dir)) && !fs.existsSync(dbkPath(dir)), 'wipe removes the DB and the wrapped key');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('run-state defaults fail-closed (resync required) and round-trips per vault', () => {
+  const dir = tmp();
+  const db = openStateDb(dir, nodeCrypto.randomBytes(32));
+  // A vault with no recorded run is fail-closed: a first run must be a deliberate resync.
+  assert.deepStrictEqual(getRunState(db, 'v1'), { lastRunUtc: null, lastResult: null, resyncRequired: true });
+  recordRun(db, 'v1', { result: 'resync-ok', resyncRequired: false, atUtc: 1000 });
+  assert.deepStrictEqual(getRunState(db, 'v1'), { lastRunUtc: 1000, lastResult: 'resync-ok', resyncRequired: false });
+  // A later run upserts the same vault; a second vault is independent and still fail-closed.
+  recordRun(db, 'v1', { result: 'ok', resyncRequired: false, atUtc: 2000 });
+  assert.deepStrictEqual(getRunState(db, 'v1'), { lastRunUtc: 2000, lastResult: 'ok', resyncRequired: false });
+  assert.strictEqual(getRunState(db, 'v2').resyncRequired, true, 'a different vault keeps its fail-closed default');
+  db.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });

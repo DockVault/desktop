@@ -17,10 +17,14 @@
  *                     { type: 'sftp-cred', id, bundle }   a per-run scoped SFTP cred (over this private,
  *                        in-memory channel ONLY — never disk/argv/env); the child obscures the password
  *                        just-in-time and holds only the prepared config
+ *                     { type: 'sync-run', id, spec }       run one bisync; spec = { vault, local,
+ *                        remotePath, resync? }. Uses the prepared config from the last sftp-cred.
  *   child  -> parent : { type: 'hello' }          sent once the child is up, before init
  *                     { type: 'ready', encrypted, reason? }
  *                     { type: 'pong', t }         { type: 'sync-status', id, ok, version?, error? }
  *                     { type: 'sftp-cred-ack', id, ok, error? }   (never echoes the cred or the config)
+ *                     { type: 'sync-run-result', id, ok, ran?, result?, resyncRequired?, code?, error? }
+ *                        (a summarized outcome only — never raw rclone output or the cred/config)
  *                     { type: 'bye' }             { type: 'error', op, message }
  *
  * The key is used only to open the database and is then zeroized in this process; it is never logged.
@@ -30,6 +34,7 @@ const path = require('node:path');
 const stateDb = require(path.join(__dirname, '..', 'main', 'state-db'));
 const { RcloneRunner } = require('./rclone-runner');
 const ephemeralConfig = require('./ephemeral-config');
+const syncEngine = require('./sync-engine');
 
 let db = null;
 let rclone = null;      // the standard-vault sync runner (one-shot rclone children), if configured
@@ -100,6 +105,30 @@ async function onSftpCred(m) {
   }
 }
 
+// Run one bisync using the config prepared by the last sftp-cred. Delete-safety + the first-run/blocked
+// resync gate live in the sync engine; this handler just supplies the ephemeral config + workdir and
+// relays a SUMMARIZED outcome (never raw rclone output, never the cred/config). The remote name matches
+// the one formatSftpRemote used ('vault'); the caller supplies only the path within it.
+async function onSyncRun(m) {
+  const b = (m && m.spec) || {};
+  if (!rclone) { reply({ type: 'sync-run-result', id: m.id, ok: false, error: 'rclone not configured' }); return; }
+  if (!sftpConfig) { reply({ type: 'sync-run-result', id: m.id, ok: false, error: 'no sftp cred prepared' }); return; }
+  if (!b.vault || !b.local || typeof b.remotePath !== 'string') {
+    reply({ type: 'sync-run-result', id: m.id, ok: false, error: 'sync-run needs vault, local, remotePath' });
+    return;
+  }
+  try {
+    if (!syncReady) syncReady = await rclone.ready();
+    const workdir = syncEngine.bisyncWorkdir(rcloneRunDir, b.vault);
+    const remote = 'vault:' + b.remotePath;
+    const r = await ephemeralConfig.withEphemeralConfig(rcloneRunDir, sftpConfig, (cfgPath) =>
+      syncEngine.runBisync({ runner: rclone, db, vault: b.vault, local: b.local, remote, workdir, config: cfgPath, resync: !!b.resync }));
+    reply({ type: 'sync-run-result', id: m.id, ok: true, ran: r.ran, result: r.result, resyncRequired: r.resyncRequired, code: r.code });
+  } catch (err) {
+    reply({ type: 'sync-run-result', id: m.id, ok: false, error: String((err && err.message) || err) });
+  }
+}
+
 process.parentPort.on('message', (event) => {
   const m = (event && event.data) || {};
   try {
@@ -108,6 +137,7 @@ process.parentPort.on('message', (event) => {
       case 'ping': reply({ type: 'pong', t: m.t }); break;
       case 'sync-status': void onSyncStatus(m); break;
       case 'sftp-cred': void onSftpCred(m); break;
+      case 'sync-run': void onSyncRun(m); break;
       case 'zk-lock':
         // Drop the daemon's in-memory ZK sync key as part of the atomic lock purge, then ACK so the
         // purge is observable (request->ack; the id correlates the reply). No such key exists until
