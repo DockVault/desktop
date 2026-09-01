@@ -19,9 +19,14 @@ const stateDb = require('./state-db');
 
 const DAEMON_ENTRY = path.join(__dirname, '..', 'daemon', 'index.js');
 const MAX_BACKOFF_MS = 30000;
+// Crash-loop ceiling: after this many unexpected exits inside the window, the supervisor stops
+// restarting and reports a stuck helper rather than churning forever. A helper that cannot stay up
+// is surfaced as a sync problem the person must act on, never retried silently to exhaustion.
+const MAX_RESTARTS = 5;
+const CRASH_WINDOW_MS = 3 * 60 * 1000;
 
 class DaemonManager {
-  constructor(userDataDir, rcloneConfig = null) {
+  constructor(userDataDir, rcloneConfig = null, opts = {}) {
     this.dir = userDataDir;
     this.rcloneConfig = rcloneConfig; // { bin, version, sha256 } for standard-vault sync, or null
     this.child = null;
@@ -30,6 +35,12 @@ class DaemonManager {
     this.status = 'stopped';
     this._listeners = [];
     this._restartTimer = null;
+    // Crash-loop ceiling state (clock injectable for tests).
+    this._now = typeof opts.now === 'function' ? opts.now : () => Date.now();
+    this._maxRestarts = opts.maxRestarts || MAX_RESTARTS;
+    this._crashWindowMs = opts.crashWindowMs || CRASH_WINDOW_MS;
+    this._restartTimes = [];
+    this.crashLoopLatched = false; // true once the ceiling is hit; cleared only by a deliberate resume()
     this._pingSeq = 0;
     this._pending = new Map(); // ping id -> resolve
     this._lockSeq = 0;
@@ -57,7 +68,10 @@ class DaemonManager {
       case 'hello': this._sendInit(); break;
       case 'ready':
         this.status = m.encrypted ? 'ready' : 'ready-no-store';
+        // A clean start breaks any crash loop: forget the recent-exit history and the backoff.
         this.restarts = 0;
+        this._restartTimes = [];
+        this.crashLoopLatched = false;
         this._emit('ready', m);
         break;
       case 'pong': {
@@ -123,12 +137,39 @@ class DaemonManager {
     for (const e of this._syncPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, ran: false, error: 'daemon exited' }); }
     this._syncPending.clear();
     if (this.stopping) { this.status = 'stopped'; return; }
+    // Record this exit and keep only those inside the window. Once too many land in the window the
+    // ceiling is hit: stop restarting, latch the stuck state, and surface it — never a silent storm.
+    const now = this._now();
+    this._restartTimes.push(now);
+    this._restartTimes = this._restartTimes.filter((t) => now - t < this._crashWindowMs);
+    if (this._restartTimes.length >= this._maxRestarts) {
+      this.crashLoopLatched = true;
+      this.status = 'crash-looped';
+      this._emit('crash-loop', { code, restarts: this._restartTimes.length });
+      return; // no restart scheduled: a deliberate resume() is required to try again
+    }
     this.status = 'crashed';
     const backoff = Math.min(MAX_BACKOFF_MS, 500 * 2 ** this.restarts);
     this.restarts += 1;
     this._emit('exit', { code, backoff });
     this._restartTimer = setTimeout(() => { if (!this.stopping) this._spawn(); }, backoff);
     if (this._restartTimer.unref) this._restartTimer.unref();
+  }
+
+  /**
+   * The deliberate "restart sync" action after the crash-loop ceiling was hit. Clears the latch and
+   * the recent-exit history and starts the helper again. A no-op (returns false) when not latched, so
+   * it can only ever RESUME from the stuck state, never force a second concurrent helper.
+   */
+  resume() {
+    if (!this.crashLoopLatched) return false;
+    this.crashLoopLatched = false;
+    this.restarts = 0;
+    this._restartTimes = [];
+    this.stopping = false;
+    this._emit('resume', {});
+    this._spawn();
+    return true;
   }
 
   /** Health check: resolves true on a matching pong, false on timeout or a dead child. */

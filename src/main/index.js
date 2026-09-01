@@ -27,7 +27,7 @@
  * renderer secure-context probe), writes .local/shell-smoke-result.json, and exits.
  */
 
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, session, dialog, safeStorage, powerMonitor } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, session, dialog, safeStorage, powerMonitor, Notification } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { APP_ORIGIN } = require('./config');
@@ -40,6 +40,8 @@ const { DaemonManager } = require('./daemon-manager');
 const { LockState } = require('./lock-state');
 const { AutoLock } = require('./auto-lock');
 const keyProtect = require('./key-protection');
+const { SyncStatusHub } = require('./sync-status-hub');
+const trayPresentation = require('./tray-presentation');
 
 const STATIC_ROOT = path.resolve(__dirname, '..', '..', 'vendor', 'vault', 'static');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'index.js');
@@ -62,6 +64,8 @@ let restored = false; // the session is seeded once per run (on the first window
 let daemon = null;    // the supervised background sync daemon (a forked utility child)
 let lockState = null; // the single source of truth for lock state (main-owned)
 let autoLock = null;  // the automatic lock triggers (idle timer + OS suspend/screen-lock)
+let syncHub = null;   // the main-owned computed sync status (feeds the tray, notifications, channel)
+let lockPhase = 'unlocked'; // the lock machine's current phase, for the tray glance (locking/lock-error/…)
 
 let mainWindow = null;
 let tray = null;
@@ -160,7 +164,21 @@ async function boot() {
   // window). It forks a utility child, is handed the DB key once, and auto-restarts on an unexpected exit.
   // The background daemon owns the encrypted state store, so it starts only with a real secret store;
   // under a memory-only posture there is nothing durable for it and background sync is withheld.
-  if (!SMOKE && keyProtect.hasSecureStore(keyMode)) { daemon = new DaemonManager(app.getPath('userData'), resolveRcloneConfig()); daemon.start(); }
+  const secureStore = keyProtect.hasSecureStore(keyMode);
+  if (!SMOKE && secureStore) { daemon = new DaemonManager(app.getPath('userData'), resolveRcloneConfig()); daemon.start(); }
+  // The main-owned computed sync status: the single source of truth the tray glance, the must-act
+  // notifications, and the read-only status channel all render. It observes the supervised helper's
+  // lifecycle and is fed lock/posture here; with no OS secret store it honestly reports sync as
+  // unavailable rather than pretending to run.
+  if (!SMOKE) {
+    syncHub = new SyncStatusHub({
+      daemon,
+      hasSecureStore: secureStore,
+      onStatus: (m) => { pushSyncStatus(m); refreshTray(); },
+      onNotify: (item) => notifyMustAct(item),
+    });
+    refreshTray(); // reflect the initial computed status now the hub exists (it does not emit on construction)
+  }
   // The lock-state single source of truth (main-owned): the window and daemon observe it, and it
   // drives the atomic key purge on a lock. Indicators reflect it honestly (never "syncing" while locked).
   lockState = new LockState({
@@ -170,14 +188,11 @@ async function boot() {
       // The renderer observes the authoritative state — it never holds a divergent unlocked state.
       // The payload carries no key material.
       pushLockState(s, reason);
-      if (!tray) return;
-      // Honest indicator: "safe/locked" only when a lock has fully confirmed; "locking…" while a purge
-      // is in flight; an explicit error state if a purge could not be confirmed (never a clean face).
-      const tip = s === 'locked' ? 'DockVault — locked'
-        : s === 'locking' ? 'DockVault — locking…'
-        : s === 'lock-error' ? 'DockVault — lock error (retrying)'
-        : 'DockVault';
-      try { tray.setToolTip(tip); } catch { /* tray gone */ }
+      // Lock is an input to the computed sync status (a locked vault pauses, but an unresolved item
+      // still outranks it). The in-flight transients (locking / lock-error) colour the glance directly.
+      lockPhase = s;
+      if (syncHub && (s === 'locked' || s === 'unlocked')) syncHub.setLocked(s === 'locked');
+      refreshTray();
     },
   });
   // Automatic lock triggers: a visibility-independent OS-idle timer plus system suspend / screen-lock,
@@ -215,6 +230,13 @@ function registerIpc() {
     keyProtection: keyMode,                              // 'A' | 'B' | 'C'
     persistence: keyProtect.hasSecureStore(keyMode),     // false => memory-only, re-auth each launch
   }));
+  // The read-only sync-status query. Returns the one computed, credential-free model (states, labels,
+  // symbolic reasons) — never a credential, host key, token, or raw helper output. Observe-only: there
+  // is no renderer channel that starts, stops, or configures sync, so the lock and safety gates can
+  // never be reached from a page.
+  ipcMain.handle('dockvault:sync.status', () => (syncHub
+    ? syncHub.current()
+    : { state: 'unavailable', label: 'Sync unavailable', reason: 'no-secure-store', vaults: [], condition: 'unavailable' }));
 }
 
 // Read the account session the UI keeps in its storage and mirror it to the encrypted store, so a
@@ -263,13 +285,7 @@ function trayImage() {
 function setupTray() {
   try {
     tray = new Tray(trayImage());
-    tray.setToolTip('DockVault');
-    tray.setContextMenu(Menu.buildFromTemplate([
-      { label: 'Open DockVault', click: () => { void showOrCreateWindow(); } },
-      { label: 'Lock now', click: () => { if (lockState) void lockState.lock('manual').catch(() => { /* state machine surfaces lock-error */ }); } },
-      { type: 'separator' },
-      { label: 'Quit DockVault', click: () => { isQuitting = true; app.quit(); } },
-    ]));
+    refreshTray(); // sets the initial tooltip + menu from the current status (neutral until the hub is up)
     tray.on('click', () => { void showOrCreateWindow(); });
     trayAvailable = true;
   } catch {
@@ -277,6 +293,68 @@ function setupTray() {
     // never a dead-end: closing the window minimizes it instead of destroying it into nothing.
     trayAvailable = false;
   }
+}
+
+// The ONE owner of the tray glance and menu: it composes both from the current computed sync status
+// and the lock phase, so lock and sync never fight over the tooltip. Called on every status change
+// and on every lock-phase change.
+function refreshTray() {
+  if (!tray) return;
+  try {
+    if (!syncHub) { tray.setToolTip('DockVault'); tray.setContextMenu(buildTrayMenu([])); return; }
+    const model = syncHub.current();
+    tray.setToolTip(trayPresentation.tooltip(model, lockPhase));
+    tray.setContextMenu(buildTrayMenu(trayPresentation.mustActItems(model)));
+  } catch { /* tray gone */ }
+}
+
+// Unresolved items sit at the TOP as reachable actions, so a decision, repair, or sign-in is never
+// buried inside the (destroyable) main window — the tray always offers a way to act.
+function buildTrayMenu(items) {
+  const template = [];
+  for (const it of items) template.push({ label: it.label, click: () => handleMustAct(it) });
+  if (items.length) template.push({ type: 'separator' });
+  template.push(
+    { label: 'Open DockVault', click: () => { void showOrCreateWindow(); } },
+    { label: 'Lock now', click: () => { if (lockState) void lockState.lock('manual').catch(() => { /* state machine surfaces lock-error */ }); } },
+    { type: 'separator' },
+    { label: 'Quit DockVault', click: () => { isQuitting = true; app.quit(); } },
+  );
+  return Menu.buildFromTemplate(template);
+}
+
+// Restarting a stuck helper is the one deliberate action that lives entirely in the shell. Every
+// other must-act (review a conflict, sign in, repair) opens the app to where the person completes it;
+// the specific in-app flows arrive with the components that own them.
+function handleMustAct(item) {
+  if (item && item.kind === 'restart') { if (daemon) daemon.resume(); refreshTray(); return; }
+  void showOrCreateWindow();
+}
+
+// Push the computed status to the live renderer (main -> renderer). Cred-free by construction (it is
+// the same model the tray renders); the renderer observes it read-only.
+function pushSyncStatus(model) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.webContents.send('dockvault:evt:syncstatus', model); }
+    catch { /* window gone mid-send */ }
+  }
+}
+
+// One OS notification the first time an unresolved item appears (the hub de-duplicates). Cred-free —
+// only the human label — and clicking it brings the app forward. Best-effort; never throws.
+function notifyMustAct(item) {
+  try {
+    if (!Notification || !Notification.isSupported || !Notification.isSupported()) return;
+    const n = new Notification({ title: 'DockVault', body: mustActBody(item) });
+    n.on('click', () => { void showOrCreateWindow(); });
+    n.show();
+  } catch { /* notifications are best-effort */ }
+}
+
+function mustActBody(item) {
+  if (item && item.kind === 'restart') return 'Sync stopped working. Your files are safe. Open DockVault to restart it.';
+  const base = (item && item.label) || 'A sync item needs your attention';
+  return `${base}. Your files are safe.`;
 }
 
 // ---------------------------------------------------------------------------------------------
