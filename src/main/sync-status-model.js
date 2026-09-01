@@ -6,15 +6,18 @@
  * into ONE honest state for the tray glance, plus a per-vault breakdown for the menu and the
  * read-only status channel.
  *
- * The vocabulary is fixed and small — five running states only:
+ * The vocabulary is fixed and small:
  *   up-to-date · syncing · paused · needs-decision · sync-problem
+ * plus 'waiting' for a vault that is set up but has not run yet — a calm, NON-active state that is
+ * deliberately NOT "syncing" (nothing is transferring) and NOT "up to date" (it has never synced), so
+ * a configured vault never claims to be syncing while no run is happening;
  * and two non-running conditions that are NOT sync states because sync cannot or does not run in
  * them: 'unavailable' (no OS secret store, so nothing durable to sync) and 'not-configured' (no
  * vault has been offered a folder yet). Keeping those separate avoids dressing "sync can't run" up
  * as a calm sync state.
  *
  * Two rules keep the aggregate honest:
- *   - Precedence: sync-problem > needs-decision > paused > syncing > up-to-date. The overall glance
+ *   - Precedence: sync-problem > needs-decision > paused > syncing > waiting > up-to-date. The overall glance
  *     is the HIGHEST-precedence contributor across every vault and every global signal — a single
  *     unresolved item forbids the green "up to date" face. A locked vault that ALSO has a conflict
  *     reads "needs your decision", not merely "paused".
@@ -26,9 +29,11 @@
  * notifications, channel, and scheduler consume it.
  */
 
-// The five running states (fixed vocabulary) plus the two non-running conditions.
+// The running/active states plus the calm 'waiting' (set up, not run yet) and the two non-running
+// conditions.
 const STATE = Object.freeze({
   UP_TO_DATE: 'up-to-date',
+  WAITING: 'waiting',               // configured but not run yet — calm, non-active, never "syncing"
   SYNCING: 'syncing',
   PAUSED: 'paused',
   NEEDS_DECISION: 'needs-decision',
@@ -39,20 +44,23 @@ const STATE = Object.freeze({
 });
 
 // Higher wins the aggregate. The two non-running conditions are handled before ranking (they mean
-// "no running state applies"), so they carry no rank here.
+// "no running state applies"), so they carry no rank here. 'waiting' sits above up-to-date (a
+// never-run vault forbids the green "up to date" glance) and below syncing (a real in-flight run wins).
 const RANK = Object.freeze({
-  [STATE.SYNC_PROBLEM]: 5,
-  [STATE.NEEDS_DECISION]: 4,
-  [STATE.PAUSED]: 3,
-  [STATE.SYNCING]: 2,
+  [STATE.SYNC_PROBLEM]: 6,
+  [STATE.NEEDS_DECISION]: 5,
+  [STATE.PAUSED]: 4,
+  [STATE.SYNCING]: 3,
+  [STATE.WAITING]: 2,
   [STATE.UP_TO_DATE]: 1,
 });
 
-// The human label for each state. These five are the fixed vocabulary; the finer per-reason wording
-// (paused-because-locked vs waiting-to-reconnect vs can't-verify-yet, and the per-outcome sentences)
-// is carried in `reason`/`detail` and finalized alongside the rest of the human copy.
+// The human label for each state. The finer per-reason wording (paused-because-locked vs
+// waiting-to-reconnect vs can't-verify-yet, and the per-outcome sentences) is carried in
+// `reason`/`detail` and finalized alongside the rest of the human copy.
 const LABEL = Object.freeze({
   [STATE.UP_TO_DATE]: 'Up to date',
+  [STATE.WAITING]: 'Sync set up - not running yet',
   [STATE.SYNCING]: 'Syncing',
   [STATE.PAUSED]: 'Paused',
   [STATE.NEEDS_DECISION]: 'Needs your decision',
@@ -113,9 +121,10 @@ function vaultState(v) {
     }
     return { vault: v.vault, state: m.state, reason: m.reason || null, running, resyncRequired };
   }
-  // Configured but no completed run yet.
+  // Configured but no completed run yet. A run actually in flight is "syncing"; otherwise it is the
+  // calm "waiting to start" — never "syncing" while nothing is transferring, and never a false green.
   if (running) return { vault: v.vault, state: STATE.SYNCING, reason: null, running, resyncRequired };
-  return { vault: v.vault, state: STATE.SYNCING, reason: 'waiting-first-sync', running, resyncRequired };
+  return { vault: v.vault, state: STATE.WAITING, reason: 'waiting-first-sync', running, resyncRequired };
 }
 
 /**

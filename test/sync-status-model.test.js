@@ -82,10 +82,21 @@ test('an in-flight run shows "syncing" only when nothing unresolved outranks it'
   assert.strictEqual(vaultState(vault({ lastResult: 'conflict-keep-both', running: true })).state, STATE.NEEDS_DECISION);
 });
 
-test('configured but never run => a calm "syncing / waiting for first sync", never a false green', () => {
+test('configured but never run => a calm "waiting to start", never SYNCING and never a false green', () => {
   const r = vaultState(vault({ lastResult: null, running: false }));
-  assert.strictEqual(r.state, STATE.SYNCING);
+  assert.strictEqual(r.state, STATE.WAITING);
   assert.strictEqual(r.reason, 'waiting-first-sync');
+  assert.notStrictEqual(r.state, STATE.SYNCING, 'nothing is transferring, so it is not "syncing"');
+});
+
+test('waiting outranks up-to-date (forbids a false green) but a real in-flight run outranks waiting', () => {
+  const secure2 = { hasSecureStore: true, online: true, daemon: 'ready' };
+  // one never-run vault + one clean vault => the glance is "Waiting to start", not "Up to date"
+  const agg = computeStatus({ ...secure2, vaults: [vault({ vault: 'a', lastResult: null }), vault({ vault: 'b', lastResult: 'ok' })] });
+  assert.strictEqual(agg.state, STATE.WAITING);
+  // a genuinely running vault wins over a waiting one
+  const agg2 = computeStatus({ ...secure2, vaults: [vault({ vault: 'a', lastResult: null }), vault({ vault: 'b', lastResult: 'ok', running: true })] });
+  assert.strictEqual(agg2.state, STATE.SYNCING);
 });
 
 test('every classifier outcome maps to a defined state', () => {

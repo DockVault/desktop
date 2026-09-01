@@ -26,7 +26,8 @@ const REASON_DETAIL = Object.freeze({
   'waiting-to-reconnect': 'waiting to reconnect',
   'reconnecting': 'reconnecting',
   'cannot-verify-yet': 'cannot verify the server yet',
-  'waiting-first-sync': 'waiting to sync',
+  // 'waiting-first-sync' carries no suffix: the "Waiting to start" label already says it plainly, and
+  // a configured-but-never-run vault must read as not-yet-running, never as active "syncing".
 });
 
 function tooltip(model, lockPhase) {

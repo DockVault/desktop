@@ -39,11 +39,14 @@ test('no generic fetch/request passthrough is exposed', () => {
   assert.ok(!/\brequest\s*:/.test(CODE), 'no request: capability');
 });
 
-test('the sync surface is read-only: a status query + a status event, no control verbs', () => {
+test('the sync surface is OBSERVE-ONLY: status query + status event, and NO initiator/list/control', () => {
   assert.match(CODE, /EVENT_CHANNELS\s*=\s*Object\.freeze\(\[[^\]]*['"]syncstatus['"]/, 'syncstatus is an allowlisted event channel');
   assert.match(CODE, /ipcRenderer\.invoke\(\s*['"]dockvault:sync\.status['"]\s*\)/, 'a cred-free status query is exposed');
-  // No renderer-driven control over sync (start/stop/run/configure would let a page bypass the gates).
-  for (const verb of [/\bstartSync\b/, /\bstopSync\b/, /\brunSync\b/, /\bconfigureSync\b/, /\bsync\.run\b/, /\bsync\.start\b/]) {
+  // Enabling/stopping/listing sync is driven from the tray in main; the renderer has NO such method,
+  // so a compromised page cannot start the native flow or supply a folder/config.
+  assert.ok(!/dockvault:sync\.setup/.test(CODE), 'no renderer sync.setup initiator');
+  assert.ok(!/dockvault:sync\.list/.test(CODE), 'no renderer sync.list capability');
+  for (const verb of [/\bstartSync\b/, /\bstopSync\b/, /\brunSync\b/, /\bconfigureSync\b/, /\bsync\.run\b/, /\bsync\.start\b/, /\bsync\.setup\b/, /\bsync\.list\b/]) {
     assert.ok(!verb.test(CODE), `no renderer sync-control verb: ${verb}`);
   }
 });

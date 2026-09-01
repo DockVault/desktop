@@ -42,6 +42,11 @@ const { AutoLock } = require('./auto-lock');
 const keyProtect = require('./key-protection');
 const { SyncStatusHub } = require('./sync-status-hub');
 const trayPresentation = require('./tray-presentation');
+const syncEnable = require('./sync-enable');
+const syncVaults = require('./sync-vaults');
+const syncConfig = require('./sync-config');
+const syncConfigStore = require('./sync-config-store');
+const enableCopy = require('./enable-copy');
 
 const STATIC_ROOT = path.resolve(__dirname, '..', '..', 'vendor', 'vault', 'static');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'index.js');
@@ -66,6 +71,8 @@ let lockState = null; // the single source of truth for lock state (main-owned)
 let autoLock = null;  // the automatic lock triggers (idle timer + OS suspend/screen-lock)
 let syncHub = null;   // the main-owned computed sync status (feeds the tray, notifications, channel)
 let lockPhase = 'unlocked'; // the lock machine's current phase, for the tray glance (locking/lock-error/…)
+let lastSomeExcluded = false; // whether the last vault listing had non-eligible vaults (a bare flag for the picker note)
+let syncFlowBusy = false;     // single-flight guard: one enable/stop-sync flow at a time (no dialog races)
 
 let mainWindow = null;
 let tray = null;
@@ -177,6 +184,8 @@ async function boot() {
       onStatus: (m) => { pushSyncStatus(m); refreshTray(); },
       onNotify: (item) => notifyMustAct(item),
     });
+    // Seed the status with the vaults already configured for sync, so a returning user sees them.
+    try { syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* no config yet */ }
     refreshTray(); // reflect the initial computed status now the hub exists (it does not emit on construction)
   }
   // The lock-state single source of truth (main-owned): the window and daemon observe it, and it
@@ -192,6 +201,7 @@ async function boot() {
       // still outranks it). The in-flight transients (locking / lock-error) colour the glance directly.
       lockPhase = s;
       if (syncHub && (s === 'locked' || s === 'unlocked')) syncHub.setLocked(s === 'locked');
+      if (s === 'unlocked') void maybeOfferSyncSetup(); // a one-time, non-blocking nudge on first unlock (gated on eligibility)
       refreshTray();
     },
   });
@@ -237,6 +247,10 @@ function registerIpc() {
   ipcMain.handle('dockvault:sync.status', () => (syncHub
     ? syncHub.current()
     : { state: 'unavailable', label: 'Sync unavailable', reason: 'no-secure-store', vaults: [], condition: 'unavailable' }));
+  // Enabling and stopping sync are driven entirely from the tray (and the notification click) in the
+  // main process — there is deliberately NO renderer IPC to START, configure, or list sync. A
+  // renderer initiator would be pure attack surface (a compromised page could pop the native flow),
+  // and the read-only status channel above already gives a page everything it needs to observe.
 }
 
 // Read the account session the UI keeps in its storage and mirror it to the encrypted store, so a
@@ -314,6 +328,20 @@ function buildTrayMenu(items) {
   const template = [];
   for (const it of items) template.push({ label: it.label, click: () => handleMustAct(it) });
   if (items.length) template.push({ type: 'separator' });
+  // The always-available, non-blocking offer (and the reversible list of what is already set up).
+  // Sync is offered, never imposed: browsing a vault never requires setting this up.
+  if (syncHub) {
+    template.push({ label: 'Set up sync…', click: () => { void setupSyncForVault(); } });
+    let configured = [];
+    try { configured = storedConfig(); } catch { /* none */ }
+    if (configured.length) {
+      template.push({
+        label: 'Synced folders',
+        submenu: configured.map((e) => ({ label: `Stop syncing ${e.vaultName}`, click: () => { void stopSyncing(e.vaultId, e.vaultName); } })),
+      });
+    }
+    template.push({ type: 'separator' });
+  }
   template.push(
     { label: 'Open DockVault', click: () => { void showOrCreateWindow(); } },
     { label: 'Lock now', click: () => { if (lockState) void lockState.lock('manual').catch(() => { /* state machine surfaces lock-error */ }); } },
@@ -355,6 +383,270 @@ function mustActBody(item) {
   if (item && item.kind === 'restart') return 'Sync stopped working. Your files are safe. Open DockVault to restart it.';
   const base = (item && item.label) || 'A sync item needs your attention';
   return `${base}. Your files are safe.`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Enable-sync (set up a vault to sync to a local folder). The renderer only asks to begin; the
+// vault pick, the native folder pick, the consent, and the write all happen here in the main process.
+
+function storedConfig() { return syncConfigStore.loadConfig(safeStorage, app.getPath('userData')); }
+
+// A minimal main-side JSON GET matching the injected-fetch contract the sync modules expect. Used
+// only to list the account's vaults over the account session; never carries or returns a credential.
+// A request timeout and a response-size cap keep a hung or oversized server from hanging the tray flow.
+function mainHttpJson(url, headers) {
+  const mod = url.startsWith('https:') ? require('node:https') : require('node:http');
+  const TIMEOUT_MS = 15000;
+  const MAX_BYTES = 5 * 1024 * 1024;
+  return new Promise((resolve, reject) => {
+    const req = mod.request(url, { method: 'GET', headers }, (res) => {
+      let s = ''; let bytes = 0; let capped = false;
+      res.on('data', (c) => {
+        bytes += c.length;
+        if (bytes > MAX_BYTES) { capped = true; req.destroy(new Error('response too large')); return; }
+        s += c;
+      });
+      res.on('end', () => { if (!capped) resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, json: async () => JSON.parse(s || 'null') }); });
+    });
+    req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error('request timed out')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// Re-resolve the account session at the moment a flow needs it — never the boot-time snapshot, which
+// goes stale (a first-run user who just signed in would otherwise get a false "not signed in" until a
+// restart). Prefer the LIVE token from the open window's storage, then the persisted session, then the
+// boot bundle.
+async function resolveAccountToken() {
+  const win = mainWindow;
+  if (win && !win.isDestroyed()) {
+    try {
+      const t = await win.webContents.executeJavaScript("localStorage.getItem('authToken')", true);
+      if (typeof t === 'string' && t) return t;
+    } catch { /* fall through to the persisted copy */ }
+  }
+  try { const s = tokenStore.loadSession(safeStorage, app.getPath('userData')); if (s && s.authToken) return s.authToken; } catch { /* fall through */ }
+  return (sessionBundle && sessionBundle.authToken) || null;
+}
+
+// The input/output surface the enable flow drives — every step that touches the OS lives here.
+function buildEnableIo() {
+  const dir = app.getPath('userData');
+  const home = app.getPath('home');
+  // Windows and default macOS volumes are case-insensitive; fold case in containment checks so a
+  // differently-cased path cannot slip past the overlap / system-root refusals.
+  const caseInsensitive = process.platform === 'win32' || process.platform === 'darwin';
+  return {
+    listVaults: async () => {
+      const origin = serverConfig.readServerOrigin(dir);
+      const token = await resolveAccountToken();
+      // Distinguish "not signed in" from a later network error so the copy can be specific.
+      if (!origin || !token) { const e = new Error('not signed in'); e.reason = 'no-session'; throw e; }
+      const { vaults, someExcluded } = await syncVaults.fetchStandardVaults({ serverOrigin: origin, sessionToken: token }, mainHttpJson);
+      lastSomeExcluded = !!someExcluded; // a bare flag for the picker note; excluded vaults never leave main
+      return vaults;
+    },
+    pickVault: async (vaults) => {
+      const note = lastSomeExcluded
+        ? '\n\nSome of your vaults are not shown here — only standard vaults can be synced to a folder.'
+        : '';
+      const buttons = [...vaults.map((v) => v.vaultName), 'Cancel'];
+      const res = await dialog.showMessageBox(mainWindow, {
+        type: 'question', title: 'Set up sync', noLink: true,
+        message: 'Which vault do you want to sync to this computer?',
+        detail: 'Its files will be kept in a folder you choose.' + note,
+        buttons, defaultId: 0, cancelId: buttons.length - 1,
+      });
+      return (res.response >= 0 && res.response < vaults.length) ? vaults[res.response] : null;
+    },
+    pickFolder: async () => {
+      const res = await dialog.showOpenDialog(mainWindow, {
+        title: 'Choose a folder to sync into',
+        properties: ['openDirectory', 'createDirectory'],
+      });
+      return (res.canceled || !res.filePaths || !res.filePaths[0]) ? null : res.filePaths[0];
+    },
+    // Canonicalize casing on win32 via realpathSync.native so the containment checks see the real case.
+    resolveReal: (p) => {
+      const real = fs.realpathSync.native || fs.realpathSync;
+      try { return real(p); } catch { try { return fs.realpathSync(p); } catch { return path.resolve(p); } }
+    },
+    classifyCtx: (excludeVaultId) => ({
+      home,
+      userData: dir,
+      refuseRoots: syncConfig.platformRefuseRoots(process.platform, process.env),
+      // Exclude the vault being (re)configured, so re-picking its OWN folder is not a false overlap.
+      existingFolders: storedConfig().filter((e) => e.vaultId !== excludeVaultId).map((e) => e.localFolder),
+      caseInsensitive,
+    }),
+    confirmCloud: async (folder) => {
+      const service = enableCopy.cloudServiceName(folder);
+      const res = await dialog.showMessageBox(mainWindow, {
+        type: 'warning', title: 'Cloud storage folder', noLink: true,
+        message: `This folder is inside ${service}`,
+        detail: enableCopy.cloudWarnMessage(service),
+        buttons: ['Choose another folder', 'Use it anyway'], defaultId: 0, cancelId: 0,
+      });
+      return res.response === 1;
+    },
+    isNonEmptyDir: (p) => { try { return fs.readdirSync(p).length > 0; } catch { return false; } },
+    confirmConsent: async ({ vaultId, vaultName, folder, nonEmpty }) => {
+      let detail = enableCopy.consentMessage(vaultName, folder, { nonEmpty });
+      // Re-targeting an already-configured vault: say what happens to the old folder, never silently orphan it.
+      const prior = storedConfig().find((e) => e.vaultId === vaultId);
+      if (prior && prior.localFolder && prior.localFolder !== folder) {
+        detail += ` The previous folder (${prior.localFolder}) will no longer sync; the files already there are left as they are.`;
+      }
+      // Windows does not enforce owner-only folder permissions, so a folder outside the user profile can
+      // be readable by other local accounts. State that honestly at the consent for such a target.
+      if (process.platform === 'win32' && !syncConfig.isWithin(folder, home, caseInsensitive)) {
+        detail += ' On Windows, a folder outside your user profile can be read by other accounts on this PC — a folder inside your profile keeps these copies private.';
+      }
+      const res = await dialog.showMessageBox(mainWindow, {
+        type: 'question', title: 'Sync this vault?', noLink: true,
+        message: `Sync ${vaultName} to this computer?`,
+        detail,
+        // Cancel is the Enter-default: a plaintext-on-disk + upload decision must not be confirmed by a stray Enter.
+        buttons: ['Cancel', 'Sync this vault'], defaultId: 0, cancelId: 0,
+      });
+      return res.response === 1;
+    },
+    ensureFolder: (p) => {
+      // The folder receives decrypted, readable copies, so create it owner-only. mode/chmod are
+      // enforced on POSIX; on Windows they are effectively no-ops (the folder inherits its ACL), which
+      // is why the consent copy states the win32 asymmetry above.
+      fs.mkdirSync(p, { recursive: true, mode: 0o700 });
+      try { fs.chmodSync(p, 0o700); } catch { /* honoured where the platform supports it */ }
+    },
+    onRefuse: async (reason) => {
+      await dialog.showMessageBox(mainWindow, {
+        type: 'warning', title: "That folder can't be used", noLink: true,
+        message: "That folder can't be used for sync", detail: enableCopy.refuseMessage(reason),
+        buttons: ['OK'],
+      });
+    },
+    save: (entry) => {
+      const list = syncConfig.upsertEntry(storedConfig(), entry);
+      syncConfigStore.saveConfig(safeStorage, dir, list); // throws CONFIG_UNREADABLE rather than clobber an unreadable file
+    },
+  };
+}
+
+async function setupSyncForVault() {
+  if (!syncHub) return { enabled: false, reason: 'unavailable' };
+  // Single-flight: never open a second enable/stop flow while one is in progress (the overlap check is
+  // read-then-write, so two concurrent flows could both pass it and the second save drop the first).
+  if (syncFlowBusy) return { enabled: false, reason: 'busy' };
+  // Claim the single-flight guard BEFORE anything that opens a dialog (including the unreadable-config
+  // pre-check below), so a second trigger arriving during that dialog is suppressed as busy, not stacked.
+  syncFlowBusy = true;
+  try {
+    // Never drag the person through the pickers over an unreadable config — a save would refuse anyway.
+    const cfgState = syncConfigStore.readConfigState(safeStorage, app.getPath('userData'));
+    if (syncConfigStore.isUnreadable(cfgState.status)) {
+      try {
+        await dialog.showMessageBox(mainWindow, {
+          type: 'error', title: 'Set up sync', noLink: true,
+          message: 'Your sync settings could not be read',
+          detail: 'DockVault will not overwrite them. This usually clears up after unlocking your login keychain and reopening DockVault.',
+          buttons: ['OK'],
+        });
+      } catch { /* best-effort */ }
+      return { enabled: false, reason: 'config-unreadable' };
+    }
+    const r = await syncEnable.runEnableFlow(buildEnableIo());
+    if (r && r.enabled) {
+      try { syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* config unreadable */ }
+      refreshTray();
+    } else if (r && r.reason === 'no-standard-vaults') {
+      try {
+        await dialog.showMessageBox(mainWindow, {
+          type: 'info', title: 'Set up sync', noLink: true,
+          message: 'No vaults can be synced to this computer yet',
+          detail: 'Syncing to a folder is available for standard vaults. Open DockVault to create one.',
+          buttons: ['OK'],
+        });
+      } catch { /* best-effort */ }
+    } else if (r && r.reason === 'bad-vault-name') {
+      try {
+        await dialog.showMessageBox(mainWindow, {
+          type: 'warning', title: 'Set up sync', noLink: true,
+          message: "That vault can't be synced to a folder",
+          detail: "Its name contains characters that can't be used as a folder name. Rename the vault, then try again.",
+          buttons: ['OK'],
+        });
+      } catch { /* best-effort */ }
+    }
+    return r;
+  } catch (e) {
+    const noSession = !!(e && e.reason === 'no-session');
+    try {
+      await dialog.showMessageBox(mainWindow, {
+        type: noSession ? 'info' : 'error', title: 'Set up sync', noLink: true,
+        message: noSession ? 'Sign in first' : 'Could not set up sync',
+        detail: noSession
+          ? 'Open DockVault and sign in to your account, then set up sync from the tray.'
+          : 'DockVault could not reach the server. Check your connection and try again.',
+        buttons: ['OK'],
+      });
+    } catch { /* best-effort */ }
+    return { enabled: false, reason: noSession ? 'no-session' : 'error' };
+  } finally {
+    syncFlowBusy = false;
+  }
+}
+
+async function stopSyncing(vaultId, vaultName) {
+  if (syncFlowBusy) return; // single-flight: don't race a setup or another stop
+  syncFlowBusy = true;
+  try {
+    const res = await dialog.showMessageBox(mainWindow, {
+      type: 'question', title: 'Stop syncing', noLink: true,
+      message: `Stop syncing ${vaultName}?`,
+      detail: 'DockVault will stop syncing this vault. The files already copied to your folder are left as they are.',
+      buttons: ['Cancel', 'Stop syncing'], defaultId: 0, cancelId: 0,
+    });
+    if (res.response !== 1) return;
+    const dir = app.getPath('userData');
+    try {
+      syncConfigStore.saveConfig(safeStorage, dir, syncConfig.removeEntry(storedConfig(), vaultId));
+    } catch {
+      try { await dialog.showMessageBox(mainWindow, { type: 'error', title: 'Stop syncing', noLink: true, message: 'Your sync settings could not be updated', detail: 'DockVault could not read your current sync settings, so it did not change them. Try again after unlocking your login keychain and reopening DockVault.', buttons: ['OK'] }); } catch { /* best-effort */ }
+      return;
+    }
+    try { if (syncHub) syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* none */ }
+    refreshTray();
+  } finally {
+    syncFlowBusy = false;
+  }
+}
+
+// A one-time, non-blocking nudge that sync exists — shown once, on the first unlock, and ONLY when
+// the account actually has at least one vault that can be synced this way. A user with nothing
+// eligible is never teased about a capability they cannot use. Fail-quiet: if eligibility cannot be
+// determined (not signed in yet, or the list cannot be fetched) nothing is shown and nothing is
+// marked, so a later unlock can try again — the always-present tray entry covers discovery meanwhile.
+async function maybeOfferSyncSetup() {
+  if (!syncHub || SMOKE) return;
+  if (readState().syncOfferShown) return;
+  if (!Notification || !Notification.isSupported || !Notification.isSupported()) return;
+  let eligible = 0;
+  try {
+    const dir = app.getPath('userData');
+    const origin = serverConfig.readServerOrigin(dir);
+    const token = await resolveAccountToken(); // live token, not the stale boot snapshot
+    if (!origin || !token) return; // not signed in yet — fail-quiet, retry on a later unlock
+    const { vaults } = await syncVaults.fetchStandardVaults({ serverOrigin: origin, sessionToken: token }, mainHttpJson);
+    eligible = vaults.length;
+  } catch { return; } // any error — show nothing, mark nothing, try again later
+  writeState({ syncOfferShown: true }); // eligibility is known now: this is the one-and-only attempt
+  if (eligible < 1) return; // nothing to sync — don't nudge; the tray entry still offers it if that changes
+  try {
+    const n = new Notification({ title: 'DockVault', body: 'You can sync a vault to a folder on this computer — set it up any time from the tray menu.' });
+    n.on('click', () => { void setupSyncForVault(); });
+    n.show();
+  } catch { /* best-effort */ }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -55,6 +55,9 @@ const api = Object.freeze({
     status: () => ipcRenderer.invoke('dockvault:sync.status'),
     // Observe status changes (main -> renderer), same cred-free shape. Returns an unsubscribe fn.
     onStatus: (cb) => subscribe('syncstatus', cb),
+    // Observe-only by design: there is deliberately NO renderer method to start, configure, or list
+    // sync. Enabling/stopping is driven from the tray in the main process, so a compromised page can
+    // neither initiate the native flow nor supply a folder or config.
   }),
 });
 

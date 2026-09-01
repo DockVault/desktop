@@ -20,6 +20,13 @@ test('a locked-and-clean vault reads "Locked", not a bare "Paused"', () => {
   assert.strictEqual(tooltip(m, 'locked'), 'DockVault — Locked');
 });
 
+test('a configured-but-never-run vault reads the set-up-not-running label, never "Syncing"', () => {
+  const m = computeStatus({ ...secure, vaults: [vault({ lastResult: null, running: false })] });
+  assert.strictEqual(m.state, STATE.WAITING);
+  assert.strictEqual(tooltip(m, 'unlocked'), 'DockVault — Sync set up - not running yet');
+  assert.doesNotMatch(tooltip(m, 'unlocked'), /Syncing/);
+});
+
 test('the calm states carry a short why-suffix; up to date is bare', () => {
   assert.strictEqual(tooltip(computeStatus({ ...secure, vaults: [vault({ lastResult: 'ok' })] }), 'unlocked'), 'DockVault — Up to date');
   assert.strictEqual(tooltip(computeStatus({ ...secure, vaults: [vault({ lastResult: 'host-key-unverified' })] }), 'unlocked'), 'DockVault — Paused · cannot verify the server yet');
