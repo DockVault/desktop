@@ -16,7 +16,25 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - name: Scan for secrets
-        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+      # The gitleaks GitHub Action requires a paid licence for organisation repos; the gitleaks
+      # binary itself is free, so run it directly from the official image. Scan only the commits a
+      # change introduces (not the whole pre-existing tree / vendored code), which is the scope the
+      # action used and keeps the gate honest about what THIS change adds.
+      - name: Scan new commits for secrets (license-free gitleaks)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            git fetch --no-tags origin "$BASE_REF" >/dev/null 2>&1 || true
+            RANGE="origin/${BASE_REF}..HEAD"
+          elif [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            RANGE="${BEFORE}..HEAD"
+          else
+            RANGE="HEAD~1..HEAD"
+          fi
+          echo "gitleaks scanning commit range: $RANGE"
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest \
+            git /repo --log-opts="$RANGE" --redact --no-banner --exit-code 1
