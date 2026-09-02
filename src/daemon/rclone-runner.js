@@ -76,7 +76,7 @@ class RcloneRunner {
 
   // The single spawn chokepoint. NOTHING spawns rclone unless the binary's checksum has been verified
   // (so a tampered binary is never run), and no forbidden flag/subcommand (--force, any rc server) reaches it.
-  _launch(args, { timeoutMs = 30000, onLine, input, config } = {}) {
+  _launch(args, { timeoutMs = 30000, inactivityMs = null, hardCeilingMs = null, onLine, input, config } = {}) {
     if (!this._binaryVerified) return Promise.reject(new Error('rclone binary not verified; call ready() first'));
     const bad = forbiddenIn(args);
     if (bad) return Promise.reject(new Error(`refusing to run rclone with ${bad}`));
@@ -94,11 +94,32 @@ class RcloneRunner {
       let stdout = '';
       let stderr = '';
       let done = false;
-      const finish = (fn, arg) => { if (done) return; done = true; clearTimeout(timer); fn(arg); };
-      const timer = setTimeout(() => { try { child.kill(); } catch { /* already gone */ } finish(reject, new Error('rclone timeout')); }, timeoutMs);
-      if (timer.unref) timer.unref();
-      if (child.stdout) child.stdout.on('data', (c) => { stdout += c; if (onLine) String(c).split(/\r?\n/).forEach((l) => { if (l) onLine(l); }); });
-      if (child.stderr) child.stderr.on('data', (c) => { stderr += c; });
+      let idleTimer = null;
+      let ceilingTimer = null;
+      const clearTimers = () => { if (idleTimer) clearTimeout(idleTimer); if (ceilingTimer) clearTimeout(ceilingTimer); };
+      const finish = (fn, arg) => { if (done) return; done = true; clearTimers(); fn(arg); };
+      const killWith = (msg) => { try { child.kill(); } catch { /* already gone */ } finish(reject, new Error(msg)); };
+      // Two timeout shapes. Utility commands use a FIXED wall-clock timeout (small; fail fast). A long
+      // transfer/scan uses an INACTIVITY timeout that resets on ANY output from EITHER stream, so a
+      // long-but-progressing run survives while a truly silent/hung one is killed; a generous fixed hard
+      // ceiling still bounds a run that emits forever. Output is fed periodic stats (on stderr) by the
+      // caller's flags so a quiet-but-working transfer keeps the timer alive.
+      const resetIdle = () => {
+        if (done) return;
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => killWith(inactivityMs ? 'rclone inactivity timeout' : 'rclone timeout'), inactivityMs || timeoutMs);
+        if (idleTimer.unref) idleTimer.unref();
+      };
+      resetIdle();
+      if (inactivityMs) {
+        ceilingTimer = setTimeout(() => killWith('rclone hard-ceiling timeout'), hardCeilingMs || inactivityMs * 30);
+        if (ceilingTimer.unref) ceilingTimer.unref();
+      }
+      // stdout feeds onLine (the line relay) AND, for a transfer, resets the idle timer. stderr ONLY
+      // accumulates (for the typed-outcome classification) and resets the idle timer — it is NEVER relayed
+      // to onLine, because stats/progress lines carry file paths that must not be logged or sent onward.
+      if (child.stdout) child.stdout.on('data', (c) => { stdout += c; if (inactivityMs) resetIdle(); if (onLine) String(c).split(/\r?\n/).forEach((l) => { if (l) onLine(l); }); });
+      if (child.stderr) child.stderr.on('data', (c) => { stderr += c; if (inactivityMs) resetIdle(); });
       child.on('error', (e) => finish(reject, e));
       child.on('exit', (code) => finish(resolve, { code, stdout, stderr }));
     });

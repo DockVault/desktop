@@ -21,7 +21,8 @@ const RESULT = Object.freeze({
   OK: 'ok',                                          // green: a clean incremental run
   RESYNC_OK: 'resync-ok',                            // green: a clean, user-initiated resync
   CONFLICT_KEEP_BOTH: 'conflict-keep-both',          // run completed, both sides kept, no byte lost — attention
-  ABORT_EXCESSIVE_DELETE: 'abort-excessive-delete',  // safety abort; server copy intact; resync required
+  ABORT_EXCESSIVE_DELETE: 'abort-excessive-delete',  // safety abort: too many DELETES; server copy intact; resync required
+  ABORT_ALL_CHANGED: 'abort-all-changed',            // safety abort: ALL files on one side changed (a different guard); resync required
   NEEDS_RESYNC: 'needs-resync',                      // missing prior listing / critical error; resync required
   HOST_KEY_MISMATCH: 'host-key-mismatch',            // pinned != presented (MITM signal) — block, no auto-TOFU
   AUTH_FAILED: 'auth-failed',                        // SFTP auth refused (e.g. a lapsed credential) — sign-in-needed
@@ -35,8 +36,12 @@ const RESULT = Object.freeze({
 const HOST_KEY_UNVERIFIED = 'host-key-unverified';
 
 const SIG = Object.freeze({
-  // "Safety abort: too many deletes (>50%, N of M) ... Run with --force if desired. Bisync aborted."
-  excessiveDelete: /safety abort|too many deletes|max delete/i,
+  // "Safety abort: too many deletes (>50%, N of M) ... Run with --force if desired. Bisync aborted." NARROW to
+  // the DELETE wording — the bare "safety abort" is shared with the all-changed guard below, a different abort.
+  excessiveDelete: /too many deletes|max delete/i,
+  // "Safety abort: all files were changed on Path1/Path2 ... Run with --force". A DIFFERENT safety guard than the
+  // delete cap: every file on one side read as changed (here, mtime drift under set_modtime=false), NOT deletions.
+  allChanged: /all files were changed|all files changed/i,
   // "cannot find prior Path1 or Path2 listings ... Must run --resync to recover." / a bisync critical error.
   needsResync: /must run --resync|cannot find prior|critical error/i,
   // A pinned-host-key failure against the configured host_keys. Deliberately NARROW: it matches an actual
@@ -69,6 +74,9 @@ function classifyBisyncOutcome(o) {
   // the status layer can prompt sign-in, and leave the resync baseline untouched. Fail-closed, never silent.
   if (SIG.authFailed.test(text)) return { result: RESULT.AUTH_FAILED, resyncRequired: null, needsAttention: true };
   if (SIG.excessiveDelete.test(text)) return { result: RESULT.ABORT_EXCESSIVE_DELETE, resyncRequired: true, needsAttention: true };
+  // A different safety abort than the delete cap — all files on one side read as changed. Must NOT be labelled as
+  // a large DELETE (its own honest status); still a fail-closed abort requiring a deliberate resync.
+  if (SIG.allChanged.test(text)) return { result: RESULT.ABORT_ALL_CHANGED, resyncRequired: true, needsAttention: true };
   if (SIG.needsResync.test(text)) return { result: RESULT.NEEDS_RESYNC, resyncRequired: true, needsAttention: true };
 
   if (o.code !== 0) {

@@ -42,6 +42,15 @@ const MAX_DELETE_PERCENT = 50;
 const SFTP_CONNECTIONS = 1;
 // bisync can legitimately run long over SFTP; bound it generously rather than leaving it unbounded.
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+// A long transfer/scan is bounded by INACTIVITY, not a fixed wall clock: it is killed only after this long
+// with NO output, so a large-but-progressing run survives while a hung one is caught. rclone is quiet by
+// default, so the run is fed periodic progress with these FIXED flags (stats to stderr at NOTICE level, so
+// even a long quiet transfer emits a line ~every 30s and keeps the timer alive). The window is 4x the stats
+// period so a single delayed/missed stats line never false-trips it. A generous hard ceiling still bounds a
+// run that emits forever. The flags are fixed here — never caller/renderer-supplied (no argv injection).
+const SYNC_STATS_ARGS = Object.freeze(['--stats', '30s', '--stats-log-level', 'NOTICE']);
+const SYNC_INACTIVITY_MS = 120 * 1000;          // 4x the 30s stats period
+const SYNC_HARD_CEILING_MS = 6 * 60 * 60 * 1000; // absolute backstop, even if stats never stop
 
 /**
  * A short, stable, filesystem-safe bisync workdir for one vault under `runDir`. The vault id (an
@@ -63,7 +72,23 @@ function buildBisyncArgs({ local, remote, workdir, resync = false }) {
   const args = ['bisync', String(local), String(remote),
     '--workdir', String(workdir),
     '--max-delete', String(MAX_DELETE_PERCENT),
-    '--transfers', String(SFTP_CONNECTIONS), '--checkers', String(SFTP_CONNECTIONS)];
+    // Compare by SIZE, not modtime. This server cannot store a client mtime (SETSTAT is unsupported; every file's
+    // mtime is the server's own upload timestamp), so a modtime compare re-reads a different mtime than the
+    // baseline recorded and reports EVERY file "changed" — tripping the all-changed safety abort on every run so
+    // routine sync never progresses. Size is stable across re-listings. The safety guards are unchanged (a real
+    // >50% name-absent delete still aborts; a real whole-side SIZE change still aborts). A same-size content
+    // overwrite is the known blind spot of size-compare: a routine run does NOT detect it and does NOT self-heal
+    // it — it is reconciled only by a DELIBERATE Repair (the zero-loss resync's byte-true `check --download`),
+    // which runs on the first baseline or a user-initiated Repair, never automatically/periodically. Closing it
+    // in routine sync needs a server that preserves a client mtime or exposes a hash (tracked cross-repo follow-up).
+    '--compare', 'size',
+    '--transfers', String(SFTP_CONNECTIONS), '--checkers', String(SFTP_CONNECTIONS),
+    // Attempt the run ONCE. Each single-use credential authenticates one connection, so retrying the whole
+    // operation would re-authenticate with a spent credential and, on a genuine auth failure, hammer the
+    // server's per-source login limiter. It also means a safety abort (excessive delete) is never
+    // re-attempted. A transient failure simply re-ticks on the next scheduled sweep.
+    '--retries', '1',
+    ...SYNC_STATS_ARGS]; // periodic progress so the inactivity timeout can tell a long run from a hung one
   if (resync) args.push('--resync'); // only ever on an explicit, user-initiated resync
   return args;
 }
@@ -86,6 +111,29 @@ function buildBisyncArgs({ local, remote, workdir, resync = false }) {
  * @param {number} [o.timeoutMs]
  * @returns {Promise<{ran:boolean, code?:number, result:string, resyncRequired:boolean, needsAttention?:boolean, stdout?:string, stderr?:string}>}
  */
+// A per-step credential prepare (mint-fresh-per-process, resync path) that FAILED — no rclone ran. Surface the
+// typed reason AS the run outcome so it reads the same as a dispatch-time failure: a changed identity stays the
+// loud mismatch, an unverifiable server the calm cannot-verify, a lost session a sign-in; anything else is a
+// retryable error. resyncRequired is carried through unchanged (nothing ran to clear or set it).
+const CRED_REASON_RESULT = Object.freeze({
+  'host-key-mismatch': 'host-key-mismatch',
+  'host-key-unavailable': 'host-key-unverified',
+  'no-session': 'auth-failed',
+});
+// A TRANSIENT authority refusal (a lock, or a lost connection, mid-resync) is not a failure: the run simply did
+// not happen, and it must read as the SAME calm skip the pre-dispatch gate emits — never a "couldn't sync"
+// problem. A NOT-RUN shape (result null + the reason) signals the caller to emit a skip that keeps the last
+// state. An invariant violation ('not-in-flight' / 'cap-exceeded') is NOT transient — it stays a plain error.
+const CRED_REASON_TRANSIENT = new Set(['paused-locked', 'waiting-to-reconnect']);
+function credPrepareOutcome(reason, resyncRequired) {
+  if (CRED_REASON_TRANSIENT.has(reason)) {
+    return { ran: false, result: null, reason, resyncRequired: !!resyncRequired, needsAttention: false, preserved: 0 };
+  }
+  const result = CRED_REASON_RESULT[reason] || 'error';
+  const needsAttention = result === 'host-key-mismatch' || result === 'auth-failed';
+  return { ran: false, result, resyncRequired: !!resyncRequired, needsAttention, preserved: 0 };
+}
+
 async function runBisync(o) {
   const now = o.now || (() => Date.now());
   const state = o.db ? getRunState(o.db, o.vault) : { resyncRequired: true };
@@ -96,9 +144,22 @@ async function runBisync(o) {
     return { ran: false, result: 'blocked-needs-resync', resyncRequired: true, needsAttention: true, stdout: '', stderr: '' };
   }
 
+  // A fresh single-use credential for THIS rclone process, when a per-step provider is wired (the resync path,
+  // whose several processes each burn a credential). On failure the TYPED reason becomes the run outcome, never
+  // a generic error, so a mid-run host-key rotation stays the loud mismatch and a lost session a sign-in —
+  // exactly as they read when the failure happens at dispatch. Nothing ran, so the resync block is untouched.
+  if (o.prepareCred) {
+    const p = await o.prepareCred();
+    if (!p || !p.ok) return credPrepareOutcome(p && p.reason, state.resyncRequired);
+  }
+
   fs.mkdirSync(o.workdir, { recursive: true });
   const args = buildBisyncArgs({ local: o.local, remote: o.remote, workdir: o.workdir, resync: !!o.resync });
-  const { code, stdout, stderr } = await o.runner.run(args, { config: o.config, timeoutMs: o.timeoutMs || DEFAULT_TIMEOUT_MS });
+  const { code, stdout, stderr } = await o.runner.run(args, {
+    config: o.config,
+    inactivityMs: o.inactivityMs || SYNC_INACTIVITY_MS,
+    hardCeilingMs: o.hardCeilingMs || SYNC_HARD_CEILING_MS,
+  });
 
   // Classify into ONE typed result. A safety abort (excessive delete) and a critical/needs-resync outcome
   // SET the resync block; a completed run clears it; a connection-level block (host-key mismatch) or a
@@ -110,4 +171,4 @@ async function runBisync(o) {
   return { ran: true, code, result: outcome.result, resyncRequired, needsAttention: outcome.needsAttention, stdout, stderr };
 }
 
-module.exports = { buildBisyncArgs, runBisync, bisyncWorkdir, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS };
+module.exports = { buildBisyncArgs, runBisync, credPrepareOutcome, bisyncWorkdir, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS };

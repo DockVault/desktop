@@ -9,7 +9,7 @@ const abs = (p) => path.resolve(p);
 
 // A configurable fake of the injected input/output surface, with a call log.
 function makeIo(over = {}) {
-  const log = { refused: [], saved: null, consentAsked: null, cloudAsked: 0, ensured: null, classifyVaultId: undefined, folderPicks: 0 };
+  const log = { refused: [], saved: null, consentAsked: null, cloudAsked: 0, ensured: null, classifyVaultId: undefined, folderPicks: 0, makePrivateAsked: 0, madePrivate: null };
   const folders = (over.folders || []).slice(); // queue of pickFolder results
   const io = {
     listVaults: over.listVaults || (async () => [{ vaultId: 'v1', vaultName: 'Marketing' }]),
@@ -24,6 +24,11 @@ function makeIo(over = {}) {
     onRefuse: over.onRefuse || ((r) => { log.refused.push(r); }),
     save: over.save || ((e) => { log.saved = e; }),
   };
+  // The folder-privacy gate callbacks are attached ONLY when a test provides them, so the default flow
+  // (nothing shared) skips the gate exactly as production does when a folder has no foreign access.
+  if (over.inspectFolderSharing) io.inspectFolderSharing = over.inspectFolderSharing;
+  io.confirmMakePrivate = over.confirmMakePrivate || (async () => { log.makePrivateAsked += 1; return 'make-private'; });
+  io.makePrivate = over.makePrivate || (async (f) => { log.madePrivate = f; return { ok: true }; });
   return { io, log };
 }
 
@@ -32,7 +37,7 @@ test('happy path: derives the remote from the vault, creates the folder, saves a
   const r = await runEnableFlow(io);
   assert.strictEqual(r.enabled, true);
   assert.deepStrictEqual(r.entry, {
-    vaultId: 'v1', vaultName: 'Marketing', localFolder: abs('/Users/tester/Vaults/Marketing'), remotePath: 'Marketing', enabled: true,
+    vaultId: 'v1', vaultName: 'Marketing', localFolder: abs('/Users/tester/Vaults/Marketing'), remotePath: 'Marketing', enabled: true, consented: true,
   });
   assert.strictEqual(log.saved.remotePath, 'Marketing', 'remote is derived from the vault name, not the picked folder');
   assert.strictEqual(log.ensured, abs('/Users/tester/Vaults/Marketing'), 'the folder is created before saving');
@@ -118,6 +123,59 @@ test('consent is folder-aware: a non-empty folder is signalled to the consent st
   assert.strictEqual(log.consentAsked.nonEmpty, true, 'the consent copy can warn about existing contents being uploaded');
   assert.strictEqual(log.consentAsked.vaultName, 'Marketing');
   assert.strictEqual(log.consentAsked.folder, abs('/Users/tester/Vaults/M'));
+});
+
+test('a shared folder: consenting to "make it private" strips the access, then setup proceeds', async () => {
+  const madeCalls = [];
+  const { io, log } = makeIo({
+    folders: [abs('/Users/tester/Vaults/Shared')],
+    inspectFolderSharing: async () => ({ shares: ['Everyone'], denies: [] }),
+    makePrivate: async (f) => { madeCalls.push(f); return { ok: true }; },
+  });
+  const r = await runEnableFlow(io);
+  assert.strictEqual(r.enabled, true);
+  assert.deepStrictEqual(madeCalls, [abs('/Users/tester/Vaults/Shared')], 'the folder was made private after consent, before saving');
+  assert.ok(log.consentAsked, 'the upload consent still follows');
+  assert.strictEqual(log.saved.localFolder, abs('/Users/tester/Vaults/Shared'));
+});
+
+test('a shared folder: "choose a different folder" strips nothing and re-picks', async () => {
+  let madePrivateCalls = 0;
+  const { io, log } = makeIo({
+    folders: [abs('/Users/tester/Vaults/Shared'), abs('/Users/tester/Vaults/Private')],
+    inspectFolderSharing: async (f) => (/Shared$/.test(f) ? { shares: ['Everyone'], denies: [] } : { shares: [], denies: [] }),
+    confirmMakePrivate: async () => 'choose-different',
+    makePrivate: async () => { madePrivateCalls += 1; return { ok: true }; },
+  });
+  const r = await runEnableFlow(io);
+  assert.strictEqual(madePrivateCalls, 0, 'declining to make it private never strips access');
+  assert.strictEqual(r.enabled, true);
+  assert.strictEqual(log.saved.localFolder, abs('/Users/tester/Vaults/Private'), 'setup continued with a different folder');
+});
+
+test('a shared folder: cancelling the privacy gate saves nothing and strips nothing', async () => {
+  let madePrivateCalls = 0;
+  const { io, log } = makeIo({
+    folders: [abs('/Users/tester/Vaults/Shared')],
+    inspectFolderSharing: async () => ({ shares: ['Everyone'], denies: [] }),
+    confirmMakePrivate: async () => 'cancel',
+    makePrivate: async () => { madePrivateCalls += 1; return { ok: true }; },
+  });
+  assert.deepStrictEqual(await runEnableFlow(io), { enabled: false, cancelled: true });
+  assert.strictEqual(madePrivateCalls, 0, 'the shared access survives — nothing is stripped without consent');
+  assert.strictEqual(log.saved, null);
+});
+
+test('a shared folder: a failed make-private is surfaced and the flow re-picks (never a dead-end)', async () => {
+  const { io, log } = makeIo({
+    folders: [abs('/Users/tester/Vaults/Shared'), abs('/Users/tester/Vaults/Private')],
+    inspectFolderSharing: async (f) => (/Shared$/.test(f) ? { shares: ['Everyone'], denies: [] } : { shares: [], denies: [] }),
+    makePrivate: async () => ({ ok: false, reason: 'acl-remove-failed' }),
+  });
+  const r = await runEnableFlow(io);
+  assert.deepStrictEqual(log.refused, ['acl-remove-failed'], 'the failure to secure the folder was surfaced');
+  assert.strictEqual(r.enabled, true);
+  assert.strictEqual(log.saved.localFolder, abs('/Users/tester/Vaults/Private'), 'the flow recovered by re-picking, not a dead-end');
 });
 
 test('the resolved (symlink-real) target is what gets classified and stored', async () => {

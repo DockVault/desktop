@@ -88,11 +88,18 @@ const OUTCOME_STATE = Object.freeze({
   'needs-resync': { state: STATE.NEEDS_DECISION, reason: 'needs-repair' },
   'blocked-needs-resync': { state: STATE.NEEDS_DECISION, reason: 'needs-repair' },
   'abort-excessive-delete': { state: STATE.NEEDS_DECISION, reason: 'confirm-large-delete' },
+  // A different safety abort than the delete cap (all files on one side read as changed). It needs a deliberate
+  // resync to re-establish the baseline — surfaced as a repair, NOT as a "large delete" (which it is not).
+  'abort-all-changed': { state: STATE.NEEDS_DECISION, reason: 'needs-repair' },
   'auth-failed': { state: STATE.NEEDS_DECISION, reason: 'sign-in-needed' },
   'path-too-long': { state: STATE.NEEDS_DECISION, reason: 'path-too-long' },
   'host-key-unverified': { state: STATE.PAUSED, reason: 'cannot-verify-yet' },
   'host-key-mismatch': { state: STATE.SYNC_PROBLEM, reason: 'host-key-mismatch' },
   'error': { state: STATE.SYNC_PROBLEM, reason: 'error' },
+  // Persistent failure to sync at all (repeated run errors, or repeated failures before a run even starts).
+  // A must-act — sync is not happening — but framed by DURATION, not danger: it is far more often a
+  // connection/sign-in issue than corruption, so its copy stays calm.
+  'not-syncing': { state: STATE.SYNC_PROBLEM, reason: 'not-syncing' },
 });
 
 /**
@@ -101,11 +108,30 @@ const OUTCOME_STATE = Object.freeze({
  * @param {boolean} [v.running]       a run is in flight right now
  * @param {string|null} [v.lastResult] the last typed outcome, or null if it has never completed a run
  * @param {boolean} [v.resyncRequired] a resync is owed (a blocked latch)
- * @returns {{vault:string, state:string, reason:(string|null), running:boolean, resyncRequired:boolean}}
+ * @param {{state:string, reason:(string|null)}|null} [v.condition] a live reason the vault cannot run
+ *   right now (e.g. it is no longer eligible, the folder is gone, sign-in is needed, consent is owed).
+ *   Distinct from a completed run's outcome: it is set when a dispatch was refused/paused rather than run,
+ *   and it FORBIDS a stale green — a vault that cannot run must never keep reading "Up to date".
+ * @param {number|null} [v.lastSyncedAt] epoch-ms of this vault's last SUCCESSFUL run, or null if it has
+ *   never succeeded this session. Carried through untouched for the "Last synced" glance; it never
+ *   affects the state (a stale success time must not make a failing vault read green).
+ * @returns {{vault:string, state:string, reason:(string|null), running:boolean, resyncRequired:boolean, lastSyncedAt:(number|null)}}
  */
 function vaultState(v) {
   const running = !!v.running;
   const resyncRequired = !!v.resyncRequired;
+  const base = baseVaultState(v, running, resyncRequired);
+  // Fold a live can't-run condition over the last-outcome state: it wins whenever it is at least as
+  // severe, so a persistent refusal (a decision or a problem) replaces a stale "up to date", while a
+  // strictly more severe completed outcome (e.g. a prior sync problem) is not masked by it.
+  const cond = v.condition && v.condition.state ? v.condition : null;
+  const out = (cond && RANK[cond.state] >= RANK[base.state])
+    ? { vault: v.vault, state: cond.state, reason: cond.reason || null, running, resyncRequired }
+    : base;
+  return { ...out, lastSyncedAt: v.lastSyncedAt != null ? v.lastSyncedAt : null };
+}
+
+function baseVaultState(v, running, resyncRequired) {
   // A blocked latch (a resync is owed) is a decision the person must make, even mid-run: it never
   // silently clears and it never reads as green. It outranks the transient "syncing" face.
   if (resyncRequired && (v.lastResult == null || OUTCOME_STATE[v.lastResult] == null

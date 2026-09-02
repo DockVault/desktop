@@ -5,8 +5,10 @@
  *
  * The window and the daemon OBSERVE this; they never hold divergent unlocked state. Two INDEPENDENT
  * lifecycles that must never be conflated:
- *   - "signed in" (the account session): persists until sign-out; a ZK lock never touches it, and
- *     Standard-vault sync keeps running while ZK is locked.
+ *   - "signed in" (the account session): persists until sign-out; a lock never re-prompts for sign-in.
+ *     But it does NOT mean sync runs while locked: Standard-vault sync DISPATCH pauses on any lock (no new
+ *     run starts), and the account-tier SFTP credential is dropped as hygiene on the lock and re-minted
+ *     from the still-live session on unlock.
  *   - "unlocked" (the zero-knowledge key is present): memory-only; on a lock event it is dropped
  *     atomically across BOTH the renderer's UI key AND the daemon's sync key.
  *

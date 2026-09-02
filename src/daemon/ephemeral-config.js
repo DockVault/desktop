@@ -50,6 +50,31 @@ async function withEphemeralConfig(runDir, contents, fn, opts = {}) {
 }
 
 /**
+ * Atomically replace the contents of an existing ephemeral config `configPath` with `contents`, for the
+ * per-process credential refresh of a multi-step resync (the server burns a temp credential on first use, so
+ * each rclone process needs a fresh one written before it runs). Writes a fresh 0600 temp file in the SAME
+ * directory and renames it over the target, so no rclone process can ever read a half-written config — and the
+ * previous process has already exited (the runner awaits), so there is no concurrent reader. The temp shares
+ * the ephemeral PREFIX/SUFFIX, so the crash-sweep still reclaims it if a crash lands between write and rename.
+ * @param {string} configPath  the ephemeral config to replace (created by withEphemeralConfig)
+ * @param {string} contents    the fresh rclone config text
+ * @param {{ nameFn?: () => string }} [opts]  test seam for the temp filename
+ */
+function rewriteEphemeralConfig(configPath, contents, opts = {}) {
+  const dir = path.dirname(configPath);
+  const tmp = path.join(dir, (opts.nameFn || defaultName)());
+  const fd = fs.openSync(tmp, 'wx', 0o600); // O_EXCL: never follow/overwrite a planted path
+  try { fs.writeSync(fd, contents); } finally { try { fs.closeSync(fd); } catch { /* ignore */ } }
+  try { fs.chmodSync(tmp, 0o600); } catch { /* best effort on Windows */ }
+  try {
+    fs.renameSync(tmp, configPath); // atomic replace within the one directory
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* left for the crash-sweep */ }
+    throw e;
+  }
+}
+
+/**
  * Remove any orphaned ephemeral configs left by a crash mid-run. Called on daemon start. Fail-closed:
  * throws if an orphan cannot be removed, so a lingering cred file is surfaced, never left silently.
  */
@@ -77,6 +102,15 @@ function formatSftpRemote(name, params) {
     user: params.user,
     pass: params.obscuredPass, // rclone "obscure" form (reversible; NOT protection — the 0600 file + TTL are)
     host_keys: params.hostKeys, // pinned server host key(s): verifies the server, defeats MITM/TOFU
+    // This deployment's SFTP refuses SETSTAT/setmodtime (SSH_FX_OP_UNSUPPORTED), which would fail every upload;
+    // disable it. A fixed benign flag, not a credential. Consequence for change-detection: the server assigns its
+    // OWN mtime (its upload timestamp), so a client mtime never survives a round-trip and mtime is unreliable for
+    // comparison — the bisync runs therefore compare by SIZE (see buildBisyncArgs `--compare size`), not modtime.
+    // The blind spot of size-compare — a same-size content overwrite — is NOT caught by a routine run and does NOT
+    // self-heal: it is reconciled only by a DELIBERATE Repair (the zero-loss resync's byte-true `check --download`),
+    // which runs on the first baseline or a user-initiated Repair, never automatically. (Closing it in routine sync
+    // needs a server that persists a client mtime or exposes a hash — a vault-side change, tracked as a follow-up.)
+    set_modtime: 'false',
   };
   const safe = (v) => typeof v === 'string' || typeof v === 'number';
   if (!/^[A-Za-z0-9_-]+$/.test(String(name))) throw new Error('invalid remote name');
@@ -87,4 +121,4 @@ function formatSftpRemote(name, params) {
   return `[${name}]\n${body}\n`;
 }
 
-module.exports = { withEphemeralConfig, sweepStaleConfigs, formatSftpRemote, PREFIX, SUFFIX };
+module.exports = { withEphemeralConfig, rewriteEphemeralConfig, sweepStaleConfigs, formatSftpRemote, PREFIX, SUFFIX };

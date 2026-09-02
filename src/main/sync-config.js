@@ -24,7 +24,7 @@
 const path = require('node:path');
 
 // The only fields the persisted config may carry. Anything credential-adjacent is rejected outright.
-const CONFIG_FIELDS = Object.freeze(['vaultId', 'vaultName', 'localFolder', 'remotePath', 'enabled']);
+const CONFIG_FIELDS = Object.freeze(['vaultId', 'vaultName', 'localFolder', 'remotePath', 'enabled', 'consented']);
 const FORBIDDEN_CONFIG_FIELDS = Object.freeze([
   'password', 'credential', 'cred', 'secret', 'token', 'accessToken', 'sessionToken',
   'hostKey', 'hostKeys', 'key', 'passphrase', 'obscured',
@@ -164,7 +164,10 @@ function makeConfigEntry(o = {}) {
   if (!o.vaultName || typeof o.vaultName !== 'string') throw new Error('config needs a vaultName');
   if (!o.localFolder || typeof o.localFolder !== 'string' || !path.isAbsolute(o.localFolder)) throw new Error('config needs an absolute localFolder');
   if (!o.remotePath || typeof o.remotePath !== 'string') throw new Error('config needs a remotePath');
-  return { vaultId: o.vaultId, vaultName: o.vaultName, localFolder: path.resolve(o.localFolder), remotePath: o.remotePath, enabled: o.enabled !== false };
+  // `consented` records that the two-way readable-copies consent was given at set-up. It defaults false,
+  // so a config written before this existed reads as not-yet-consented and the first upload re-asks — the
+  // consent is never assumed, only ever recorded when it was actually given.
+  return { vaultId: o.vaultId, vaultName: o.vaultName, localFolder: path.resolve(o.localFolder), remotePath: o.remotePath, enabled: o.enabled !== false, consented: !!o.consented };
 }
 
 // Guard used before persisting or shipping a record anywhere: no credential-adjacent field, ever.

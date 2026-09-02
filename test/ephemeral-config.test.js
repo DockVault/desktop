@@ -75,9 +75,11 @@ test('formatSftpRemote emits only the connection params + obscured cred + pinned
   assert.match(cfg, /user = tc_abc\n/);
   assert.match(cfg, /pass = OBSCURED_xyz\n/);
   assert.match(cfg, /host_keys = ssh-ed25519 AAAAC3Nz\.\.\.\n/);
+  // This deployment's SFTP refuses set-modtime; the config disables it so uploads don't fail.
+  assert.match(cfg, /set_modtime = false\n/);
   // Field-contents discipline: no key/token fields ever appear.
   assert.ok(!/(\bkey_pem\b|\bkey_file\b|token|dbk|passphrase|secret)/i.test(cfg), 'no key/token material');
-  assert.strictEqual(cfg.trim().split('\n').length, 7, 'section header + exactly 6 fields');
+  assert.strictEqual(cfg.trim().split('\n').length, 8, 'section header + exactly 7 fields');
 });
 
 test('formatSftpRemote rejects config injection (newline in a value) and a bad remote name', () => {

@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { tooltip, mustActItems } = require('../src/main/tray-presentation');
+const { tooltip, mustActItems, syncNowItem, lastSyncedLabel, vaultRows } = require('../src/main/tray-presentation');
 const { computeStatus, STATE } = require('../src/main/sync-status-model');
 
 const secure = { hasSecureStore: true, online: true, daemon: 'ready' };
@@ -64,4 +64,80 @@ test('every unresolved vault item becomes a reachable tray action of the right k
 test('no unresolved item => no must-act menu entries', () => {
   const m = computeStatus({ ...secure, vaults: [vault({ lastResult: 'ok' })] });
   assert.deepStrictEqual(mustActItems(m), []);
+});
+
+test('a persistent cant-run condition becomes the right reachable tray action', () => {
+  const m = computeStatus({ ...secure, vaults: [
+    vault({ vault: 'a', lastResult: 'ok', condition: { state: STATE.NEEDS_DECISION, reason: 'vault-unavailable' } }),
+    vault({ vault: 'b', lastResult: 'ok', condition: { state: STATE.NEEDS_DECISION, reason: 'folder-rejected' } }),
+    vault({ vault: 'c', lastResult: 'ok', condition: { state: STATE.NEEDS_DECISION, reason: 'folder-problem' } }),
+  ] });
+  const items = mustActItems(m);
+  const byVault = Object.fromEntries(items.filter((i) => i.vault).map((i) => [i.vault, i.kind]));
+  assert.strictEqual(byVault.a, 'open', 'an unavailable vault is reachable, calmly worded');
+  assert.strictEqual(byVault.b, 'choose-folder', 'a gone folder routes back to picking a folder');
+  assert.match(items.find((i) => i.vault === 'b').label, /choose a folder again/);
+  // A re-shared folder is a DISTINCT action: re-present the make-private consent, not pick a new folder.
+  assert.strictEqual(byVault.c, 'recover-folder', 'a re-shared folder offers to make it private again');
+  assert.match(items.find((i) => i.vault === 'c').label, /shared again — make it private/);
+});
+
+test('consent-declined reads as calm WAITING and earns NO must-act item (never nags a made choice)', () => {
+  const m = computeStatus({ ...secure, vaults: [vault({ vault: 'a', condition: { state: STATE.WAITING, reason: 'consent-needed' } })] });
+  assert.strictEqual(m.vaults[0].state, STATE.WAITING);
+  assert.deepStrictEqual(mustActItems(m), []);
+});
+
+test('"Sync now" is offered when idle, but a running vault shows the run in progress, never a false new start', () => {
+  const idle = syncNowItem({ vault: 'a', running: false });
+  assert.deepStrictEqual(idle, { kind: 'sync-now', vault: 'a', enabled: true, label: 'Sync a now' });
+  const running = syncNowItem({ vault: 'a', running: true });
+  assert.strictEqual(running.kind, 'syncing');
+  assert.strictEqual(running.enabled, false, 'a run in flight is not clickable as a fresh "Sync now"');
+  assert.doesNotMatch(running.label, /Sync a now/);
+});
+
+test('vaultRows matches each configured vault to its live status, honestly, with a safe fallback', () => {
+  const now = 10 * 24 * 60 * 60 * 1000;
+  const configured = [
+    { vaultId: 'v1', vaultName: 'Marketing' },
+    { vaultId: 'v2', vaultName: 'Finance' },
+    { vaultId: 'v3', vaultName: 'Design' },
+  ];
+  const modelVaults = [
+    { vault: 'v1', running: true, lastSyncedAt: now - 5 * 60 * 1000 },   // a run in flight
+    { vault: 'v2', running: false, lastSyncedAt: now - 60 * 1000 },      // idle, synced a minute ago
+    // v3 has no computed status entry yet
+  ];
+  const rows = vaultRows(configured, modelVaults, now);
+  assert.strictEqual(rows.length, 3);
+  // v1: in flight -> shows the run, the "Sync now" is not offered as a fresh start
+  assert.strictEqual(rows[0].syncLabel, 'Syncing…');
+  assert.strictEqual(rows[0].syncEnabled, false);
+  assert.match(rows[0].lastSynced, /Last synced/);
+  // v2: idle -> "Sync now" offered (enqueues), and a real last-synced time
+  assert.strictEqual(rows[1].syncLabel, 'Sync now');
+  assert.strictEqual(rows[1].syncEnabled, true);
+  assert.strictEqual(rows[1].lastSynced, 'Last synced 1 min ago');
+  // v3: no status yet -> safe fallback (not running, never synced), never a stale/false view
+  assert.strictEqual(rows[2].syncLabel, 'Sync now');
+  assert.strictEqual(rows[2].syncEnabled, true);
+  assert.strictEqual(rows[2].lastSynced, 'Not synced yet');
+  assert.strictEqual(rows[2].vaultId, 'v3');
+  assert.strictEqual(rows[2].vaultName, 'Design');
+});
+
+test('vaultRows is empty when nothing is configured, regardless of stray status entries', () => {
+  assert.deepStrictEqual(vaultRows([], [{ vault: 'ghost', running: true }], 0), []);
+  assert.deepStrictEqual(vaultRows(undefined, undefined, 0), []);
+});
+
+test('"Last synced" reads from the last-success time only, never fabricating one', () => {
+  const now = 10 * 24 * 60 * 60 * 1000; // a fixed reference instant
+  assert.strictEqual(lastSyncedLabel(null, now), 'Not synced yet');
+  assert.strictEqual(lastSyncedLabel(now - 30 * 1000, now), 'Last synced just now');
+  assert.strictEqual(lastSyncedLabel(now - 5 * 60 * 1000, now), 'Last synced 5 min ago');
+  assert.strictEqual(lastSyncedLabel(now - 3 * 60 * 60 * 1000, now), 'Last synced 3 h ago');
+  assert.strictEqual(lastSyncedLabel(now - 2 * 24 * 60 * 60 * 1000, now), 'Last synced 2 d ago');
+  assert.strictEqual(lastSyncedLabel(now + 5000, now), 'Last synced just now', 'a clock step to the future never reads as a negative age');
 });

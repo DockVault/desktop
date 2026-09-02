@@ -30,6 +30,10 @@ test('buildBisyncArgs bakes in the safety controls and never emits --force/--ign
   const ci = a.indexOf('--checkers');
   assert.ok(ti >= 0 && a[ti + 1] === '1', 'transfers pinned to a single connection');
   assert.ok(ci >= 0 && a[ci + 1] === '1', 'checkers pinned to a single connection');
+  const ri = a.indexOf('--retries');
+  assert.ok(ri >= 0 && a[ri + 1] === '1', 'the run is attempted once — no re-auth with a spent single-use credential, no re-attempt of a safety abort');
+  const ki = a.indexOf('--compare');
+  assert.ok(ki >= 0 && a[ki + 1] === 'size', 'change-detection is by size — this server cannot preserve a client mtime, so a modtime compare would spuriously report every file changed');
 });
 
 test('buildBisyncArgs adds --resync only when requested; the delete guard is fixed + non-defeatable', () => {

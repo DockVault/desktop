@@ -104,3 +104,17 @@ test('every classifier outcome maps to a defined state', () => {
     assert.ok(OUTCOME_STATE[k] && OUTCOME_STATE[k].state, `${k} maps to a state`);
   }
 });
+
+test('a live can\'t-run condition overrides a stale green, but never masks a more severe outcome', () => {
+  // stale "ok" + a sign-in condition => needs-decision (a vault that cannot run never keeps up-to-date)
+  const a = vaultState({ vault: 'a', lastResult: 'ok', condition: { state: STATE.NEEDS_DECISION, reason: 'sign-in-needed' } });
+  assert.strictEqual(a.state, STATE.NEEDS_DECISION);
+  assert.strictEqual(a.reason, 'sign-in-needed');
+  // a prior sync problem outranks a lower condition and is not hidden by it
+  const b = vaultState({ vault: 'b', lastResult: 'host-key-mismatch', condition: { state: STATE.PAUSED, reason: 'retrying' } });
+  assert.strictEqual(b.state, STATE.SYNC_PROBLEM);
+  // consent-declined (WAITING) over a never-run vault carries the consent reason, not the bare waiting one
+  const c = vaultState({ vault: 'c', lastResult: null, condition: { state: STATE.WAITING, reason: 'consent-needed' } });
+  assert.strictEqual(c.state, STATE.WAITING);
+  assert.strictEqual(c.reason, 'consent-needed');
+});

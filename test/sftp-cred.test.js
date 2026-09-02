@@ -80,3 +80,10 @@ test('mintSftpAccess returns the per-run bundle and leaks neither the account to
   assert.ok(!serialized.includes(TOKEN), 'the account session token never appears in the bundle');
   assert.ok(!serialized.includes('VAULTPW'), 'the vault-password proof never appears in the bundle');
 });
+
+test('fetchHostKey on a server without the endpoint (404) fails closed as can\'t-verify (not auth, not a bare retry)', async () => {
+  await assert.rejects(
+    () => fetchHostKey({ serverOrigin: ORIGIN, sessionToken: TOKEN }, mockFetch({ '/sftp/host-key': { status: 404, body: {} } })),
+    (e) => { assert.strictEqual(e.status, 404); assert.strictEqual(e.reason, 'host-key-unverified'); return true; },
+  );
+});

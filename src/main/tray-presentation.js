@@ -26,6 +26,8 @@ const REASON_DETAIL = Object.freeze({
   'waiting-to-reconnect': 'waiting to reconnect',
   'reconnecting': 'reconnecting',
   'cannot-verify-yet': 'cannot verify the server yet',
+  'retrying': 'retrying',
+  'consent-needed': 'approve syncing to start',
   // 'waiting-first-sync' carries no suffix: the "Waiting to start" label already says it plainly, and
   // a configured-but-never-run vault must read as not-yet-running, never as active "syncing".
 });
@@ -36,6 +38,9 @@ function tooltip(model, lockPhase) {
   if (model.condition === 'unavailable') return 'DockVault — Sync unavailable';
   if (model.condition === 'not-configured') return 'DockVault';
   if (model.state === STATE.PAUSED && model.reason === 'locked') return 'DockVault — Locked';
+  // A persistent no-sync is a must-act, but its glance reads by duration, not alarm (it is usually a
+  // connection or sign-in issue). Keep the calm phrasing rather than the bare "Sync problem" label.
+  if (model.state === STATE.SYNC_PROBLEM && model.reason === 'not-syncing') return "DockVault — Sync hasn't run for a while";
   const detail = REASON_DETAIL[model.reason];
   return 'DockVault — ' + model.label + (detail ? ' · ' + detail : '');
 }
@@ -50,6 +55,11 @@ function itemForVault(v) {
     case 'confirm-large-delete': return { kind: 'repair', vault: v.vault, label: `Repair sync for ${v.vault}` };
     case 'path-too-long': return { kind: 'repair', vault: v.vault, label: `A file in ${v.vault} needs a shorter path` };
     case 'host-key-mismatch': return { kind: 'check-identity', vault: v.vault, label: `Check ${v.vault}: the server identity changed` };
+    case 'vault-unavailable': return { kind: 'open', vault: v.vault, label: `${v.vault} can't sync right now — it may have been changed or removed` };
+    case 'not-syncing': return { kind: 'open', vault: v.vault, label: `${v.vault} hasn't synced for a while — check your connection` };
+    case 'folder-problem': return { kind: 'recover-folder', vault: v.vault, label: `The sync folder for ${v.vault} is shared again — make it private` };
+    case 'folder-insecure':
+    case 'folder-rejected': return { kind: 'choose-folder', vault: v.vault, label: `The sync folder for ${v.vault} can't be used — choose a folder again` };
     default: return { kind: 'open', vault: v.vault, label: `Sync problem with ${v.vault}` };
   }
 }
@@ -67,4 +77,57 @@ function mustActItems(model) {
   return items;
 }
 
-module.exports = { tooltip, mustActItems, REASON_DETAIL };
+// The per-vault "Sync now" affordance, honest about concurrency. While a run is actually in flight for
+// this vault it does NOT offer to start another — the runs are serialised (one credential, one run at a
+// time) and a second is refused — so it shows the run in progress instead. When the vault is not running
+// it offers "Sync now", which merely ENQUEUES a manual run: if another vault is mid-run the scheduler
+// queues this one, and the glance moves to syncing in its turn. So the menu never claims a fresh sync
+// "started" while one is already underway; it states what is true right now.
+function syncNowItem(v) {
+  if (v.running) return { kind: 'syncing', vault: v.vault, enabled: false, label: `Syncing ${v.vault}…` };
+  return { kind: 'sync-now', vault: v.vault, enabled: true, label: `Sync ${v.vault} now` };
+}
+
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+// A calm "Last synced …" line for a vault, from the last-SUCCESS time the model carries. A vault that
+// has never synced successfully reads "Not synced yet" — never a fabricated or stale-from-failure time.
+// Coarse buckets only; the exact wording here is provisional and is finalized with the rest of the human
+// copy (the buckets themselves are the stable part). A time in the future (a clock step) reads "just now"
+// rather than a negative age.
+function lastSyncedLabel(lastSyncedAt, now) {
+  if (lastSyncedAt == null) return 'Not synced yet';
+  const t = typeof now === 'number' ? now : Date.now();
+  const age = t - lastSyncedAt;
+  if (age < MINUTE_MS) return 'Last synced just now';
+  if (age < HOUR_MS) return `Last synced ${Math.floor(age / MINUTE_MS)} min ago`;
+  if (age < DAY_MS) return `Last synced ${Math.floor(age / HOUR_MS)} h ago`;
+  return `Last synced ${Math.floor(age / DAY_MS)} d ago`;
+}
+
+// Compose the per-vault tray rows, ready for the menu. Each configured vault (its stored id + display
+// name) is matched by id to its LIVE per-vault status; a vault with no computed status yet falls back to
+// a not-running, never-synced view — never a stale or fabricated one. Pure, so the exact menu content —
+// the honest "Sync now"/"Syncing…" affordance and the "Last synced" line per vault — is unit-tested
+// without a tray. The Electron layer maps each row to menu items and binds the clicks. The per-item
+// label omits the vault name (the row is nested under a menu labelled with the name).
+function vaultRows(configured, modelVaults, now) {
+  const byId = new Map((Array.isArray(modelVaults) ? modelVaults : []).map((v) => [v.vault, v]));
+  return (Array.isArray(configured) ? configured : []).map((e) => {
+    const v = byId.get(e.vaultId) || { vault: e.vaultId, running: false, lastSyncedAt: null };
+    const item = syncNowItem({ vault: e.vaultId, running: !!v.running });
+    const inFlight = item.kind === 'syncing';
+    return {
+      vaultId: e.vaultId,
+      vaultName: e.vaultName,
+      lastSynced: lastSyncedLabel(v.lastSyncedAt, now),
+      running: inFlight,
+      syncLabel: inFlight ? 'Syncing…' : 'Sync now',
+      syncEnabled: item.enabled,
+    };
+  });
+}
+
+module.exports = { tooltip, mustActItems, syncNowItem, lastSyncedLabel, vaultRows, REASON_DETAIL };

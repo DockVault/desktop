@@ -13,18 +13,21 @@ function fakeDaemon() {
 function harness(deps = {}) {
   const statuses = [];
   const notifies = [];
+  const toasts = [];
   const daemon = fakeDaemon();
-  const hub = new SyncStatusHub({ daemon, onStatus: (m) => statuses.push(m), onNotify: (n) => notifies.push(n), hasSecureStore: true, online: true, ...deps });
-  return { hub, daemon, statuses, notifies };
+  const hub = new SyncStatusHub({ daemon, onStatus: (m) => statuses.push(m), onNotify: (n) => notifies.push(n), onToast: (t) => toasts.push(t), hasSecureStore: true, online: true, ...deps });
+  return { hub, daemon, statuses, notifies, toasts };
 }
 
 test('emits the computed status on change and suppresses no-op re-emits', () => {
-  const { hub, daemon, statuses } = harness();
+  // A fixed clock so two identical successes stamp the same last-synced time: an unchanged picture must
+  // not re-emit. (A success at a genuinely later instant SHOULD re-emit — that is covered separately.)
+  const { hub, daemon, statuses } = harness({ now: () => 5000 });
   daemon.emit('ready', { encrypted: true }); // the helper is up (until then, sync is honestly paused)
   hub.setVaults(['a']);
   hub.recordOutcome('a', { result: 'ok', resyncRequired: false });
   const n = statuses.length;
-  hub.recordOutcome('a', { result: 'ok', resyncRequired: false }); // same picture
+  hub.recordOutcome('a', { result: 'ok', resyncRequired: false }); // same picture, same instant
   assert.strictEqual(statuses.length, n, 'an unchanged recompute does not re-emit');
   assert.strictEqual(statuses[statuses.length - 1].state, STATE.UP_TO_DATE);
 });
@@ -74,6 +77,51 @@ test('no secure store => unavailable; no vaults => not-configured', () => {
   assert.strictEqual(a.hub.current().state, STATE.UNAVAILABLE);
   const b = harness();
   assert.strictEqual(b.hub.current().state, STATE.NOT_CONFIGURED);
+});
+
+test('"Last synced" is stamped only by a successful run, and advances with each later success', () => {
+  let clock = 1000;
+  const { hub } = harness({ now: () => clock });
+  hub.setVaults(['a']);
+  const at = () => hub.current().vaults.find((v) => v.vault === 'a').lastSyncedAt;
+  assert.strictEqual(at(), null, 'never synced yet -> no last-synced time');
+  hub.recordOutcome('a', { result: 'error' });
+  assert.strictEqual(at(), null, 'a failed run does not stamp a last-synced time');
+  hub.recordOutcome('a', { result: 'conflict-keep-both' });
+  assert.strictEqual(at(), null, 'a conflict (needs a decision) does not stamp a last-synced time');
+  clock = 2000;
+  hub.recordOutcome('a', { result: 'ok' });
+  assert.strictEqual(at(), 2000, 'a success stamps the time');
+  hub.recordOutcome('a', { result: 'needs-resync', resyncRequired: true });
+  assert.strictEqual(at(), 2000, 'a later blocked run leaves the last SUCCESS time untouched, not cleared');
+  clock = 3000;
+  hub.recordOutcome('a', { result: 'resync-ok', resyncRequired: false });
+  assert.strictEqual(at(), 3000, 'a later success advances it');
+});
+
+test('the first successful sync of a vault toasts once; failures never toast, later successes do not re-toast', () => {
+  const { hub, toasts } = harness({ now: () => 42 });
+  hub.setVaults(['a', 'b']);
+  hub.recordOutcome('a', { result: 'error' });
+  hub.recordOutcome('a', { result: 'auth-failed' });
+  assert.strictEqual(toasts.length, 0, 'no toast until a real success');
+  hub.recordOutcome('a', { result: 'resync-ok' });
+  assert.deepStrictEqual(toasts, [{ scope: 'vault', vault: 'a', kind: 'first-success' }], 'the first success toasts once, naming the vault (so the layer can offer Open folder)');
+  hub.recordOutcome('a', { result: 'ok' });
+  assert.strictEqual(toasts.length, 1, 'a later success does not re-toast');
+  hub.recordOutcome('b', { result: 'ok' });
+  assert.strictEqual(toasts.length, 2, 'a different vault gets its own first-success toast');
+  assert.strictEqual(toasts[1].vault, 'b');
+});
+
+test('a first-success toast carries no file count and no credential-shaped field', () => {
+  const { hub, toasts } = harness();
+  hub.setVaults(['a']);
+  hub.recordOutcome('a', { result: 'ok' });
+  const blob = JSON.stringify(toasts);
+  for (const forbidden of ['count', 'files', 'password', 'hostKeys', 'token', 'path']) {
+    assert.strictEqual(blob.includes(forbidden), false, `the toast carries no "${forbidden}"`);
+  }
 });
 
 test('the emitted model is cred-free (no credential, host key, token, or user field anywhere)', () => {
