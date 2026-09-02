@@ -20,6 +20,7 @@
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const { StatsStderrParser } = require('./stats-parse');
 
 // Flags the daemon must never hand rclone, enforced by construction (not by caller discipline):
 //   --force                             overrides rclone's own data-safety aborts, so a local wipe could
@@ -76,7 +77,7 @@ class RcloneRunner {
 
   // The single spawn chokepoint. NOTHING spawns rclone unless the binary's checksum has been verified
   // (so a tampered binary is never run), and no forbidden flag/subcommand (--force, any rc server) reaches it.
-  _launch(args, { timeoutMs = 30000, inactivityMs = null, hardCeilingMs = null, onLine, input, config } = {}) {
+  _launch(args, { timeoutMs = 30000, inactivityMs = null, hardCeilingMs = null, onLine, onProgress, input, config } = {}) {
     if (!this._binaryVerified) return Promise.reject(new Error('rclone binary not verified; call ready() first'));
     const bad = forbiddenIn(args);
     if (bad) return Promise.reject(new Error(`refusing to run rclone with ${bad}`));
@@ -92,7 +93,11 @@ class RcloneRunner {
       catch (e) { return reject(e); }
       if (input != null && child.stdin) { try { child.stdin.end(input); } catch { /* child gone */ } }
       let stdout = '';
-      let stderr = '';
+      // stderr is not accumulated raw: it is fed through a stats parser that extracts ONLY the two
+      // aggregate progress integers (files, bytes) and keeps ONLY genuine non-stats lines for the
+      // typed-outcome classifier. rclone's stats block carries per-file PATHS ("Transferring:" + " * path")
+      // that must never be kept, forwarded, or logged — the parser drops them (see stats-parse.js).
+      const statsParser = new StatsStderrParser();
       let done = false;
       let idleTimer = null;
       let ceilingTimer = null;
@@ -115,13 +120,18 @@ class RcloneRunner {
         ceilingTimer = setTimeout(() => killWith('rclone hard-ceiling timeout'), hardCeilingMs || inactivityMs * 30);
         if (ceilingTimer.unref) ceilingTimer.unref();
       }
-      // stdout feeds onLine (the line relay) AND, for a transfer, resets the idle timer. stderr ONLY
-      // accumulates (for the typed-outcome classification) and resets the idle timer — it is NEVER relayed
-      // to onLine, because stats/progress lines carry file paths that must not be logged or sent onward.
+      // stdout feeds onLine (the line relay) AND, for a transfer, resets the idle timer. stderr is fed to
+      // the stats parser: it resets the idle timer (so a quiet-but-working transfer stays alive), advances
+      // the {files,bytes} progress counters, and — only when a counter advances — calls onProgress with
+      // those TWO INTEGERS (never a line, never a path). No raw stderr line is relayed to onLine.
       if (child.stdout) child.stdout.on('data', (c) => { stdout += c; if (inactivityMs) resetIdle(); if (onLine) String(c).split(/\r?\n/).forEach((l) => { if (l) onLine(l); }); });
-      if (child.stderr) child.stderr.on('data', (c) => { stderr += c; if (inactivityMs) resetIdle(); });
+      if (child.stderr) child.stderr.on('data', (c) => {
+        const advanced = statsParser.push(c);
+        if (inactivityMs) resetIdle();
+        if (advanced && onProgress) { try { onProgress(statsParser.counts()); } catch { /* a consumer error is not ours */ } }
+      });
       child.on('error', (e) => finish(reject, e));
-      child.on('exit', (code) => finish(resolve, { code, stdout, stderr }));
+      child.on('exit', (code) => { statsParser.end(); finish(resolve, { code, stdout, stderr: statsParser.stderr() }); });
     });
   }
 

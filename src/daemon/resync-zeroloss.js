@@ -172,7 +172,7 @@ async function zeroLossResync(o) {
 
   // 5. Establish the clean baseline. resync:true satisfies runBisync's gate and CLEARS a resync-required
   //    block; this is the deliberate user action, never an automatic response to an abort.
-  const r = await runBisync({ runner: o.runner, db: o.db, vault: o.vault, local: o.local, remote: o.remote, workdir: o.workdir, config: o.config, resync: true, prepareCred: o.prepareCred, now, timeoutMs: o.timeoutMs });
+  const r = await runBisync({ runner: o.runner, db: o.db, vault: o.vault, local: o.local, remote: o.remote, workdir: o.workdir, config: o.config, resync: true, prepareCred: o.prepareCred, onProgress: o.onProgress, now, timeoutMs: o.timeoutMs });
 
   // A kept-both conflict is an UNRECONCILED state the user must resolve: even though the resync itself
   // succeeded and the data is safe, the outcome must NOT read as clean (the same anti-lie rule as a normal

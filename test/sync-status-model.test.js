@@ -75,11 +75,13 @@ test('a resync-required latch never reads green, even if the last outcome looked
   assert.strictEqual(r.reason, 'needs-repair');
 });
 
-test('an in-flight run shows "syncing" only when nothing unresolved outranks it', () => {
-  // running + clean prior => syncing
-  assert.strictEqual(vaultState(vault({ lastResult: 'ok', running: true })).state, STATE.SYNCING);
-  // running + an unresolved conflict keeps the decision face (the next run does not paper over it)
-  assert.strictEqual(vaultState(vault({ lastResult: 'conflict-keep-both', running: true })).state, STATE.NEEDS_DECISION);
+test('the "syncing" glance shows only while transferring, and only when nothing unresolved outranks it', () => {
+  // transferring + clean prior => syncing
+  assert.strictEqual(vaultState(vault({ lastResult: 'ok', transferring: true })).state, STATE.SYNCING);
+  // dispatched but merely scanning (running, not transferring) keeps the last real state — quiet, no flicker
+  assert.strictEqual(vaultState(vault({ lastResult: 'ok', running: true, transferring: false })).state, STATE.UP_TO_DATE);
+  // transferring + an unresolved conflict keeps the decision face (the next run does not paper over it)
+  assert.strictEqual(vaultState(vault({ lastResult: 'conflict-keep-both', transferring: true })).state, STATE.NEEDS_DECISION);
 });
 
 test('configured but never run => a calm "waiting to start", never SYNCING and never a false green', () => {
@@ -94,8 +96,8 @@ test('waiting outranks up-to-date (forbids a false green) but a real in-flight r
   // one never-run vault + one clean vault => the glance is "Waiting to start", not "Up to date"
   const agg = computeStatus({ ...secure2, vaults: [vault({ vault: 'a', lastResult: null }), vault({ vault: 'b', lastResult: 'ok' })] });
   assert.strictEqual(agg.state, STATE.WAITING);
-  // a genuinely running vault wins over a waiting one
-  const agg2 = computeStatus({ ...secure2, vaults: [vault({ vault: 'a', lastResult: null }), vault({ vault: 'b', lastResult: 'ok', running: true })] });
+  // a genuinely TRANSFERRING vault wins over a waiting one
+  const agg2 = computeStatus({ ...secure2, vaults: [vault({ vault: 'a', lastResult: null }), vault({ vault: 'b', lastResult: 'ok', transferring: true })] });
   assert.strictEqual(agg2.state, STATE.SYNCING);
 });
 

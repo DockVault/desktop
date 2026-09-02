@@ -57,6 +57,9 @@ class SyncStatusHub {
     this._daemon.on('crash-loop', () => { this._sig.daemon = 'crash-looped'; this._sig.crashLoopLatched = true; this._recompute(); });
     this._daemon.on('resume', () => { this._sig.daemon = 'starting'; this._sig.crashLoopLatched = false; this._recompute(); });
     this._daemon.on('error', () => { this._recompute(); });
+    // In-flight transfer progress from the helper: the two aggregate integers only (files, bytes) for a
+    // vault, never a path. Drives the "syncing" glance so it shows only while bytes actually move.
+    this._daemon.on('sync-progress', (p) => { if (p && p.vault) this.recordProgress(p.vault, { files: p.files, bytes: p.bytes }); });
   }
 
   // ---- signal setters (the app + the scheduler drive these) ----
@@ -68,7 +71,7 @@ class SyncStatusHub {
   setVaults(list) {
     const next = new Map();
     for (const v of Array.isArray(list) ? list : []) {
-      const prev = this._vaults.get(v) || { running: false, lastResult: null, resyncRequired: false, condition: null, lastSyncedAt: null, everSucceeded: false };
+      const prev = this._vaults.get(v) || { running: false, transferring: false, progress: null, lastResult: null, resyncRequired: false, condition: null, lastSyncedAt: null, everSucceeded: false };
       next.set(v, prev);
     }
     this._vaults = next;
@@ -78,7 +81,27 @@ class SyncStatusHub {
   setRunning(vault, running) {
     const e = this._vaults.get(vault); if (!e) return;
     e.running = !!running;
+    // Transfer motion is per-run: starting or ending a run clears any prior counts, so a fresh run begins
+    // with no "syncing" motion (it surfaces only once bytes move) and a finished one trails none.
+    e.transferring = false;
+    e.progress = null;
     if (e.running) e.condition = null; // a run actually starting clears any prior can't-run reason
+    this._recompute();
+  }
+
+  /**
+   * Record in-flight transfer progress for a vault: the two aggregate integers the daemon extracted from
+   * rclone's stats (files + bytes transferred — never a path). Motion, and so the "syncing" glance, is
+   * shown ONLY when real bytes are moving (a positive count); a run that is merely scanning reports nothing
+   * and keeps the vault quiet at its last real state.
+   */
+  recordProgress(vault, { files, bytes } = {}) {
+    const e = this._vaults.get(vault); if (!e || !e.running) return; // only the run in flight has progress
+    const f = typeof files === 'number' ? files : null;
+    const b = typeof bytes === 'number' ? bytes : null;
+    if (!((f != null && f > 0) || (b != null && b > 0))) return; // a zero/empty report is not motion — stay quiet
+    e.transferring = true;
+    e.progress = { files: f, bytes: b };
     this._recompute();
   }
 
@@ -88,6 +111,8 @@ class SyncStatusHub {
     e.lastResult = result != null ? result : e.lastResult;
     if (typeof resyncRequired === 'boolean') e.resyncRequired = resyncRequired;
     e.running = false;
+    e.transferring = false; // the run is over — no motion trails it
+    e.progress = null;
     e.condition = null; // a completed run supersedes any prior can't-run reason
     // Success-ONLY bookkeeping: a run counts as a success exactly when it lands the vault at "up to date"
     // (an 'ok'/'resync-ok' outcome with nothing unresolved outranking it). Reuse the one status model so
@@ -112,6 +137,8 @@ class SyncStatusHub {
     const e = this._vaults.get(vault); if (!e || !state) return;
     e.condition = { state, reason: reason || null };
     e.running = false;
+    e.transferring = false; // a vault that cannot run is not transferring
+    e.progress = null;
     this._recompute();
   }
 

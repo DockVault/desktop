@@ -31,6 +31,8 @@
  *                       (a real missing row = never-run), or 'unknown' (unreadable / no state DB — not never-run)
  *                     { type: 'sync-run-result', id, ok, ran?, result?, resyncRequired?, needsAttention?,
  *                        code?, error? }  (a summarized, typed outcome only — never raw output or the cred)
+ *                     { type: 'sync-progress', vault, files, bytes }  (in-flight; the TWO aggregate integers
+ *                        only — never a line, never a file path; unsolicited, no id, fired as a transfer moves)
  *                     { type: 'bye' }             { type: 'error', op, message }
  *
  * The key is used only to open the database and is then zeroized in this process; it is never logged.
@@ -215,6 +217,10 @@ async function onSyncRun(m) {
       runVaultSync({
         runner: rclone, db, vault: b.vault, local: b.local, remote, workdir, config: cfgPath, resync: !!b.resync,
         prepareCred: b.resync ? (() => prepareFreshCred(b.vault, cfgPath)) : undefined,
+        // Progress: the runner extracts the two aggregate {files,bytes} integers from rclone's stats and calls
+        // this as a transfer moves. Forward ONLY those numbers + the vault id on the existing parent channel —
+        // never a line, never a path (the path-bearing stats lines die in the daemon's stats parser).
+        onProgress: (c) => reply({ type: 'sync-progress', vault: b.vault, files: (c && c.files != null) ? c.files : null, bytes: (c && c.bytes != null) ? c.bytes : null }),
       }));
     reply({ type: 'sync-run-result', id: m.id, ok: true, ran: r.ran, result: r.result, reason: r.reason, resyncRequired: r.resyncRequired, needsAttention: r.needsAttention, code: r.code, preserved: r.preserved });
   } catch (err) {

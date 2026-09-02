@@ -65,14 +65,18 @@ test('verifyEligible fails closed when the current name is no longer a single sa
   assert.deepStrictEqual(await verify('v1'), { ok: false, reason: 'bad-vault-name' });
 });
 
-test('applySchedulerEvent: running shows syncing; done records the outcome and clears running', () => {
+test('applySchedulerEvent: a dispatched run is quiet until it transfers; a transfer shows syncing; done records the outcome', () => {
   const hub = hubWithVault();
   applySchedulerEvent(hub, 'v1', { phase: 'running' });
-  assert.strictEqual(vaultOf(hub).state, STATE.SYNCING);
-  assert.strictEqual(vaultOf(hub).running, true);
+  assert.strictEqual(vaultOf(hub).running, true, 'the running flag is set at dispatch (it drives the Sync-now affordance)');
+  assert.notStrictEqual(vaultOf(hub).state, STATE.SYNCING, 'a dispatched-but-scanning run does NOT read syncing — quiet until bytes move');
+  hub.recordProgress('v1', { files: 2, bytes: 1048576 });
+  assert.strictEqual(vaultOf(hub).state, STATE.SYNCING, 'once real bytes move, it reads syncing');
+  assert.deepStrictEqual(vaultOf(hub).progress, { files: 2, bytes: 1048576 }, 'carrying the two aggregate counts');
   applySchedulerEvent(hub, 'v1', { phase: 'done', outcome: { result: 'ok', resyncRequired: false } });
   assert.strictEqual(vaultOf(hub).state, STATE.UP_TO_DATE);
   assert.strictEqual(vaultOf(hub).running, false);
+  assert.strictEqual(vaultOf(hub).progress, null, 'progress is cleared when the run completes');
 });
 
 test('applySchedulerEvent: a conflict outcome reads needs-decision, not up-to-date', () => {
@@ -161,7 +165,8 @@ test('applySchedulerEvent: a cant-run condition clears once the vault actually r
   applySchedulerEvent(hub, 'v1', { phase: 'skipped', reason: 'no-session' });
   assert.strictEqual(vaultOf(hub).state, STATE.NEEDS_DECISION);
   applySchedulerEvent(hub, 'v1', { phase: 'running' });
-  assert.strictEqual(vaultOf(hub).state, STATE.SYNCING, 'a real run clears the condition');
+  assert.notStrictEqual(vaultOf(hub).state, STATE.NEEDS_DECISION, 'a real run clears the sign-in condition');
+  assert.strictEqual(vaultOf(hub).state, STATE.WAITING, 'now scanning (not yet transferring), so calm waiting, not syncing');
   applySchedulerEvent(hub, 'v1', { phase: 'done', outcome: { result: 'ok', resyncRequired: false } });
   assert.strictEqual(vaultOf(hub).state, STATE.UP_TO_DATE);
 });
@@ -230,11 +235,13 @@ test('StatusSink: a host-key-mismatch is an immediate alert, never thresholded a
   assert.strictEqual(vaultOf(hub).reason, 'host-key-mismatch');
 });
 
-test('StatusSink: non-error events map straight through (running -> syncing)', () => {
+test('StatusSink: non-error events map straight through (running sets the flag; a transfer shows syncing)', () => {
   const { hub } = hubWithNotify();
   const sink = new StatusSink(hub);
   sink.apply('v1', { phase: 'running' });
-  assert.strictEqual(vaultOf(hub).state, STATE.SYNCING);
+  assert.strictEqual(vaultOf(hub).running, true, 'a running event maps straight through (not thresholded like a failure)');
+  hub.recordProgress('v1', { files: 1, bytes: 2048 });
+  assert.strictEqual(vaultOf(hub).state, STATE.SYNCING, 'once it transfers, it reads syncing');
 });
 
 test('StatusSink: persistent PRE-DISPATCH failures escalate too (a mint outage never reads calm forever)', () => {
@@ -282,13 +289,16 @@ test('StatusSink: an escalated "not-syncing" does not MASK a later, more specifi
   assert.strictEqual(vaultOf(hub).reason, 'sign-in-needed', 'the actionable "sign in" replaces "check your connection"');
 });
 
-test('StatusSink: a noop (already-running refusal) leaves the in-flight run reading syncing', () => {
+test('StatusSink: a noop (already-running refusal) leaves the in-flight, transferring run reading syncing', () => {
   const { hub } = hubWithNotify();
   const sink = new StatusSink(hub);
   sink.apply('v1', { phase: 'running' });
+  hub.recordProgress('v1', { files: 1, bytes: 2048 }); // the live run is actually transferring
+  assert.strictEqual(vaultOf(hub).state, STATE.SYNCING);
   sink.apply('v1', { phase: 'noop', reason: 'already-running' });
   assert.strictEqual(vaultOf(hub).state, STATE.SYNCING, 'still syncing — the guard refusal did not disturb the live run');
   assert.strictEqual(vaultOf(hub).running, true);
+  assert.deepStrictEqual(vaultOf(hub).progress, { files: 1, bytes: 2048 }, 'progress preserved across the noop');
 });
 
 test('StatusSink: a noop neither increments nor resets the failure streak', () => {

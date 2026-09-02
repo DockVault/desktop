@@ -32,6 +32,30 @@ const REASON_DETAIL = Object.freeze({
   // a configured-but-never-run vault must read as not-yet-running, never as active "syncing".
 });
 
+// Human-readable transfer size for the "Syncing…" detail. Binary steps (1024) with familiar labels; a
+// round number below 10 of a unit, one decimal otherwise. Returns null for a non-positive/absent count so
+// the caller can omit it. Numbers only — never a path.
+function formatBytes(n) {
+  if (typeof n !== 'number' || !(n > 0)) return null;
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+  const val = (i === 0 || v >= 10) ? Math.round(v) : Math.round(v * 10) / 10;
+  return `${val} ${units[i]}`;
+}
+
+// The honest, percentage-free transfer detail from the two aggregate counts: "3 files", "4.2 MB", or both.
+// Never a total (the size-compare can't know total work ahead), never a path — just what has moved so far.
+function progressDetail(progress) {
+  if (!progress) return null;
+  const parts = [];
+  if (typeof progress.files === 'number' && progress.files > 0) parts.push(progress.files === 1 ? '1 file' : `${progress.files} files`);
+  const b = formatBytes(progress.bytes);
+  if (b) parts.push(b);
+  return parts.length ? parts.join(' · ') : null;
+}
+
 function tooltip(model, lockPhase) {
   if (lockPhase === 'locking') return 'DockVault — Locking…';
   if (lockPhase === 'lock-error') return 'DockVault — Lock error (retrying)';
@@ -41,6 +65,12 @@ function tooltip(model, lockPhase) {
   // A persistent no-sync is a must-act, but its glance reads by duration, not alarm (it is usually a
   // connection or sign-in issue). Keep the calm phrasing rather than the bare "Sync problem" label.
   if (model.state === STATE.SYNC_PROBLEM && model.reason === 'not-syncing') return "DockVault — Sync hasn't run for a while";
+  // While transferring, show the honest count detail ("Syncing… · 3 files · 4.2 MB") — numbers only, no
+  // percentage and no total implied, from the aggregate counts the daemon parsed.
+  if (model.state === STATE.SYNCING) {
+    const d = progressDetail(model.progress);
+    return 'DockVault — ' + model.label + (d ? ' · ' + d : '');
+  }
   const detail = REASON_DETAIL[model.reason];
   return 'DockVault — ' + model.label + (detail ? ' · ' + detail : '');
 }
@@ -126,8 +156,10 @@ function vaultRows(configured, modelVaults, now) {
       running: inFlight,
       syncLabel: inFlight ? 'Syncing…' : 'Sync now',
       syncEnabled: item.enabled,
+      // The honest transfer detail, shown only while this vault is actually syncing (numbers only, no path).
+      syncingDetail: v.state === STATE.SYNCING ? progressDetail(v.progress) : null,
     };
   });
 }
 
-module.exports = { tooltip, mustActItems, syncNowItem, lastSyncedLabel, vaultRows, REASON_DETAIL };
+module.exports = { tooltip, mustActItems, syncNowItem, lastSyncedLabel, vaultRows, formatBytes, progressDetail, REASON_DETAIL };

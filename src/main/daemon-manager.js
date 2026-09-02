@@ -120,6 +120,10 @@ class DaemonManager {
         }
         break;
       }
+      // Unsolicited in-flight progress: the two aggregate integers only (files, bytes) for a vault. Emitted as
+      // an event for the status hub. It is not a reply (no id) and carries no path — the numbers are re-coerced
+      // here so nothing but a number or null can pass on, whatever the helper sent.
+      case 'sync-progress': this._emit('sync-progress', { vault: m.vault, files: typeof m.files === 'number' ? m.files : null, bytes: typeof m.bytes === 'number' ? m.bytes : null }); break;
       // The helper asks main to mint+send a fresh single-use credential for the CURRENT resync's next process.
       case 'need-sftp-cred': void this._onNeedSftpCred(m); break;
       case 'run-state-result': {

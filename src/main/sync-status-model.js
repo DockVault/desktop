@@ -105,7 +105,12 @@ const OUTCOME_STATE = Object.freeze({
 /**
  * @param {object} v one vault's signals
  * @param {string} v.vault            vault identifier
- * @param {boolean} [v.running]       a run is in flight right now
+ * @param {boolean} [v.running]       a run is in flight right now (dispatch..completion) — drives the per-vault
+ *   "Sync now" affordance's honest-concurrency state, NOT the glance; a run may be scanning without transferring.
+ * @param {boolean} [v.transferring]  the run is actually moving bytes right now — THIS drives the "syncing"
+ *   glance, so a routine no-op check (running but not transferring) stays quiet at its last real state.
+ * @param {{files:(number|null), bytes:(number|null)}|null} [v.progress] the two aggregate transfer counts for
+ *   the "Syncing… N files / X" detail; carried through untouched, numbers only, never a path.
  * @param {string|null} [v.lastResult] the last typed outcome, or null if it has never completed a run
  * @param {boolean} [v.resyncRequired] a resync is owed (a blocked latch)
  * @param {{state:string, reason:(string|null)}|null} [v.condition] a live reason the vault cannot run
@@ -119,8 +124,9 @@ const OUTCOME_STATE = Object.freeze({
  */
 function vaultState(v) {
   const running = !!v.running;
+  const transferring = !!v.transferring;
   const resyncRequired = !!v.resyncRequired;
-  const base = baseVaultState(v, running, resyncRequired);
+  const base = baseVaultState(v, transferring, running, resyncRequired);
   // Fold a live can't-run condition over the last-outcome state: it wins whenever it is at least as
   // severe, so a persistent refusal (a decision or a problem) replaces a stale "up to date", while a
   // strictly more severe completed outcome (e.g. a prior sync problem) is not masked by it.
@@ -128,10 +134,13 @@ function vaultState(v) {
   const out = (cond && RANK[cond.state] >= RANK[base.state])
     ? { vault: v.vault, state: cond.state, reason: cond.reason || null, running, resyncRequired }
     : base;
-  return { ...out, lastSyncedAt: v.lastSyncedAt != null ? v.lastSyncedAt : null };
+  // progress rides along ONLY while the vault is actually syncing; any other state clears it so a stale
+  // count never trails a finished or paused vault.
+  const progress = out.state === STATE.SYNCING && v.progress ? v.progress : null;
+  return { ...out, running, progress, lastSyncedAt: v.lastSyncedAt != null ? v.lastSyncedAt : null };
 }
 
-function baseVaultState(v, running, resyncRequired) {
+function baseVaultState(v, transferring, running, resyncRequired) {
   // A blocked latch (a resync is owed) is a decision the person must make, even mid-run: it never
   // silently clears and it never reads as green. It outranks the transient "syncing" face.
   if (resyncRequired && (v.lastResult == null || OUTCOME_STATE[v.lastResult] == null
@@ -140,16 +149,18 @@ function baseVaultState(v, running, resyncRequired) {
   }
   if (v.lastResult != null && OUTCOME_STATE[v.lastResult]) {
     const m = OUTCOME_STATE[v.lastResult];
-    // A run in flight still shows "syncing" only when nothing unresolved outranks it; an unresolved
-    // outcome (a decision or a problem) keeps its face even while the next run is moving.
-    if (running && RANK[m.state] <= RANK[STATE.SYNCING]) {
+    // The "syncing" glance shows ONLY while bytes are actually moving (transferring) and nothing unresolved
+    // outranks it. A run that is merely dispatched/scanning (running but not transferring) keeps the vault's
+    // last real state — a routine no-op tick never flickers "syncing". An unresolved outcome (a decision or a
+    // problem) keeps its face even while the next run moves.
+    if (transferring && RANK[m.state] <= RANK[STATE.SYNCING]) {
       return { vault: v.vault, state: STATE.SYNCING, reason: null, running, resyncRequired };
     }
     return { vault: v.vault, state: m.state, reason: m.reason || null, running, resyncRequired };
   }
-  // Configured but no completed run yet. A run actually in flight is "syncing"; otherwise it is the
-  // calm "waiting to start" — never "syncing" while nothing is transferring, and never a false green.
-  if (running) return { vault: v.vault, state: STATE.SYNCING, reason: null, running, resyncRequired };
+  // Configured but no completed run yet. Only an actual transfer reads "syncing"; a dispatched-but-scanning
+  // first run stays the calm "waiting to start" — never "syncing" while nothing is transferring, never green.
+  if (transferring) return { vault: v.vault, state: STATE.SYNCING, reason: null, running, resyncRequired };
   return { vault: v.vault, state: STATE.WAITING, reason: 'waiting-first-sync', running, resyncRequired };
 }
 
@@ -188,7 +199,7 @@ function computeStatus(s) {
   if (!s.crashLoopLatched && (s.daemon === 'starting' || s.daemon === 'crashed')) {
     contributors.push({ state: STATE.PAUSED, reason: 'reconnecting' });
   }
-  for (const v of vaults) contributors.push({ state: v.state, reason: v.reason, vault: v.vault });
+  for (const v of vaults) contributors.push({ state: v.state, reason: v.reason, vault: v.vault, progress: v.progress || null });
 
   // The aggregate is the highest-precedence contributor; ties keep the first seen (global before
   // per-vault only where ranks are equal, which does not change the surfaced severity).
@@ -200,6 +211,8 @@ function computeStatus(s) {
     state: winner.state,
     label: LABEL[winner.state],
     reason: winner.reason || null,
+    // The glance's transfer detail, present only when the winning contributor is a syncing vault.
+    progress: (winner.state === STATE.SYNCING && winner.progress) ? winner.progress : null,
     vaults,
     condition: null,
   };

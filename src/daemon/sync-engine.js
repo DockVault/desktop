@@ -44,12 +44,15 @@ const SFTP_CONNECTIONS = 1;
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 // A long transfer/scan is bounded by INACTIVITY, not a fixed wall clock: it is killed only after this long
 // with NO output, so a large-but-progressing run survives while a hung one is caught. rclone is quiet by
-// default, so the run is fed periodic progress with these FIXED flags (stats to stderr at NOTICE level, so
-// even a long quiet transfer emits a line ~every 30s and keeps the timer alive). The window is 4x the stats
-// period so a single delayed/missed stats line never false-trips it. A generous hard ceiling still bounds a
-// run that emits forever. The flags are fixed here — never caller/renderer-supplied (no argv injection).
-const SYNC_STATS_ARGS = Object.freeze(['--stats', '30s', '--stats-log-level', 'NOTICE']);
-const SYNC_INACTIVITY_MS = 120 * 1000;          // 4x the 30s stats period
+// default, so the run is fed periodic stats to stderr at NOTICE level, which keep the idle timer alive AND
+// carry the two aggregate {files,bytes} progress numbers the daemon extracts for the "Syncing…" glance.
+// The stats period doubles as the "Syncing…" VISIBILITY THRESHOLD: a transfer only surfaces once a stats
+// block reports it, so a transfer shorter than one period stays silent (quiet-by-default; motion means real
+// work). 5s is a deliberate UX choice — responsive enough that an everyday few-files transfer is visible,
+// tunable up to 10s if a rendered pass shows flicker — and it is DECOUPLED from the inactivity window below
+// (a shorter period only widens the margin). The flags are fixed here — never caller/renderer-supplied.
+const SYNC_STATS_ARGS = Object.freeze(['--stats', '5s', '--stats-log-level', 'NOTICE']);
+const SYNC_INACTIVITY_MS = 120 * 1000;          // 24x the 5s stats period — ample margin against a false idle-trip
 const SYNC_HARD_CEILING_MS = 6 * 60 * 60 * 1000; // absolute backstop, even if stats never stop
 
 /**
@@ -159,6 +162,9 @@ async function runBisync(o) {
     config: o.config,
     inactivityMs: o.inactivityMs || SYNC_INACTIVITY_MS,
     hardCeilingMs: o.hardCeilingMs || SYNC_HARD_CEILING_MS,
+    // Progress sink: the runner calls this with the two aggregate {files,bytes} integers as bytes move
+    // (never a line, never a path). Optional; only wired for the ambient "Syncing…" glance.
+    onProgress: o.onProgress,
   });
 
   // Classify into ONE typed result. A safety abort (excessive delete) and a critical/needs-resync outcome

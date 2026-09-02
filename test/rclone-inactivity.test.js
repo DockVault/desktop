@@ -27,9 +27,11 @@ async function withKeepalive(fn) {
   try { return await fn(); } finally { clearInterval(ka); }
 }
 
-test('the bisync argv carries the fixed stats flags that feed the inactivity timer', () => {
+test('the bisync argv carries the fixed stats flags that feed the inactivity timer + the progress glance', () => {
   const args = buildBisyncArgs({ local: '/l', remote: 'vault:V', workdir: '/w' });
-  assert.deepStrictEqual(SYNC_STATS_ARGS, ['--stats', '30s', '--stats-log-level', 'NOTICE']);
+  // 5s: the stats period doubles as the "Syncing…" visibility threshold (a UX decision), decoupled from the
+  // 120s inactivity window. A shorter period only widens the idle margin.
+  assert.deepStrictEqual(SYNC_STATS_ARGS, ['--stats', '5s', '--stats-log-level', 'NOTICE']);
   for (const f of SYNC_STATS_ARGS) assert.ok(args.includes(f), `bisync args include ${f}`);
 });
 
@@ -55,18 +57,26 @@ test('inactivity: a silent (hung) run is killed after the window and rejects via
   });
 });
 
-test('inactivity: stderr (stats, path-bearing) resets the timer but is NEVER relayed to onLine; stdout is', async () => {
+test('inactivity: stderr stats/path lines are parsed-and-dropped (never onLine, never in returned stderr); counts surface as {files,bytes}; real errors kept', async () => {
   await withKeepalive(async () => {
     const child = controllableChild();
     const r = runnerWith(child);
     const lines = [];
-    const p = r.run(['bisync'], { inactivityMs: 200, hardCeilingMs: 100000, onLine: (l) => lines.push(l) });
-    setTimeout(() => child.stderr.emit('data', Buffer.from('Transferred: /Users/me/secret/path.txt\n')), 10);
-    setTimeout(() => child.stdout.emit('data', Buffer.from('a-stdout-line\n')), 20);
-    setTimeout(() => child.emit('exit', 0), 40);
+    const progress = [];
+    const p = r.run(['bisync'], { inactivityMs: 200, hardCeilingMs: 100000, onLine: (l) => lines.push(l), onProgress: (c) => progress.push(c) });
+    // A path-bearing per-file stats line (the leak shape) — must be DROPPED, never kept or relayed.
+    setTimeout(() => child.stderr.emit('data', Buffer.from(' *   /Users/me/secret/path.txt: 50% /1Mi, 1/s, 1s\n')), 10);
+    // A real aggregate count — surfaces as {files} via onProgress (numbers only).
+    setTimeout(() => child.stderr.emit('data', Buffer.from('Transferred: 3 / 8, 38%\n')), 20);
+    // A genuine (non-stats) error line — kept for the typed-outcome classifier.
+    setTimeout(() => child.stderr.emit('data', Buffer.from('2026/09/03 02:00:00 ERROR : a real problem\n')), 30);
+    setTimeout(() => child.stdout.emit('data', Buffer.from('a-stdout-line\n')), 40);
+    setTimeout(() => child.emit('exit', 0), 60);
     const res = await p;
-    assert.deepStrictEqual(lines, ['a-stdout-line'], 'only stdout reaches onLine; the stderr stats/path line never did');
-    assert.match(res.stderr, /secret\/path/, 'stderr is still accumulated for the typed-outcome classification');
+    assert.deepStrictEqual(lines, ['a-stdout-line'], 'only stdout reaches onLine; no stderr line ever does');
+    assert.doesNotMatch(res.stderr, /secret\/path/, 'the path-bearing stats line is DROPPED — never in the returned stderr');
+    assert.match(res.stderr, /a real problem/, 'a genuine non-stats error line is kept for classification');
+    assert.ok(progress.some((c) => c.files === 3), 'the aggregate file count surfaces via onProgress (numbers only)');
   });
 });
 

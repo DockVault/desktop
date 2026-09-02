@@ -32,6 +32,9 @@ async function runVaultSync(o, engines = {}) {
     // A per-step fresh-credential provider (mint-fresh-per-process). Set only on the resync path, whose several
     // rclone processes each burn a single-use credential; a normal one-process bisync uses the dispatch cred.
     prepareCred: o.prepareCred,
+    // A progress sink invoked with the two aggregate {files,bytes} integers as a transfer moves (never a
+    // path). Optional — the daemon wires it so the tray can show an honest "Syncing…" only while transferring.
+    onProgress: o.onProgress,
   };
   // A resync — repair or initial baseline — goes ONLY through the keep-both path, never a bare --resync.
   if (o.resync) return resync(base);
