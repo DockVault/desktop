@@ -19,6 +19,20 @@ test('excessive-delete safety abort -> typed abort result + resync required', ()
   assert.strictEqual(o.needsAttention, true);
 });
 
+// bisync's OTHER safety abort — all files on one side read as changed — is a DIFFERENT guard than the delete
+// cap, and must not be mislabelled as a large delete (both begin "Safety abort:"). It is still a fail-closed
+// abort needing a deliberate resync.
+test('all-changed safety abort -> its own result, never mislabelled as an excessive DELETE', () => {
+  const ALLCHANGED = 'ERROR : Safety abort: all files were changed on Path2 "vault:v/". Run with --force if desired. Bisync aborted.';
+  const o = classifyBisyncOutcome({ code: 2, stderr: ALLCHANGED });
+  assert.strictEqual(o.result, RESULT.ABORT_ALL_CHANGED);
+  assert.notStrictEqual(o.result, RESULT.ABORT_EXCESSIVE_DELETE, 'not a delete abort — it is an all-changed abort');
+  assert.strictEqual(o.resyncRequired, true);
+  assert.strictEqual(o.needsAttention, true);
+  // And the delete abort is still classified as a delete (the narrowed regex did not weaken it).
+  assert.strictEqual(classifyBisyncOutcome({ code: 2, stderr: ABORT }).result, RESULT.ABORT_EXCESSIVE_DELETE);
+});
+
 test('missing prior listing / critical error -> needs-resync (resync required)', () => {
   const o = classifyBisyncOutcome({ code: 2, stderr: NEEDS });
   assert.strictEqual(o.result, RESULT.NEEDS_RESYNC);

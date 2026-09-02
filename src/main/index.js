@@ -27,9 +27,11 @@
  * renderer secure-context probe), writes .local/shell-smoke-result.json, and exits.
  */
 
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, session, dialog, safeStorage, powerMonitor, Notification } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, session, dialog, safeStorage, powerMonitor, Notification, shell } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFile } = require('node:child_process');
+const { net } = require('electron'); // OS-connectivity read for the sync scheduler's online gate (no network request)
 const { APP_ORIGIN } = require('./config');
 const schemeMod = require('./scheme');
 const { buildCsp } = require('./csp');
@@ -47,6 +49,13 @@ const syncVaults = require('./sync-vaults');
 const syncConfig = require('./sync-config');
 const syncConfigStore = require('./sync-config-store');
 const enableCopy = require('./enable-copy');
+const { mintSftpAccess } = require('./sftp-cred');
+const { CredCache } = require('./cred-cache');
+const { RunStateSnapshot } = require('./run-state-snapshot');
+const { SyncScheduler } = require('./sync-scheduler');
+const schedulerIo = require('./scheduler-io');
+const { manualCompletionBody } = require('./manual-sync-copy');
+const { ensureFolderSecure, recoverOwnerOnly, classifyForeignAces } = require('./folder-secure');
 
 const STATIC_ROOT = path.resolve(__dirname, '..', '..', 'vendor', 'vault', 'static');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'index.js');
@@ -70,6 +79,12 @@ let daemon = null;    // the supervised background sync daemon (a forked utility
 let lockState = null; // the single source of truth for lock state (main-owned)
 let autoLock = null;  // the automatic lock triggers (idle timer + OS suspend/screen-lock)
 let syncHub = null;   // the main-owned computed sync status (feeds the tray, notifications, channel)
+let syncScheduler = null;   // the background scheduler (decides when/whether each vault syncs)
+let runStateSnapshot = null; // main-side cache of per-vault run-state, refreshed from the daemon
+let credCache = null;        // per-vault SFTP credential cache (mint via the account session, send to the daemon)
+let syncTickTimer = null;    // the routine sync cadence timer
+const SYNC_TICK_MS = 5 * 60 * 1000; // a locked/offline/no-session/uncertain/no-config tick is a cheap gated skip
+const BOOT_SYNC_KICK_MS = 2000; // a first gated pass shortly after boot when already unlocked (no lock->unlock transition fires)
 let lockPhase = 'unlocked'; // the lock machine's current phase, for the tray glance (locking/lock-error/…)
 let lastSomeExcluded = false; // whether the last vault listing had non-eligible vaults (a bare flag for the picker note)
 let syncFlowBusy = false;     // single-flight guard: one enable/stop-sync flow at a time (no dialog races)
@@ -183,10 +198,13 @@ async function boot() {
       hasSecureStore: secureStore,
       onStatus: (m) => { pushSyncStatus(m); refreshTray(); },
       onNotify: (item) => notifyMustAct(item),
+      onToast: (item) => notifyFirstSuccess(item),
     });
     // Seed the status with the vaults already configured for sync, so a returning user sees them.
     try { syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* no config yet */ }
     refreshTray(); // reflect the initial computed status now the hub exists (it does not emit on construction)
+    resolveUserSid(); // resolve the account SID once (win32), so ACL checks can match the owner by SID
+    startSyncScheduler(); // wire the background scheduler to the hub + daemon (dormant until a tick drives it)
   }
   // The lock-state single source of truth (main-owned): the window and daemon observe it, and it
   // drives the atomic key purge on a lock. Indicators reflect it honestly (never "syncing" while locked).
@@ -201,7 +219,11 @@ async function boot() {
       // still outranks it). The in-flight transients (locking / lock-error) colour the glance directly.
       lockPhase = s;
       if (syncHub && (s === 'locked' || s === 'unlocked')) syncHub.setLocked(s === 'locked');
-      if (s === 'unlocked') void maybeOfferSyncSetup(); // a one-time, non-blocking nudge on first unlock (gated on eligibility)
+      // #5 clear-on-lock: a lock pauses sync dispatch, so drop the account-tier SFTP credential as hygiene
+      // — the main-side cache AND the helper's prepared config — re-minted from the still-live session on
+      // unlock. (The account session itself persists across a lock; only the derived credential is dropped.)
+      if (s === 'locked') { if (credCache) credCache.clear(); if (daemon) void daemon.clearSftpCred(); }
+      if (s === 'unlocked') { void maybeOfferSyncSetup(); void tickSync(); } // nudge setup + kick a sync now the credential can re-mint
       refreshTray();
     },
   });
@@ -214,6 +236,10 @@ async function boot() {
       onDegraded: (code) => { console.warn('[dockvault] auto-lock posture degraded:', code); },
     });
     autoLock.start();
+    // A first sync pass shortly after boot when the app starts already unlocked: the on-unlock hook only
+    // kicks on a lock->unlock TRANSITION, so a cold start that is already unlocked would otherwise sit until
+    // the routine interval. Deferred a moment so the window and account session settle; gated like any tick.
+    if (lockState.isUnlocked()) { const t = setTimeout(() => { void tickSync(); }, BOOT_SYNC_KICK_MS); if (t.unref) t.unref(); }
   }
   await finishSmokeIfNeeded();
 }
@@ -265,7 +291,15 @@ async function captureSession() {
       `(() => { const keys = ${JSON.stringify(SESSION_KEYS)}, o = {};`
       + ` for (const k of keys) { const v = localStorage.getItem(k); if (v != null) o[k] = v; } return o; })()`, true);
     if (bundle && bundle.authToken) tokenStore.persistSession(safeStorage, dir, bundle);
-    else tokenStore.clearSession(dir);
+    else {
+      // Sign-out: the account session ended, so the SFTP credential derived from it is now invalid — clear
+      // the persisted session AND the sync credential (main cache + the helper's prepared config), and drop
+      // the in-memory session snapshot so the scheduler reads "signed out" and never mints against a dead session.
+      tokenStore.clearSession(dir);
+      sessionBundle = null;
+      if (credCache) credCache.clear();
+      if (daemon) void daemon.clearSftpCred();
+    }
   } catch { /* best effort; the token is never logged */ }
 }
 
@@ -315,16 +349,16 @@ function setupTray() {
 function refreshTray() {
   if (!tray) return;
   try {
-    if (!syncHub) { tray.setToolTip('DockVault'); tray.setContextMenu(buildTrayMenu([])); return; }
+    if (!syncHub) { tray.setToolTip('DockVault'); tray.setContextMenu(buildTrayMenu([], null)); return; }
     const model = syncHub.current();
     tray.setToolTip(trayPresentation.tooltip(model, lockPhase));
-    tray.setContextMenu(buildTrayMenu(trayPresentation.mustActItems(model)));
+    tray.setContextMenu(buildTrayMenu(trayPresentation.mustActItems(model), model));
   } catch { /* tray gone */ }
 }
 
 // Unresolved items sit at the TOP as reachable actions, so a decision, repair, or sign-in is never
 // buried inside the (destroyable) main window — the tray always offers a way to act.
-function buildTrayMenu(items) {
+function buildTrayMenu(items, model) {
   const template = [];
   for (const it of items) template.push({ label: it.label, click: () => handleMustAct(it) });
   if (items.length) template.push({ type: 'separator' });
@@ -335,9 +369,20 @@ function buildTrayMenu(items) {
     let configured = [];
     try { configured = storedConfig(); } catch { /* none */ }
     if (configured.length) {
+      // The honest per-vault submenu content (Sync-now/Syncing… + the last-synced line, matched to live
+      // status by id) is composed by the pure, tested trayPresentation.vaultRows; here it is only mapped
+      // to menu items and bound to clicks.
       template.push({
         label: 'Synced folders',
-        submenu: configured.map((e) => ({ label: `Stop syncing ${e.vaultName}`, click: () => { void stopSyncing(e.vaultId, e.vaultName); } })),
+        submenu: trayPresentation.vaultRows(configured, model && model.vaults, Date.now()).map((r) => ({
+          label: r.vaultName,
+          submenu: [
+            { label: r.lastSynced, enabled: false },
+            { type: 'separator' },
+            { label: r.syncLabel, enabled: r.syncEnabled, click: () => syncVaultNow(r.vaultId) },
+            { label: `Stop syncing ${r.vaultName}`, click: () => { void stopSyncing(r.vaultId, r.vaultName); } },
+          ],
+        })),
       });
     }
     template.push({ type: 'separator' });
@@ -356,7 +401,95 @@ function buildTrayMenu(items) {
 // the specific in-app flows arrive with the components that own them.
 function handleMustAct(item) {
   if (item && item.kind === 'restart') { if (daemon) daemon.resume(); refreshTray(); return; }
+  if (item && item.kind === 'recover-folder' && item.vault) { void recoverSharedFolder(item.vault); return; }
+  // The deliberate Repair: the ONLY thing that clears a blocked-after-run latch (a resync owed, or a
+  // >50%-delete abort). It enqueues a manual repair run; the dispatch then asks the keep-both confirm
+  // (confirmFirstUpload kind 'repair') before doing a zero-loss resync — nothing is auto-resynced.
+  if (item && item.kind === 'repair' && item.vault) { if (syncScheduler) syncScheduler.requestRepair(item.vault); return; }
   void showOrCreateWindow();
+}
+
+// The make-private consent dialog, shared by setup and by run-time drift recovery. Its fail-safe default
+// (both the default and the cancel button are "Choose a different folder") means Enter or dismissing the
+// dialog declines — only an explicit "Make it private" click strips access. Wording is provisional (ux).
+async function confirmMakePrivateDialog(folder) {
+  const res = await dialog.showMessageBox(mainWindow, {
+    type: 'warning', title: 'This folder is shared', noLink: true,
+    message: 'Other accounts can currently open this folder',
+    detail: `To sync it privately, ${folder} needs to be made accessible only to you. Other accounts on this PC will lose access to it. You can make it private, or choose a different folder instead.`,
+    buttons: ['Choose a different folder', 'Make it private'], defaultId: 0, cancelId: 0,
+  });
+  return res.response === 1 ? 'make-private' : 'choose-different';
+}
+
+// A synced folder that was made private at setup can be RE-SHARED later; the run-time check then reads
+// 'folder-problem'. Re-present the SAME make-private consent: on an explicit yes, make it private again and
+// retry that vault; on decline, open the app so the person can change the folder — nothing is ever
+// stripped without the explicit consent.
+async function recoverSharedFolder(vaultId) {
+  let entry = null;
+  try { entry = storedConfig().find((e) => e.vaultId === vaultId) || null; } catch { /* no config to act on */ }
+  if (!entry || !entry.localFolder) { void showOrCreateWindow(); return; }
+  let decision = 'choose-different';
+  try { decision = await confirmMakePrivateDialog(entry.localFolder); } catch { decision = 'choose-different'; }
+  if (decision !== 'make-private') { void showOrCreateWindow(); return; } // declined — nothing stripped
+  const made = await recoverOwnerOnly(entry.localFolder, folderSecureIo());
+  if (made && made.ok) { if (syncScheduler) syncScheduler.requestSync(vaultId, { manual: true }); } // secured — retry this vault
+  else {
+    try {
+      await dialog.showMessageBox(mainWindow, {
+        type: 'warning', title: "That folder can't be made private", noLink: true,
+        message: "That folder can't be made private right now",
+        detail: 'You can try again, or open DockVault to choose a different folder for this vault.',
+        buttons: ['OK'],
+      });
+    } catch { /* best-effort */ }
+  }
+  refreshTray();
+}
+
+// Vaults whose CURRENT run was started by a deliberate "Sync now" press — so its completion earns one quiet
+// confirmation. Routine ticks stay silent; a manual press is the exception, because the person who clicked
+// it is waiting for a definite answer ("is it safe to close the lid?"). Cleared when that run's terminal
+// event fires (or when the press joins an in-flight run, which then carries the confirmation on completion).
+const pendingManualSync = new Set();
+// The vaultId whose manual-completion toast is guaranteed to fire in the CURRENT onEvent callback — set for
+// exactly that synchronous window so notifyMustAct can drop the redundant hub toast for the same event
+// without ever silencing a must-act raised outside a press's terminal event.
+let manualHookPending = null;
+
+// A per-vault "Sync now" from the tray: only ENQUEUE a manual run. The scheduler coalesces (a run already
+// in flight for this vault is not doubled) and serialises across vaults (another vault mid-run queues this
+// one), and every dispatch gate stays fail-closed. So this asks for a run and lets the honest status
+// surface show waiting/syncing in turn — it never asserts that a sync "started".
+function syncVaultNow(vaultId) {
+  if (!syncScheduler) return;
+  // Flip the glance to the current online state at the moment of the press, so a "Sync now" while offline
+  // reads "waiting to reconnect" INSTANTLY rather than green-until-the-next-tick; the dispatch still gates
+  // offline (no real run), and the completion answer says "can't reach the server".
+  if (syncHub) syncHub.setOnline(isOnlineNow());
+  pendingManualSync.add(vaultId);
+  syncScheduler.requestSync(vaultId, { manual: true });
+}
+
+// The completion answer a deliberate "Sync now" press earns — one notification, scoped to manual runs, so a
+// person is never left wondering whether their press did anything. A press that lands "up to date" gets the
+// reassurance; a press that ends blocked / offline / needs-sign-in gets the honest reason, never a silent
+// no-op; a press the person themselves declined (the consent) gets nothing. Cred-free, best-effort.
+function notifyManualComplete(vaultId, ev) {
+  try {
+    if (!Notification || !Notification.isSupported || !Notification.isSupported()) return;
+    let name = vaultId;
+    try { const e = storedConfig().find((c) => c.vaultId === vaultId); if (e && e.vaultName) name = e.vaultName; } catch { /* name only */ }
+    // One source with the tray glance: the answer is derived from the same condition the sink records for this
+    // event, so a "can't verify the server" pause is never mislabelled as "can't reach the server". A choice
+    // the person made themselves (a declined upload) earns no toast.
+    const msg = manualCompletionBody(ev, name);
+    if (msg.silent) return;
+    const n = new Notification({ title: 'DockVault', body: msg.body });
+    n.on('click', () => { void showOrCreateWindow(); });
+    n.show();
+  } catch { /* notifications are best-effort */ }
 }
 
 // Push the computed status to the live renderer (main -> renderer). Cred-free by construction (it is
@@ -373,6 +506,12 @@ function pushSyncStatus(model) {
 function notifyMustAct(item) {
   try {
     if (!Notification || !Notification.isSupported || !Notification.isSupported()) return;
+    // Exactly-one-per-deliberate-press: when THIS vault's manual "Sync now" is ending in the SAME callback,
+    // its scoped completion toast is the one answer — drop this redundant transient must-act toast (the tray
+    // state still updates from the status emit). Suppress ONLY when the manual toast is guaranteed to fire
+    // this callback (manualHookPending is set just for that window), so a must-act raised outside a press's
+    // terminal event is never dropped — never zero.
+    if (item && item.scope === 'vault' && item.vault === manualHookPending) return;
     const n = new Notification({ title: 'DockVault', body: mustActBody(item) });
     n.on('click', () => { void showOrCreateWindow(); });
     n.show();
@@ -383,6 +522,28 @@ function mustActBody(item) {
   if (item && item.kind === 'restart') return 'Sync stopped working. Your files are safe. Open DockVault to restart it.';
   const base = (item && item.label) || 'A sync item needs your attention';
   return `${base}. Your files are safe.`;
+}
+
+// One positive notification the first time a vault syncs successfully (the hub fires it at most once per
+// vault, never on later successes). Cred-free — only the vault's own name — and clicking it opens the
+// synced folder so "where did my files go" is answered in one click. Best-effort; never throws. The exact
+// wording is provisional and settles with the rest of the human copy.
+function notifyFirstSuccess(item) {
+  try {
+    if (!item || item.scope !== 'vault') return;
+    if (!Notification || !Notification.isSupported || !Notification.isSupported()) return;
+    let entry = null;
+    try { entry = storedConfig().find((e) => e.vaultId === item.vault) || null; } catch { /* no config to name */ }
+    const name = (entry && entry.vaultName) || 'Your vault';
+    const n = new Notification({ title: 'DockVault', body: `${name} finished its first sync to this computer.` });
+    n.on('click', () => {
+      try {
+        if (entry && entry.localFolder) shell.openPath(entry.localFolder);
+        else void showOrCreateWindow();
+      } catch { /* opening the folder is best-effort */ }
+    });
+    n.show();
+  } catch { /* notifications are best-effort */ }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -413,6 +574,213 @@ async function resolveAccountToken() {
 }
 
 // The input/output surface the enable flow drives — every step that touches the OS lives here.
+function syncConfigList() { try { return storedConfig(); } catch { return []; } }
+function syncConfiguredIds() { return syncConfigList().map((e) => e.vaultId); }
+
+// The one online reader — the scheduler's dispatch gate and the status hub's glance both read it, so they
+// can never disagree. Fail-closed: an unknown state is a calm offline (never a false "syncing"/"up to date").
+function isOnlineNow() { try { return net.isOnline(); } catch { return false; } }
+
+// One sync pass: refresh the run-state view from the helper, drop any expired credentials (clearing the
+// helper's now-stale slot too), then let the scheduler decide each configured vault. A manual pass
+// ("Sync now") asks for each enabled vault ahead of the routine queue; a routine pass ticks them all. The
+// run-state view is refreshed for EVERY configured vault (a disabled one still needs an honest status),
+// but only enabled vaults are dispatched — matching the routine tick. Every dispatch is still gated
+// (locked / offline / signed-out / uncertain → a calm skip), so this is safe to run on a timer regardless
+// of state — and a no-config tick is simply a no-op.
+async function tickSync({ manual = false } = {}) {
+  if (!syncScheduler || !runStateSnapshot) return;
+  // Feed the online signal to the STATUS hub, not only the scheduler's dispatch gate, from the one source —
+  // so the tray glance and the run gate can never disagree. Without this the glance stays a false green
+  // "Up to date" while the machine is offline and edits accrue; the model already renders offline as a calm
+  // paused "waiting to reconnect".
+  if (syncHub) syncHub.setOnline(isOnlineNow());
+  await runStateSnapshot.refresh(syncConfiguredIds()); // a failed refresh keeps it not-fresh → the scheduler skips
+  if (manual) { for (const e of syncConfigList()) if (e && e.enabled) syncScheduler.requestSync(e.vaultId, { manual: true }); }
+  else syncScheduler.tickAll();
+}
+
+// A per-run icacls invocation (an argv array, never a shell string) for the owner-only folder ACL on
+// win32. Resolves { code, stdout } so ensureFolderSecure can read the ACL back and verify it.
+function runIcacls(args) {
+  return new Promise((resolve) => {
+    execFile('icacls', args, { windowsHide: true }, (err, stdout) => {
+      resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: stdout || '' });
+    });
+  });
+}
+
+// The current user's SID, resolved once at startup (win32) so ACL entries can be matched by SID as well as
+// by name — a directory account (Entra/AzureAD) prints in a listing as a display name whose leaf is not the
+// login username, which a name-only match would misread as a foreign account. Resolution is async and
+// best-effort; until (or unless) it resolves, the name match is the fallback, so nothing blocks on it.
+let currentUserSid = null;
+function resolveUserSid() {
+  if (process.platform !== 'win32') return;
+  try {
+    execFile('whoami', ['/user', '/fo', 'csv', '/nh'], { windowsHide: true }, (err, stdout) => {
+      if (err) return;
+      const m = String(stdout || '').match(/S-1-[0-9-]+/); // the account SID in the CSV row
+      if (m) currentUserSid = m[0];
+    });
+  } catch { /* best-effort; name matching remains the fallback */ }
+}
+
+// The injected io the folder-secure module needs to apply/verify an owner-only ACL and to run the
+// consented recovery: the real platform, the current account (name for the grant, SID for robust matching),
+// the icacls runner, and POSIX chmod/mode.
+function folderSecureIo() {
+  return {
+    platform: process.platform,
+    user: { name: qualifiedUserName(), sid: currentUserSid },
+    icacls: runIcacls,
+    chmod: (d, m) => fs.chmodSync(d, m),
+    mode: (d) => fs.statSync(d).mode,
+  };
+}
+
+// The current account as an ACL listing prints it: the FULLY-QUALIFIED "DOMAIN\user" (or "MACHINE\user" for a local
+// account), so the owner match is exact and never a bare-leaf over-match. Falls back to the bare username only when
+// no domain is known (the SID is the robust match in that case).
+function qualifiedUserName() {
+  const name = process.env.USERNAME || process.env.USER || '';
+  // COMPUTERNAME (the NetBIOS machine name) is what an ACL lists for a LOCAL account, and it equals USERDOMAIN
+  // for one — so it is the right fallback when USERDOMAIN is somehow unset, avoiding a bare-name qualifier that
+  // (with no SID) would make every folder read acl-non-owner forever. The SID stays the robust primary key.
+  const domain = process.platform === 'win32' ? (process.env.USERDOMAIN || process.env.COMPUTERNAME || '') : '';
+  return domain && name ? `${domain}\\${name}` : name;
+}
+
+// The first upload of a vault is confirmed here. A deliberate Repair always asks (keep-both, nothing
+// deleted; default Not now). An initial upload of an already-consented config proceeds silently; a config
+// written before the two-way consent was recorded re-asks it now, never assuming it. Copy is provisional.
+async function confirmFirstUpload({ vaultId, kind }, entry) {
+  if (kind === 'repair') {
+    const res = await dialog.showMessageBox(mainWindow, {
+      type: 'question', title: 'Repair sync', noLink: true,
+      message: 'Repair sync for this vault?',
+      detail: 'Nothing is deleted. Where the same file differs in both places, both copies are kept.',
+      buttons: ['Repair', 'Not now'], defaultId: 1, cancelId: 1,
+    });
+    return res.response === 0;
+  }
+  if (entry && entry.consented) return true; // already agreed at set-up — do not re-ask
+  const name = (entry && entry.vaultName) || vaultId;
+  const folder = (entry && entry.localFolder) || '';
+  // A config written before the two-way consent was recorded re-asks here — with the SAME non-empty warning
+  // the setup flow gives: if the folder already holds files, say they will be uploaded, before the first byte.
+  let nonEmpty = false;
+  try { nonEmpty = !!folder && fs.readdirSync(folder).length > 0; } catch { nonEmpty = false; }
+  const res = await dialog.showMessageBox(mainWindow, {
+    type: 'question', title: 'Start syncing', noLink: true,
+    message: `Start syncing ${name}?`,
+    detail: enableCopy.consentMessage(name, folder, { nonEmpty }),
+    buttons: ['Start syncing', 'Not now'], defaultId: 1, cancelId: 1,
+  });
+  return res.response === 0;
+}
+
+// Stand up the background sync scheduler once the hub + daemon exist. It wires the already-built,
+// already-tested pieces (the credential cache, the run-state snapshot, the injected-IO scheduler) to the
+// REAL Electron signals — lock state, the account session, OS connectivity — and folds each run event
+// into the honest status hub. Dormant until a tick drives it (the cadence lands with the tray wiring).
+function startSyncScheduler() {
+  if (SMOKE || !syncHub || !daemon) return;
+  const dir = app.getPath('userData');
+  const home = app.getPath('home');
+  const caseInsensitive = process.platform === 'win32' || process.platform === 'darwin';
+  const resolveReal = (p) => { const real = fs.realpathSync.native || fs.realpathSync; try { return real(p); } catch { try { return fs.realpathSync(p); } catch { return path.resolve(p); } } };
+  const configuredIds = () => { try { return storedConfig().map((e) => e.vaultId); } catch { return []; } };
+  const entryFor = (vaultId) => { try { return storedConfig().find((e) => e.vaultId === vaultId) || null; } catch { return null; } };
+  const entryByFolder = (folder) => { try { return storedConfig().find((e) => e.localFolder === folder) || null; } catch { return null; } };
+
+  runStateSnapshot = new RunStateSnapshot({ fetch: (ids) => daemon.runStates(ids) });
+  credCache = new CredCache({
+    mint: async (vaultId) => {
+      const origin = serverConfig.readServerOrigin(dir);
+      const token = await resolveAccountToken();
+      if (!origin || !token) { const e = new Error('not signed in'); e.status = 401; throw e; } // -> 'no-session' -> sign in
+      return mintSftpAccess({ serverOrigin: origin, sessionToken: token, vaultId }, mainHttpJson);
+    },
+    send: (bundle) => daemon.sendSftpCred(bundle),
+  });
+  const sink = new schedulerIo.StatusSink(syncHub);
+  const io = schedulerIo.makeSchedulerIo({
+    listConfigured: () => { try { return storedConfig().filter((e) => e.enabled !== false); } catch { return []; } },
+    snapshot: runStateSnapshot,
+    fetchStandard: async () => {
+      const origin = serverConfig.readServerOrigin(dir);
+      const token = await resolveAccountToken();
+      if (!origin || !token) { const e = new Error('not signed in'); e.reason = 'no-session'; throw e; }
+      return syncVaults.fetchStandardVaults({ serverOrigin: origin, sessionToken: token }, mainHttpJson);
+    },
+    remotePathForVault: syncConfig.remotePathForVault,
+    secureFolder: async (folder) => {
+      const r = await ensureFolderSecure(folder, folderSecureIo());
+      if (r && r.ok) return r;
+      // A folder made private at setup can be RE-SHARED later. A surviving explicit foreign grant or a deny
+      // is recoverable by re-presenting the same make-private consent, so it reads as 'folder-problem'
+      // (re-consent); anything else is a folder that cannot be secured at all -> 'folder-insecure' (re-pick).
+      const reShared = r && (r.reason === 'acl-non-owner' || r.reason === 'acl-deny-present');
+      return { ok: false, reason: reShared ? 'folder-problem' : 'folder-insecure' };
+    },
+    classify: (folder) => {
+      const owner = entryByFolder(folder);
+      const ctx = {
+        home, userData: dir,
+        refuseRoots: syncConfig.platformRefuseRoots(process.platform, process.env),
+        existingFolders: storedConfig().filter((e) => !owner || e.vaultId !== owner.vaultId).map((e) => e.localFolder),
+        caseInsensitive,
+      };
+      try { return syncConfig.classifyLocalTarget(resolveReal(folder), ctx); } catch { return { ok: false, reason: 'folder-rejected' }; }
+    },
+    credCache,
+    daemon,
+    confirmFirstUpload: (o) => confirmFirstUpload(o, entryFor(o.vaultId)),
+    isUnlocked: () => !!(lockState && lockState.isUnlocked()),
+    hasAccount: () => { try { return !!(serverConfig.readServerOrigin(dir) && ((sessionBundle && sessionBundle.authToken) || (tokenStore.loadSession(safeStorage, dir) || {}).authToken)); } catch { return false; } },
+    isOnline: isOnlineNow, // the one online source — shared with the status hub's glance (tickSync setOnline)
+    onEvent: (vaultId, ev) => {
+      // A deliberate "Sync now" press earns one completion answer. 'running'/'noop' are not terminal — the
+      // press is still in progress or has joined an in-flight run, so keep waiting; any terminal outcome
+      // resolves it. Mark it BEFORE sink.apply so the hub's must-act notification (fired synchronously inside
+      // sink.apply) drops its redundant toast for the same event; the manual toast below is the one answer.
+      // The auth-failed retry-once backstop emits an interim { phase:'paused', reason:'retrying' } and re-runs;
+      // that interim is NOT the press's final answer — the retry's own outcome is. Exclude it here so the press
+      // waits for the real result instead of being answered by the transient.
+      const manualTerminal = ev && pendingManualSync.has(vaultId) && ['done', 'error', 'blocked', 'paused', 'skipped', 'refused'].includes(ev.phase)
+        && !(ev.phase === 'paused' && ev.reason === 'retrying');
+      if (manualTerminal) manualHookPending = vaultId;
+      try {
+        sink.apply(vaultId, ev);
+        // Keep the run-state snapshot in step with the daemon's store after every terminal event, so a
+        // Repair pressed right after a run never acts on a stale latch (a cheap local read).
+        if (ev && ['done', 'error', 'blocked', 'noop'].includes(ev.phase)) void runStateSnapshot.refresh(configuredIds());
+        if (manualTerminal) { pendingManualSync.delete(vaultId); notifyManualComplete(vaultId, ev); }
+      } finally {
+        manualHookPending = null; // the guarantee window is only this callback
+      }
+    },
+  });
+  syncScheduler = new SyncScheduler(io);
+  // Authorise the helper's per-step credential requests (a resync mints one fresh single-use credential per
+  // rclone process). Main holds the say: it mints ONLY for the vault whose run is in flight right now, and only
+  // while the app is unlocked with a live account. The helper's requested vaultId is CHECKED against the
+  // scheduler's in-flight vault, never trusted as an input; the fresh credential is delivered on the existing
+  // sftp-cred path, and this returns only { ok, reason }.
+  if (daemon) daemon.setCredProvider(async (vault) => {
+    if (!syncScheduler || syncScheduler.current() !== vault) return { ok: false, reason: 'not-in-flight' };
+    if (!(lockState && lockState.isUnlocked())) return { ok: false, reason: 'paused-locked' };
+    if (!io.hasAccount()) return { ok: false, reason: 'no-session' };
+    return credCache.ensureSent(vault);
+  });
+  // The routine cadence. Unref'd so it never keeps the process alive; each tick is a cheap gated skip when
+  // there is nothing to do. A first pass is kicked shortly after boot (once the window/session settle).
+  if (syncTickTimer) clearInterval(syncTickTimer);
+  syncTickTimer = setInterval(() => { void tickSync(); }, SYNC_TICK_MS);
+  if (syncTickTimer.unref) syncTickTimer.unref();
+}
+
 function buildEnableIo() {
   const dir = app.getPath('userData');
   const home = app.getPath('home');
@@ -472,6 +840,21 @@ function buildEnableIo() {
       });
       return res.response === 1;
     },
+    // Report who, other than the owner, currently has access to the picked folder (win32). A read of the
+    // ACL, classified into deliberate shares vs denies; anything else (POSIX, an unreadable ACL) reports
+    // nothing shared, so the gate is skipped and the owner-only enforcement stays at run time.
+    inspectFolderSharing: async (folder) => {
+      if (process.platform !== 'win32') return { shares: [], denies: [] };
+      const read = await runIcacls([String(folder)]);
+      if (!read || read.code !== 0) return { shares: [], denies: [] };
+      return classifyForeignAces(read.stdout, folderSecureIo().user, folder);
+    },
+    // The folder-privacy consent gate, shown only when the folder is shared. Its explicit "make it
+    // private" is the sole trigger to strip access; declining picks another folder or cancels, stripping
+    // nothing. The same dialog is re-presented on run-time drift (recoverSharedFolder).
+    confirmMakePrivate: ({ folder }) => confirmMakePrivateDialog(folder),
+    // Make the folder owner-only AFTER the person consented above. Never reached without that consent.
+    makePrivate: (folder) => recoverOwnerOnly(folder, folderSecureIo()),
     isNonEmptyDir: (p) => { try { return fs.readdirSync(p).length > 0; } catch { return false; } },
     confirmConsent: async ({ vaultId, vaultName, folder, nonEmpty }) => {
       let detail = enableCopy.consentMessage(vaultName, folder, { nonEmpty });
@@ -541,6 +924,11 @@ async function setupSyncForVault() {
     if (r && r.enabled) {
       try { syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* config unreadable */ }
       refreshTray();
+      // Kick the first sync right away instead of leaving the freshly-enabled vault at "set up - not running
+      // yet" until the next routine tick. Via tickSync so the run-state snapshot is REFRESHED with the new id
+      // list FIRST — otherwise the just-enabled id is uncovered and would read never-run, auto-resyncing a
+      // re-enabled but still-latched vault instead of blocking it. The dispatch stays gated as usual.
+      void tickSync();
     } else if (r && r.reason === 'no-standard-vaults') {
       try {
         await dialog.showMessageBox(mainWindow, {

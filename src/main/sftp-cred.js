@@ -52,7 +52,7 @@ async function postJson(fetchFn, url, sessionToken, body) {
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
     body: JSON.stringify(body),
   });
-  if (!res || !res.ok) throw new Error(`mint request failed: ${(res && res.status) || 'no response'}`);
+  if (!res || !res.ok) { const e = new Error(`mint request failed: ${(res && res.status) || 'no response'}`); e.status = res && res.status; throw e; }
   return res.json();
 }
 
@@ -72,15 +72,26 @@ async function mintTempCred({ serverOrigin, sessionToken, vaultId, validityMinut
 // against this fingerprint before pinning).
 async function fetchHostKey({ serverOrigin, sessionToken }, fetchFn) {
   const res = await fetchFn(`${serverOrigin}/sftp/host-key`, { headers: { Authorization: `Bearer ${sessionToken}` } });
-  if (!res || !res.ok) throw new Error(`host-key request failed: ${(res && res.status) || 'no response'}`);
+  if (!res || !res.ok) {
+    const e = new Error(`host-key request failed: ${(res && res.status) || 'no response'}`);
+    e.status = res && res.status;
+    // A server that does not even expose this endpoint (404) cannot be verified — a calm "can't verify yet",
+    // fail-closed with no trust-on-first-use, not an auth problem or a bare retry.
+    if (res && res.status === 404) e.reason = 'host-key-unverified';
+    throw e;
+  }
   const data = (await res.json()) || {};
-  if (data.available === false) throw new Error('SFTP host key unavailable — refusing to connect without server verification');
+  // The server cannot verify itself yet (or offers nothing usable to pin): a calm "can't verify yet", not an auth
+  // problem — tag it so the caller can surface it as such rather than a generic retry.
+  if (data.available === false) { const e = new Error('SFTP host key unavailable — refusing to connect without server verification'); e.reason = 'host-key-unverified'; throw e; }
   const raw = data.host_keys || data.hostKeys || data.public_keys || data.public_key || data.key || null;
   const list = (Array.isArray(raw) ? raw : (raw ? [raw] : [])).map((k) => String(k).trim()).filter(Boolean);
   // Only accept actual OpenSSH public-key lines (ssh-ed25519 / ssh-rsa / ecdsa-* / sk-*), never a bare fingerprint.
   const full = list.filter((k) => /^(ssh-|ecdsa-|sk-)\S+\s+\S/.test(k));
   if (full.length === 0) {
-    throw new Error('server did not provide a full SFTP host public key to pin — refusing to connect (a fingerprint alone is insufficient; no trust-on-first-use)');
+    const e = new Error('server did not provide a full SFTP host public key to pin — refusing to connect (a fingerprint alone is insufficient; no trust-on-first-use)');
+    e.reason = 'host-key-unverified';
+    throw e;
   }
   return full.join(',');
 }

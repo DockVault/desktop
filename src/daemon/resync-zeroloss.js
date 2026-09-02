@@ -28,7 +28,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { planPreservation } = require('./resync-plan');
 const { keepBothName } = require('./keepboth-name');
-const { runBisync } = require('./sync-engine');
+const { runBisync, credPrepareOutcome, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS } = require('./sync-engine');
 const { RESULT } = require('./bisync-outcome');
 const { recordRun } = require('../main/state-db');
 
@@ -123,8 +123,20 @@ async function zeroLossResync(o) {
   const source = o.source || 'the vault';
   const at = now(); // one timestamp for the whole repair, so planned names + collision retries agree
 
+  // Every sub-command below is bounded by INACTIVITY (like the bisync run), not a fixed wall clock, so a
+  // large-but-progressing pre-scan of a big vault is not false-killed; each is fed periodic stats so a
+  // quiet-but-working transfer keeps the timer alive. A generous hard ceiling still bounds a hung run.
+  const scanOpts = { config: o.config, inactivityMs: o.inactivityMs || SYNC_INACTIVITY_MS, hardCeilingMs: o.hardCeilingMs || SYNC_HARD_CEILING_MS };
+
+  // The server issues single-use credentials, so EACH rclone process below must authenticate with its own
+  // fresh one. `prepareCred` (wired on the resync path) mints a fresh credential and rewrites the ephemeral
+  // config in place before a step runs; on failure the typed reason becomes the run outcome (nothing ran, so
+  // the resync stays required and is retried). Absent (it never is on this path) it is a no-op.
+  const prepare = o.prepareCred || (async () => ({ ok: true }));
+
   // 1. FAIL-CLOSED enumeration of the server side.
-  const ls = await o.runner.run(['lsf', '-R', '--files-only', o.remote], { config: o.config, timeoutMs: o.timeoutMs || 120000 });
+  { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved: 0 }; }
+  const ls = await o.runner.run(['lsf', '-R', '--files-only', o.remote, ...SYNC_STATS_ARGS], scanOpts);
   if (ls.code !== 0) throw new Error('zero-loss resync: could not enumerate the server — refusing to resync');
   const serverList = parseLsf(ls.stdout);
   const localList = walkLocal(o.local);
@@ -136,7 +148,8 @@ async function zeroLossResync(o) {
   //    on-both file could not be compared (a '!' verdict, or simply no verdict = the run died mid-scan).
   let differing = [];
   if (onBoth.length) {
-    const chk = await o.runner.run(['check', o.local, o.remote, '--download', '--combined', '-'], { config: o.config, timeoutMs: o.timeoutMs || 300000 })
+    { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved: 0 }; }
+    const chk = await o.runner.run(['check', o.local, o.remote, '--download', '--combined', '-', ...SYNC_STATS_ARGS], scanOpts)
       .catch((e) => ({ code: -1, stdout: '', stderr: String(e) }));
     const parsed = parseCheckDiffering(chk.stdout, onBoth);
     if (parsed.compareError || parsed.covered.size !== onBoth.length) {
@@ -149,8 +162,9 @@ async function zeroLossResync(o) {
   const plan = planPreservation({ serverOnly, differing, localFiles: localList }, { source, at });
   let preserved = 0;
   for (const action of plan) {
+    { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved }; }
     const { full, rel } = reserveLocalPath(o.local, action, source, at);
-    const cp = await o.runner.run(['copyto', `${o.remote}/${action.from}`, full], { config: o.config, timeoutMs: o.timeoutMs || 120000 })
+    const cp = await o.runner.run(['copyto', `${o.remote}/${action.from}`, full, ...SYNC_STATS_ARGS], scanOpts)
       .catch((e) => ({ code: -1, stderr: String(e) }));
     if (cp.code !== 0) { try { fs.rmSync(full, { force: true }); } catch { /* best effort */ } throw new Error(`zero-loss resync: failed to preserve ${action.from} -> ${rel}`); }
     preserved += 1;
@@ -158,7 +172,7 @@ async function zeroLossResync(o) {
 
   // 5. Establish the clean baseline. resync:true satisfies runBisync's gate and CLEARS a resync-required
   //    block; this is the deliberate user action, never an automatic response to an abort.
-  const r = await runBisync({ runner: o.runner, db: o.db, vault: o.vault, local: o.local, remote: o.remote, workdir: o.workdir, config: o.config, resync: true, now, timeoutMs: o.timeoutMs });
+  const r = await runBisync({ runner: o.runner, db: o.db, vault: o.vault, local: o.local, remote: o.remote, workdir: o.workdir, config: o.config, resync: true, prepareCred: o.prepareCred, now, timeoutMs: o.timeoutMs });
 
   // A kept-both conflict is an UNRECONCILED state the user must resolve: even though the resync itself
   // succeeded and the data is safe, the outcome must NOT read as clean (the same anti-lie rule as a normal

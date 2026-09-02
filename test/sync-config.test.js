@@ -75,7 +75,12 @@ test('classifyLocalTarget: case-insensitive mode catches a differently-cased ove
 // ---- config record ----
 test('makeConfigEntry: builds a credential-free record and defaults enabled true', () => {
   const e = cfg.makeConfigEntry({ vaultId: 'v1', vaultName: 'Marketing', localFolder: abs('/Users/tester/Vaults/M'), remotePath: 'Marketing' });
-  assert.deepStrictEqual(e, { vaultId: 'v1', vaultName: 'Marketing', localFolder: abs('/Users/tester/Vaults/M'), remotePath: 'Marketing', enabled: true });
+  assert.deepStrictEqual(e, { vaultId: 'v1', vaultName: 'Marketing', localFolder: abs('/Users/tester/Vaults/M'), remotePath: 'Marketing', enabled: true, consented: false });
+});
+
+test('makeConfigEntry: records consent when given, and never assumes it (defaults false)', () => {
+  assert.strictEqual(cfg.makeConfigEntry({ vaultId: 'v', vaultName: 'M', localFolder: abs('/x'), remotePath: 'M', consented: true }).consented, true);
+  assert.strictEqual(cfg.makeConfigEntry({ vaultId: 'v', vaultName: 'M', localFolder: abs('/x'), remotePath: 'M' }).consented, false);
 });
 
 test('makeConfigEntry: rejects any credential-adjacent or unexpected field, and bad required fields', () => {

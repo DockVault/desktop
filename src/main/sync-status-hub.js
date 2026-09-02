@@ -27,6 +27,11 @@ class SyncStatusHub {
     this._daemon = deps.daemon || null;
     this._onStatus = typeof deps.onStatus === 'function' ? deps.onStatus : () => {};
     this._onNotify = typeof deps.onNotify === 'function' ? deps.onNotify : () => {};
+    // A single positive notification the FIRST time each vault syncs successfully this session. Distinct
+    // from onNotify (which is for must-act items) — it is the only "good news" toast, and it is fired at
+    // most once per vault, never on later successes.
+    this._onToast = typeof deps.onToast === 'function' ? deps.onToast : () => {};
+    this._now = typeof deps.now === 'function' ? deps.now : () => Date.now();
     this._sig = {
       hasSecureStore: deps.hasSecureStore !== false,
       locked: !!deps.locked,
@@ -63,7 +68,7 @@ class SyncStatusHub {
   setVaults(list) {
     const next = new Map();
     for (const v of Array.isArray(list) ? list : []) {
-      const prev = this._vaults.get(v) || { running: false, lastResult: null, resyncRequired: false };
+      const prev = this._vaults.get(v) || { running: false, lastResult: null, resyncRequired: false, condition: null, lastSyncedAt: null, everSucceeded: false };
       next.set(v, prev);
     }
     this._vaults = next;
@@ -72,7 +77,9 @@ class SyncStatusHub {
 
   setRunning(vault, running) {
     const e = this._vaults.get(vault); if (!e) return;
-    e.running = !!running; this._recompute();
+    e.running = !!running;
+    if (e.running) e.condition = null; // a run actually starting clears any prior can't-run reason
+    this._recompute();
   }
 
   /** Record a completed run's typed outcome for a vault (from the scheduler). */
@@ -81,8 +88,33 @@ class SyncStatusHub {
     e.lastResult = result != null ? result : e.lastResult;
     if (typeof resyncRequired === 'boolean') e.resyncRequired = resyncRequired;
     e.running = false;
+    e.condition = null; // a completed run supersedes any prior can't-run reason
+    // Success-ONLY bookkeeping: a run counts as a success exactly when it lands the vault at "up to date"
+    // (an 'ok'/'resync-ok' outcome with nothing unresolved outranking it). Reuse the one status model so
+    // there is no second, drifting notion of success. A failed, blocked, or conflicted outcome stamps
+    // nothing and never toasts.
+    const landed = model.vaultState({ vault, running: false, lastResult: e.lastResult, resyncRequired: e.resyncRequired, condition: null });
+    let firstSuccess = false;
+    if (landed.state === model.STATE.UP_TO_DATE) {
+      e.lastSyncedAt = this._now();          // "Last synced" advances only on a real success
+      if (!e.everSucceeded) { e.everSucceeded = true; firstSuccess = true; }
+    }
+    this._recompute();
+    if (firstSuccess) { try { this._onToast({ scope: 'vault', vault, kind: 'first-success' }); } catch { /* a consumer error is not ours */ } }
+  }
+
+  /**
+   * Record a live reason a vault could NOT run this dispatch (refused/paused/skipped for a persistent
+   * cause), so it stops reading as its stale last state. Distinct from a completed outcome — it leaves
+   * lastResult/resyncRequired untouched and is cleared once the vault actually runs or completes.
+   */
+  recordCondition(vault, { state, reason } = {}) {
+    const e = this._vaults.get(vault); if (!e || !state) return;
+    e.condition = { state, reason: reason || null };
+    e.running = false;
     this._recompute();
   }
+
 
   /** The current computed model (also what the read-only channel returns on demand). */
   current() {

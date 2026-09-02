@@ -42,6 +42,10 @@ app.whenReady().then(async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dv-enable-check-'));
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dv-enable-home-'));
   const target = path.join(home, 'Vaults', 'Marketing');
+  // Create the target BEFORE the flow so resolveReal's realpathSync.native actually canonicalizes an
+  // existing path (a native resolver returns nothing for a missing dir). The temp path here carries an
+  // 8.3 short-name segment (a "NAME~1"-style component) that .native expands — the observable proof it ran.
+  fs.mkdirSync(target, { recursive: true });
 
   // Drive the REAL flow with stubbed dialogs; everything else (fs, store, derivation) is real.
   const io = {
@@ -63,6 +67,10 @@ app.whenReady().then(async () => {
   out.flow = r;
   out.remoteDerived = !!(r.entry && r.entry.remotePath === 'Marketing'); // from the vault, not the folder
   out.folderExists = fs.existsSync(target);
+  // residual-#3 observable consequence: the STORED path equals the native-canonical form (so .native
+  // actually ran — a path.resolve fallback would keep the 8.3 short name and differ), and no ~N remains.
+  out.nativeResolved = !!(r.entry && r.entry.localFolder === fs.realpathSync.native(target));
+  out.noShortName = !!(r.entry && !/~\d/.test(r.entry.localFolder));
   out.encAvailable = safeStorage.isEncryptionAvailable();
   const onDisk = JSON.parse(fs.readFileSync(store.configPath(dir), 'utf8'));
   out.wrappedMatchesStore = onDisk.enc === out.encAvailable; // encrypted iff the OS store is available
@@ -88,7 +96,8 @@ app.whenReady().then(async () => {
   try { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); } catch {}
 
   out.ok = !!(r.enabled && out.remoteDerived && out.folderExists && out.wrappedMatchesStore && out.roundTrip
-    && out.storeCredFree && out.permsOk && out.hasStatus && out.hasOnStatus && out.noSetup && out.noList);
+    && out.storeCredFree && out.permsOk && out.hasStatus && out.hasOnStatus && out.noSetup && out.noList
+    && out.nativeResolved && out.noShortName);
   clearTimeout(watchdog);
   dump();
   app.quit();

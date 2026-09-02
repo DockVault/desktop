@@ -29,6 +29,12 @@ const { remotePathForVault, makeConfigEntry, classifyLocalTarget } = require('./
  * @param {(p:string) => string} io.resolveReal  resolve symlinks to the real absolute target
  * @param {() => object} io.classifyCtx  fresh { home, userData, refuseRoots, existingFolders }
  * @param {(folder:string) => Promise<boolean>} io.confirmCloud  a cloud-folder warning; true => use anyway
+ * @param {(folder:string) => Promise<{shares:string[],denies:string[]}>} [io.inspectFolderSharing]  optional: report
+ *   principals that currently have access to the picked folder beyond the owner (win32); default => nothing shared
+ * @param {(info:{folder:string,shares:string[],denies:string[]}) => Promise<'make-private'|'choose-different'|'cancel'>} [io.confirmMakePrivate]
+ *   the folder-privacy consent gate, shown ONLY when the folder is shared; its explicit "make-private" is the sole trigger
+ *   to strip access — declining never strips
+ * @param {(folder:string) => Promise<{ok:boolean,reason?:string}>} [io.makePrivate]  make the folder owner-only AFTER consent
  * @param {(vaultName:string, folder:string) => Promise<boolean>} io.confirmConsent  the readable-copies consent
  * @param {(folder:string) => void} io.ensureFolder  create the folder not-world-accessible (idempotent)
  * @param {(reason:string) => (void|Promise<void>)} io.onRefuse  surface why a folder was refused
@@ -69,6 +75,21 @@ async function runEnableFlow(io) {
       if (!useAnyway) continue; // "choose another folder"
     }
 
+    // A folder the person picked may already be shared with other accounts (an explicit foreign ACE) or
+    // carry a deny. Syncing needs it owner-only, but that access is NEVER stripped silently: if the folder
+    // is shared, a consent gate is shown, and only its explicit "make it private" makes the folder
+    // owner-only. Declining strips nothing — the person either picks a different folder or abandons setup.
+    const sharing = io.inspectFolderSharing ? await io.inspectFolderSharing(resolved) : { shares: [], denies: [] };
+    const shares = (sharing && sharing.shares) || [];
+    const denies = (sharing && sharing.denies) || [];
+    if (shares.length || denies.length) {
+      const decision = await io.confirmMakePrivate({ folder: resolved, shares, denies });
+      if (decision === 'choose-different') continue;               // re-pick, nothing stripped
+      if (decision !== 'make-private') return { enabled: false, cancelled: true }; // declined -> no strip, nothing saved
+      const made = io.makePrivate ? await io.makePrivate(resolved) : { ok: false, reason: 'folder-problem' };
+      if (!made.ok) { await io.onRefuse(made.reason || 'folder-problem'); continue; } // couldn't secure -> re-pick, never a dead-end
+    }
+
     // Consent is two-way and folder-aware: a bisync uploads the folder's existing (and future)
     // contents into the server-readable vault, so the consent must know whether the folder is non-empty.
     const nonEmpty = typeof io.isNonEmptyDir === 'function' ? !!io.isNonEmptyDir(resolved) : false;
@@ -77,7 +98,9 @@ async function runEnableFlow(io) {
 
     // The remote is ALWAYS the value derived from the chosen vault above — never a picker/renderer value.
     io.ensureFolder(resolved);
-    const entry = makeConfigEntry({ vaultId: vault.vaultId, vaultName: vault.vaultName, localFolder: resolved, remotePath, enabled: true });
+    // consented: the two-way readable-copies consent was just given (confirmConsent above), so the first
+    // scheduled upload does not re-ask; a config written before this flag existed re-asks, fail-safe.
+    const entry = makeConfigEntry({ vaultId: vault.vaultId, vaultName: vault.vaultName, localFolder: resolved, remotePath, enabled: true, consented: true });
     await io.save(entry);
     return { enabled: true, entry };
   }

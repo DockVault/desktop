@@ -48,7 +48,30 @@ test('runSync() round-trips a summarized bisync outcome (id-correlated), never r
   assert.deepStrictEqual(sent.spec, { vault: 'v1', local: 'l', remotePath: 'p', resync: true });
   assert.ok(typeof sent.id === 'number');
   mgr._onMessage({ type: 'sync-run-result', id: sent.id, ok: true, ran: true, result: 'abort-excessive-delete', resyncRequired: true, needsAttention: true, code: 2 });
-  assert.deepStrictEqual(await p, { ok: true, ran: true, result: 'abort-excessive-delete', resyncRequired: true, needsAttention: true, code: 2, error: null });
+  assert.deepStrictEqual(await p, { ok: true, ran: true, result: 'abort-excessive-delete', reason: null, resyncRequired: true, needsAttention: true, code: 2, preserved: null, refused: null, error: null });
+});
+
+test('runSync() surfaces a TYPED already-running refusal (never a failure or a completion)', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  let sent = null;
+  mgr.child = { postMessage: (m) => { sent = m; } };
+  const p = mgr.runSync({ vault: 'v1', local: 'l', remotePath: 'p' }, 1000);
+  mgr._onMessage({ type: 'sync-run-result', id: sent.id, ok: false, ran: false, refused: 'already-running' });
+  const r = await p;
+  assert.strictEqual(r.refused, 'already-running');
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.ran, false);
+});
+
+test('runSync() carries the keep-both preservation count back when a resync reports one', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  let sent = null;
+  mgr.child = { postMessage: (m) => { sent = m; } };
+  const p = mgr.runSync({ vault: 'v1', local: 'l', remotePath: 'p', resync: true }, 1000);
+  mgr._onMessage({ type: 'sync-run-result', id: sent.id, ok: true, ran: true, result: 'conflict-keep-both', resyncRequired: false, needsAttention: true, preserved: 3 });
+  const r = await p;
+  assert.strictEqual(r.preserved, 3, 'the keep-both count round-trips to the caller');
+  assert.strictEqual(r.result, 'conflict-keep-both');
 });
 
 test('runSync() resolves not-ok when there is no daemon, or the send fails', async () => {
@@ -128,4 +151,113 @@ test('a clean ready breaks the loop history (counters + latch reset)', () => {
   assert.strictEqual(mgr.restarts, 0);
   assert.strictEqual(mgr._restartTimes.length, 0);
   assert.strictEqual(mgr.crashLoopLatched, false);
+});
+
+test('clearSftpCred() sends sftp-cred-clear and resolves ok on the ack; ok (vacuously) with no daemon', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  let sent = null;
+  mgr.child = { postMessage: (m) => { sent = m; } };
+  const p = mgr.clearSftpCred(1000);
+  assert.strictEqual(sent.type, 'sftp-cred-clear');
+  assert.ok(typeof sent.id === 'number');
+  mgr._onMessage({ type: 'sftp-cred-ack', id: sent.id, ok: true });
+  assert.deepStrictEqual(await p, { ok: true, error: null });
+  mgr.child = null;
+  assert.deepStrictEqual(await mgr.clearSftpCred(20), { ok: true }, 'no daemon holds no credential — nothing to clear');
+});
+
+test('runStates() round-trips the per-vault snapshot; null for a never-run vault', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  let sent = null;
+  mgr.child = { postMessage: (m) => { sent = m; } };
+  const p = mgr.runStates(['a', 'b'], 1000);
+  assert.strictEqual(sent.type, 'run-state');
+  assert.deepStrictEqual(sent.vaults, ['a', 'b']);
+  mgr._onMessage({ type: 'run-state-result', id: sent.id, states: { a: { lastResult: 'ok', resyncRequired: false }, b: null } });
+  assert.deepStrictEqual(await p, { ok: true, states: { a: { lastResult: 'ok', resyncRequired: false }, b: null } });
+});
+
+test('runStates() distinguishes a FAILED query ({ok:false}) from a successful-but-empty snapshot', async () => {
+  // no daemon -> failure, not an empty success (so the glue never reads it as "every vault never-run")
+  const noDaemon = new DaemonManager('/nonexistent');
+  noDaemon.child = null;
+  assert.deepStrictEqual(await noDaemon.runStates(['a'], 20), { ok: false });
+  // a real answer with no rows -> success with an empty snapshot (all genuinely never-run)
+  const live = new DaemonManager('/nonexistent');
+  let sent = null;
+  live.child = { postMessage: (m) => { sent = m; } };
+  const p = live.runStates(['a'], 1000);
+  live._onMessage({ type: 'run-state-result', id: sent.id, states: {} });
+  assert.deepStrictEqual(await p, { ok: true, states: {} });
+});
+
+test('a daemon exit resolves an in-flight run-state query as a FAILURE (never an empty success)', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  mgr.stopping = true;
+  mgr.child = { postMessage: () => {} };
+  const p = mgr.runStates(['a'], 5000);
+  mgr._onExit(1);
+  assert.deepStrictEqual(await p, { ok: false });
+});
+
+// The helper-initiated per-step credential request (resync fresh-cred-per-process). Main AUTHORISES it: it
+// bounds the count per run, delegates the in-flight-vault/unlock/account checks + mint to an injected provider,
+// and replies with only { ok, reason } — never a credential (that travels on the sftp-cred path).
+test('need-sftp-cred: authorises via the injected provider and replies only {ok,reason}, no credential', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  const posted = [];
+  mgr.child = { postMessage: (m) => posted.push(m) };
+  let asked = null;
+  mgr.setCredProvider(async (vault) => { asked = vault; return { ok: true }; });
+  await mgr._onNeedSftpCred({ type: 'need-sftp-cred', id: 'nc1', vault: 'v1' });
+  assert.strictEqual(asked, 'v1', 'the provider is asked for the requested vault');
+  const reply = posted.find((m) => m.type === 'need-sftp-cred-result');
+  assert.deepStrictEqual(reply, { type: 'need-sftp-cred-result', id: 'nc1', ok: true, reason: null });
+  assert.ok(!('bundle' in reply) && !('password' in reply) && !('hostKeys' in reply), 'the reply carries no credential');
+});
+
+test('need-sftp-cred: a provider refusal (not-in-flight / locked) rides back as the reason, mints nothing extra', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  const posted = [];
+  mgr.child = { postMessage: (m) => posted.push(m) };
+  mgr.setCredProvider(async () => ({ ok: false, reason: 'not-in-flight' }));
+  await mgr._onNeedSftpCred({ type: 'need-sftp-cred', id: 'nc2', vault: 'other' });
+  assert.deepStrictEqual(posted.pop(), { type: 'need-sftp-cred-result', id: 'nc2', ok: false, reason: 'not-in-flight' });
+});
+
+test('need-sftp-cred: a bad request and a missing provider fail closed without minting', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  const posted = [];
+  mgr.child = { postMessage: (m) => posted.push(m) };
+  let called = 0;
+  mgr.setCredProvider(async () => { called += 1; return { ok: true }; });
+  await mgr._onNeedSftpCred({ type: 'need-sftp-cred', id: 'x', vault: null }); // no vault
+  assert.strictEqual(called, 0, 'a bad request never reaches the provider');
+  assert.strictEqual(posted.pop().reason, 'bad-request');
+
+  const mgr2 = new DaemonManager('/nonexistent');
+  const posted2 = [];
+  mgr2.child = { postMessage: (m) => posted2.push(m) };
+  await mgr2._onNeedSftpCred({ type: 'need-sftp-cred', id: 'y', vault: 'v1' }); // no provider wired
+  assert.strictEqual(posted2.pop().reason, 'no-provider');
+});
+
+test('need-sftp-cred: the per-run request count is bounded — past the cap mints nothing', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  const posted = [];
+  mgr.child = { postMessage: (m) => posted.push(m) };
+  let called = 0;
+  mgr.setCredProvider(async () => { called += 1; return { ok: true }; });
+  mgr._credRequestsThisRun = 1e9; // well past any cap — a runaway helper
+  await mgr._onNeedSftpCred({ type: 'need-sftp-cred', id: 'z', vault: 'v1' });
+  assert.strictEqual(called, 0, 'past the cap, nothing is minted');
+  assert.strictEqual(posted.pop().reason, 'cap-exceeded');
+});
+
+test('need-sftp-cred: the per-run request budget resets at the start of each run', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  mgr.child = { postMessage: () => {} };
+  mgr._credRequestsThisRun = 500;
+  mgr.runSync({ vault: 'v', local: 'l', remotePath: 'p' }, 1000); // sends + awaits; not awaited here
+  assert.strictEqual(mgr._credRequestsThisRun, 0, 'a fresh run resets the per-step credential budget');
 });

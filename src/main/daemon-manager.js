@@ -24,6 +24,10 @@ const MAX_BACKOFF_MS = 30000;
 // is surfaced as a sync problem the person must act on, never retried silently to exhaustion.
 const MAX_RESTARTS = 5;
 const CRASH_WINDOW_MS = 3 * 60 * 1000;
+// A single resync run's per-process credential requests are bounded: enumerate + compare + one preserve per
+// conflicting file + the baseline. This ceiling covers a large conflict set with generous slack while still
+// stopping a looping helper from minting without bound (each mint is a server credential row + an audit line).
+const MAX_CRED_REQUESTS_PER_RUN = 512;
 
 class DaemonManager {
   constructor(userDataDir, rcloneConfig = null, opts = {}) {
@@ -51,7 +55,22 @@ class DaemonManager {
     this._credPending = new Map(); // sftp-cred id -> { resolve, timer }
     this._syncSeq = 0;
     this._syncPending = new Map(); // sync-run id -> { resolve, timer }
+    this._runStateSeq = 0;
+    this._runStatePending = new Map(); // run-state id -> { resolve, timer }
+    // The helper may REQUEST a fresh single-use credential per rclone process of a resync (the daemon->main
+    // 'need-sftp-cred' direction). Main AUTHORISES each such request — it never executes it: an injected
+    // provider applies the in-flight-vault + unlock + account checks and mints, and a per-run counter bounds
+    // how many a single run may ask for, so a looping helper cannot mint without bound.
+    this._credProvider = null;
+    this._credRequestsThisRun = 0;
   }
+
+  /**
+   * Wire the authoriser for a helper-initiated per-step credential request. `fn(vault)` must itself enforce
+   * the in-flight-vault, unlock and account checks and then mint+send (it returns { ok, reason }). The per-run
+   * COUNT bound is enforced here, in main, independently of anything the helper says.
+   */
+  setCredProvider(fn) { this._credProvider = fn; }
 
   start() { if (!this.child) this._spawn(); return this; }
 
@@ -97,8 +116,15 @@ class DaemonManager {
         const e = this._syncPending.get(m.id);
         if (e) {
           this._syncPending.delete(m.id); clearTimeout(e.timer);
-          e.resolve({ ok: !!m.ok, ran: !!m.ran, result: m.result || null, resyncRequired: !!m.resyncRequired, needsAttention: !!m.needsAttention, code: typeof m.code === 'number' ? m.code : null, error: m.error || null });
+          e.resolve({ ok: !!m.ok, ran: !!m.ran, result: m.result || null, reason: m.reason || null, resyncRequired: !!m.resyncRequired, needsAttention: !!m.needsAttention, code: typeof m.code === 'number' ? m.code : null, preserved: typeof m.preserved === 'number' ? m.preserved : null, refused: m.refused || null, error: m.error || null });
         }
+        break;
+      }
+      // The helper asks main to mint+send a fresh single-use credential for the CURRENT resync's next process.
+      case 'need-sftp-cred': void this._onNeedSftpCred(m); break;
+      case 'run-state-result': {
+        const e = this._runStatePending.get(m.id);
+        if (e) { this._runStatePending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: true, states: (m.states && typeof m.states === 'object') ? m.states : {} }); }
         break;
       }
       case 'error': this._emit('error', m); break;
@@ -136,6 +162,11 @@ class DaemonManager {
     // fail-closed: the caller sees a failed run and the resync block (if any) is untouched on disk.
     for (const e of this._syncPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, ran: false, error: 'daemon exited' }); }
     this._syncPending.clear();
+    // A dead daemon can't answer a run-state query — resolve any in-flight one as a FAILURE (ok:false),
+    // distinct from a successful-but-empty snapshot, so the caller fails closed (never reads it as
+    // "every vault never-run") and never hangs.
+    for (const e of this._runStatePending.values()) { clearTimeout(e.timer); e.resolve({ ok: false }); }
+    this._runStatePending.clear();
     if (this.stopping) { this.status = 'stopped'; return; }
     // Record this exit and keep only those inside the window. Once too many land in the window the
     // ceiling is hit: stop restarting, latch the stuck state, and surface it — never a silent storm.
@@ -240,21 +271,82 @@ class DaemonManager {
   }
 
   /**
+   * Tell the daemon to drop its prepared SFTP config (on app lock / session end). Resolves { ok } — and
+   * ok=true when there is no daemon, since "no daemon holds no credential" already satisfies the caller's
+   * goal (nothing to clear). Acked so the lock flow can confirm the daemon holds nothing.
+   */
+  clearSftpCred(timeoutMs = 12000) {
+    return new Promise((resolve) => {
+      if (!this.child) return resolve({ ok: true }); // no daemon => nothing is held; the clear is vacuously done
+      const id = ++this._credSeq;
+      const timer = setTimeout(() => { if (this._credPending.delete(id)) resolve({ ok: false, error: 'timeout' }); }, timeoutMs);
+      if (timer.unref) timer.unref();
+      this._credPending.set(id, { resolve, timer });
+      try { this.child.postMessage({ type: 'sftp-cred-clear', id }); }
+      catch { this._credPending.delete(id); clearTimeout(timer); return resolve({ ok: false, error: 'send failed' }); }
+    });
+  }
+
+  /**
    * Ask the daemon to run one bisync for a vault, using the config prepared by the last sendSftpCred().
    * The daemon enforces delete-safety + the first-run/blocked resync gate; this only relays a summarized
    * outcome. `spec` = { vault, local, remotePath, resync? }. Resolves { ok, ran, result, resyncRequired,
    * code, error }: ok=false when unconfigured, no cred is prepared, the daemon is dead, or it timed out.
-   * The timeout exceeds the daemon-side bisync timeout so a long-but-live run is not cut short here.
+   * The daemon self-bounds a run by inactivity plus its own generous hard ceiling, so this timeout sits
+   * ABOVE that ceiling — it is only a backstop for a wedged daemon, never a shorter cap that would give up
+   * on a long-but-live run and release the run mutex while the daemon is still working (which could then
+   * start a second run on the same vault).
    */
-  runSync(spec, timeoutMs = 15 * 60 * 1000) {
+  runSync(spec, timeoutMs = 6 * 60 * 60 * 1000 + 10 * 60 * 1000) {
     return new Promise((resolve) => {
       if (!this.child) return resolve({ ok: false, ran: false, error: 'no daemon' });
+      this._credRequestsThisRun = 0; // a fresh per-run budget for this run's per-step credential requests
       const id = ++this._syncSeq;
       const timer = setTimeout(() => { if (this._syncPending.delete(id)) resolve({ ok: false, ran: false, error: 'timeout' }); }, timeoutMs);
       if (timer.unref) timer.unref();
       this._syncPending.set(id, { resolve, timer });
       try { this.child.postMessage({ type: 'sync-run', id, spec }); }
       catch { this._syncPending.delete(id); clearTimeout(timer); return resolve({ ok: false, ran: false, error: 'send failed' }); }
+    });
+  }
+
+  // Authorise (never blindly execute) a helper-initiated request to mint+send a fresh single-use credential
+  // for the current resync's next process. Main holds the say: the per-run COUNT is bounded here, and the
+  // injected provider re-checks that `vault` is the in-flight one and that the app is unlocked with a live
+  // account before it mints. The reply carries NO credential — only { ok, reason }; the credential itself
+  // travels on the existing sftp-cred -> sftp-cred-ack path, which the helper confirms arrived before it uses it.
+  async _onNeedSftpCred(m) {
+    const id = m && m.id;
+    const vault = m && typeof m.vault === 'string' && m.vault ? m.vault : null;
+    const done = (ok, reason) => { try { if (this.child) this.child.postMessage({ type: 'need-sftp-cred-result', id, ok: !!ok, reason: reason || null }); } catch { /* child gone */ } };
+    if (id == null || !vault) return done(false, 'bad-request');
+    this._credRequestsThisRun += 1;
+    if (this._credRequestsThisRun > MAX_CRED_REQUESTS_PER_RUN) return done(false, 'cap-exceeded');
+    if (!this._credProvider) return done(false, 'no-provider');
+    let r;
+    try { r = await this._credProvider(vault); } catch { r = { ok: false, reason: 'mint-failed' }; }
+    return done(!!(r && r.ok), r && r.reason);
+  }
+
+  /**
+   * Query the daemon for each vault's run-state (operational metadata only — no credential). Resolves
+   * `{ ok:true, states }` on a real answer — states = { vaultId: { lastResult, resyncRequired } | null |
+   * 'unknown' }, null for a genuinely never-run vault (a real missing row), 'unknown' for a vault whose state
+   * could NOT be read (a throwing store, or no state DB this session) so the caller skips it as
+   * state-uncertain, and an EMPTY states means every vault is genuinely never-run. Resolves `{ ok:false }` on
+   * no daemon, a timeout, or a send failure — DISTINCT from an empty success, so the caller can fail closed
+   * (a failed query, or an unknown per-vault state, must never read as "every vault never-run") and never hangs.
+   * @param {string[]} vaults
+   */
+  runStates(vaults, timeoutMs = 5000) {
+    return new Promise((resolve) => {
+      if (!this.child) return resolve({ ok: false });
+      const id = ++this._runStateSeq;
+      const timer = setTimeout(() => { if (this._runStatePending.delete(id)) resolve({ ok: false }); }, timeoutMs);
+      if (timer.unref) timer.unref();
+      this._runStatePending.set(id, { resolve, timer });
+      try { this.child.postMessage({ type: 'run-state', id, vaults: Array.isArray(vaults) ? vaults : [] }); }
+      catch { this._runStatePending.delete(id); clearTimeout(timer); return resolve({ ok: false }); }
     });
   }
 
