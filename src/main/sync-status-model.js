@@ -60,7 +60,7 @@ const RANK = Object.freeze({
 // `reason`/`detail` and finalized alongside the rest of the human copy.
 const LABEL = Object.freeze({
   [STATE.UP_TO_DATE]: 'Up to date',
-  [STATE.WAITING]: 'Sync set up - not running yet',
+  [STATE.WAITING]: 'Sync set up — not running yet',
   [STATE.SYNCING]: 'Syncing',
   [STATE.PAUSED]: 'Paused',
   [STATE.NEEDS_DECISION]: 'Needs your decision',

@@ -32,7 +32,7 @@ function bodyForConditionReason(reason, name) {
     case 'host-key-mismatch':
       // A CHANGED server identity — a security must-act, at least as loud as the hub alert this replaces on a
       // manual press. Never the vague "couldn't sync": the user must be told to stop and check.
-      return `${name}'s server identity has changed — don't sync until you've checked it. Open DockVault.`;
+      return `${name}'s server identity has changed — don't sync until you've confirmed this is really your server. Open DockVault.`;
     case 'sign-in-needed': return `Sign in to keep ${name} syncing.`;
     case 'needs-repair':
     case 'confirm-large-delete': return `${name} needs a repair before it can sync. Open DockVault to fix it.`;
@@ -41,7 +41,7 @@ function bodyForConditionReason(reason, name) {
     case 'folder-rejected':
     case 'folder-problem': return `${name} can't sync until its folder is fixed. Open DockVault to sort it out.`;
     case 'vault-unavailable': return `${name} can't be synced any more. Open DockVault for details.`;
-    case 'conflict-keep-both': return `${name} has conflicting copies to review. Open DockVault to sort it out.`;
+    case 'conflict-keep-both': return `${name} has conflicting copies — open DockVault to review them.`;
     case 'not-syncing': return `${name} hasn't synced for a while. Open DockVault to check your connection.`;
     case 'error': return `${name} couldn't sync. Open DockVault to see why.`;
     case 'retrying':
