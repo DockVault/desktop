@@ -14,6 +14,13 @@ zero-knowledge encrypted file vault.
 
 Windows, macOS, and Linux are treated as first-class targets.
 
+## Server requirements
+
+Background sync for Standard vaults requires the server to run DockVault vault 0.27.0 or later — the first
+release that serves its full SFTP host key. The client pins that key to verify the server before it syncs.
+Against an older server, sync degrades gracefully rather than failing: the client pauses and reports that it
+cannot verify the server yet, and never syncs unverified.
+
 ## Repository layout
 
 - `vendor/vault` — the DockVault vault application, included as a git submodule and pinned to a released
