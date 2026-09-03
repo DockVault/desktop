@@ -89,6 +89,7 @@ function makeSession({ isAccountUsable, hasAccount, isOnline, snapshotFresh }) {
  * @param {(o:object)=>Promise<boolean>} [deps.confirmFirstUpload]
  * @param {()=>boolean} deps.isAccountUsable
  * @param {()=>boolean} deps.hasAccount
+ * @param {(vaultId:string)=>boolean} [deps.vaultHasPassword]
  * @param {()=>boolean} deps.isOnline
  * @param {(vaultId:string, ev:object)=>void} deps.onEvent
  */
@@ -103,6 +104,11 @@ function makeSchedulerIo(deps) {
     // makeSession left io.hasAccount undefined, so that gate threw (a swallowed TypeError) on every per-step
     // request while the dispatch path — refreshCred below — never touched it and worked.
     hasAccount: deps.hasAccount,
+    // Exposed for the scheduler's auth-failed reroute (sync-scheduler.js): a password-protected vault past its
+    // one retry maps auth-failed -> needs-unlock (re-enter the vault password) rather than a sign-in. Same
+    // omission as hasAccount above — it was threaded nowhere — but this read is typeof-guarded, so instead of
+    // throwing it silently stayed false and dropped the reroute (a wrong sign-in state for a rotated password).
+    vaultHasPassword: deps.vaultHasPassword,
     verifyEligible: makeVerifyEligible({ fetchStandard: deps.fetchStandard, remotePathForVault: deps.remotePathForVault }),
     secureFolder: deps.secureFolder,
     classify: deps.classify,

@@ -337,7 +337,7 @@ test('makeSchedulerIo assembles the io: run-state from the snapshot, resync rout
     remotePathForVault: (n) => n,
     secureFolder: () => ({ ok: true }), classify: () => ({ ok: true }),
     credCache, daemon, confirmFirstUpload: async () => true,
-    isAccountUsable: () => true, hasAccount: () => true, isOnline: () => true, onEvent: () => {},
+    isAccountUsable: () => true, hasAccount: () => true, vaultHasPassword: (id) => id === 'v1', isOnline: () => true, onEvent: () => {},
   });
   assert.deepStrictEqual(io.runState('v1'), { lastResult: 'ok', resyncRequired: false });
   assert.strictEqual(io.runState('other'), null, 'unknown vault -> never-run');
@@ -347,6 +347,10 @@ test('makeSchedulerIo assembles the io: run-state from the snapshot, resync rout
   // throws a TypeError on every per-step (first-run/resync) request while the dispatch path works.
   assert.strictEqual(typeof io.hasAccount, 'function', 'hasAccount is exposed on the io');
   assert.strictEqual(io.hasAccount(), true, 'io.hasAccount() reflects the injected account presence');
+  // Same class: the scheduler's auth-failed -> needs-unlock reroute reads io.vaultHasPassword behind a
+  // typeof guard, so if it is not exposed the reroute silently dies. It must be on the io, not just a dep.
+  assert.strictEqual(typeof io.vaultHasPassword, 'function', 'vaultHasPassword is exposed on the io');
+  assert.strictEqual(io.vaultHasPassword('v1'), true, 'io.vaultHasPassword() reflects the injected predicate');
   assert.deepStrictEqual(await io.verifyEligible('v1'), { ok: true, remotePath: 'V1', vaultName: 'V1' });
   await io.refreshCred('v1');
   assert.deepStrictEqual(calls.ensureSent, ['v1'], 'refreshCred -> the credential cache');
