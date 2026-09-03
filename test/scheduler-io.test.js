@@ -342,6 +342,11 @@ test('makeSchedulerIo assembles the io: run-state from the snapshot, resync rout
   assert.deepStrictEqual(io.runState('v1'), { lastResult: 'ok', resyncRequired: false });
   assert.strictEqual(io.runState('other'), null, 'unknown vault -> never-run');
   assert.deepStrictEqual(io.session(), { locked: false, accountLive: true, online: true });
+  // The per-step credential provider (index.js) gates on io.hasAccount() before minting each fresh
+  // credential; it must be EXPOSED on the io, not only threaded into session — otherwise io.hasAccount()
+  // throws a TypeError on every per-step (first-run/resync) request while the dispatch path works.
+  assert.strictEqual(typeof io.hasAccount, 'function', 'hasAccount is exposed on the io');
+  assert.strictEqual(io.hasAccount(), true, 'io.hasAccount() reflects the injected account presence');
   assert.deepStrictEqual(await io.verifyEligible('v1'), { ok: true, remotePath: 'V1', vaultName: 'V1' });
   await io.refreshCred('v1');
   assert.deepStrictEqual(calls.ensureSent, ['v1'], 'refreshCred -> the credential cache');

@@ -225,6 +225,17 @@ test('need-sftp-cred: a provider refusal (not-in-flight / locked) rides back as 
   assert.deepStrictEqual(posted.pop(), { type: 'need-sftp-cred-result', id: 'nc2', ok: false, reason: 'not-in-flight' });
 });
 
+test('need-sftp-cred: a provider that THROWS surfaces a distinct provider-error, never the generic mint-failed', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  const posted = [];
+  mgr.child = { postMessage: (m) => posted.push(m) };
+  // A code error in the provider (e.g. calling an unexposed io method) must NOT be swallowed as the generic
+  // retryable 'mint-failed' — that hid a real bug behind an endless per-tick retry. It surfaces distinctly.
+  mgr.setCredProvider(async () => { throw new TypeError('io.hasAccount is not a function'); });
+  await mgr._onNeedSftpCred({ type: 'need-sftp-cred', id: 'nc3', vault: 'v1' });
+  assert.deepStrictEqual(posted.pop(), { type: 'need-sftp-cred-result', id: 'nc3', ok: false, reason: 'provider-error' });
+});
+
 test('need-sftp-cred: a bad request and a missing provider fail closed without minting', async () => {
   const mgr = new DaemonManager('/nonexistent');
   const posted = [];

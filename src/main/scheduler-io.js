@@ -98,6 +98,11 @@ function makeSchedulerIo(deps) {
     listConfigured: deps.listConfigured,
     runState: (vaultId) => deps.snapshot.get(vaultId),
     session: makeSession({ isAccountUsable: deps.isAccountUsable, hasAccount: deps.hasAccount, isOnline: deps.isOnline, snapshotFresh: () => deps.snapshot.fresh() }),
+    // Exposed for the per-step credential provider's live-account gate: it calls io.hasAccount() before
+    // minting a fresh credential for each rclone process of a first-run/resync. Threading it only into
+    // makeSession left io.hasAccount undefined, so that gate threw (a swallowed TypeError) on every per-step
+    // request while the dispatch path — refreshCred below — never touched it and worked.
+    hasAccount: deps.hasAccount,
     verifyEligible: makeVerifyEligible({ fetchStandard: deps.fetchStandard, remotePathForVault: deps.remotePathForVault }),
     secureFolder: deps.secureFolder,
     classify: deps.classify,

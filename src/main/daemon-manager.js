@@ -328,7 +328,14 @@ class DaemonManager {
     if (this._credRequestsThisRun > MAX_CRED_REQUESTS_PER_RUN) return done(false, 'cap-exceeded');
     if (!this._credProvider) return done(false, 'no-provider');
     let r;
-    try { r = await this._credProvider(vault); } catch { r = { ok: false, reason: 'mint-failed' }; }
+    try { r = await this._credProvider(vault); }
+    catch (e) {
+      // The provider itself threw (a code error, not a mint/network failure). Do NOT swallow it as the
+      // generic retryable 'mint-failed' — that hid a real bug behind an endless per-tick retry. Surface a
+      // DISTINCT typed reason and note the error class only (leak-safe: class/code, never a message/path).
+      try { console.error('[sync] credential provider error:', (e && e.name) || 'Error', (e && e.code) || ''); } catch { /* ignore */ }
+      r = { ok: false, reason: 'provider-error' };
+    }
     return done(!!(r && r.ok), r && r.reason);
   }
 
