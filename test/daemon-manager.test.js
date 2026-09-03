@@ -69,6 +69,46 @@ test('sync-run-result and sync-status resolves carry a bounded reason, never a r
   assert.ok(!('error' in r2), 'the status resolve never carries an error field');
 });
 
+test('_sendInit PRODUCES the typed keyReason from a loadOrMintDBK throw — never mints, never re-escapes', () => {
+  const stateDb = require('../src/main/state-db');
+  const origLoad = stateDb.loadOrMintDBK;
+  try {
+    const mgr = new DaemonManager('/nonexistent');
+    let sent = null;
+    mgr.child = { postMessage: (m) => { sent = m; } };
+
+    // (a) An existing-but-undecryptable wrapped key: loadOrMintDBK throws the typed error. _sendInit must
+    // hand in NO key and carry the extracted reason — a fresh key is never minted (the DB is never orphaned)
+    // and the throw never re-escapes to leave the supervisor stuck 'starting'.
+    stateDb.loadOrMintDBK = () => { const e = new Error('unreadable'); e.reason = 'db-key-unreadable'; throw e; };
+    mgr._sendInit();
+    assert.strictEqual(sent.type, 'init');
+    assert.strictEqual(sent.dbk, null, 'no key is handed in when the wrapped key cannot be unwrapped');
+    assert.strictEqual(sent.keyReason, 'db-key-unreadable');
+
+    // (b) A throw with no reason falls back to the typed db-key-unreadable (extraction is robust).
+    stateDb.loadOrMintDBK = () => { throw new Error('opaque'); };
+    mgr._sendInit();
+    assert.strictEqual(sent.dbk, null);
+    assert.strictEqual(sent.keyReason, 'db-key-unreadable');
+
+    // (c) The insecure-backend case (loadOrMintDBK returns null) is benign: no key, no reason -> the daemon
+    // reports 'no-secure-store', not a problem.
+    stateDb.loadOrMintDBK = () => null;
+    mgr._sendInit();
+    assert.strictEqual(sent.dbk, null);
+    assert.strictEqual(sent.keyReason, null);
+
+    // (d) The happy path still hands the key in, with no keyReason.
+    stateDb.loadOrMintDBK = () => Buffer.alloc(32, 7);
+    mgr._sendInit();
+    assert.ok(sent.dbk instanceof Uint8Array && sent.dbk.length === 32, 'the key is handed in on the normal path');
+    assert.strictEqual(sent.keyReason, null);
+  } finally {
+    stateDb.loadOrMintDBK = origLoad;
+  }
+});
+
 test('runSync() surfaces a TYPED already-running refusal (never a failure or a completion)', async () => {
   const mgr = new DaemonManager('/nonexistent');
   let sent = null;
