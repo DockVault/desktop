@@ -127,12 +127,15 @@ function onInit(m) {
 // Standard-vault sync health: verify the pinned rclone once (checksum + version) and report its
 // version. This is the daemon supervising rclone through a one-shot child — no listener, no key material.
 async function onSyncStatus(m) {
-  if (!rclone) { reply({ type: 'sync-status', id: m.id, ok: false, error: 'rclone not configured' }); return; }
+  if (!rclone) { reply({ type: 'sync-status', id: m.id, ok: false, reason: 'rclone-unconfigured' }); return; }
   try {
     if (!syncReady) syncReady = await rclone.ready();
     reply({ type: 'sync-status', id: m.id, ok: true, version: syncReady.version });
   } catch (err) {
-    reply({ type: 'sync-status', id: m.id, ok: false, error: String((err && err.message) || err) });
+    // Never surface the raw readiness error — its message can carry the rclone binary path or checksum
+    // detail. Report a bounded reason; log the class only (leak-safe) for diagnosis.
+    try { console.error('[sync] rclone health check failed:', (err && err.name) || 'Error'); } catch { /* ignore */ }
+    reply({ type: 'sync-status', id: m.id, ok: false, reason: 'rclone-unhealthy' });
   }
 }
 
@@ -205,10 +208,10 @@ function onRunState(m) {
 // formatSftpRemote used ('vault'); the caller supplies only the path within it.
 async function onSyncRun(m) {
   const b = (m && m.spec) || {};
-  if (!rclone) { reply({ type: 'sync-run-result', id: m.id, ok: false, error: 'rclone not configured' }); return; }
-  if (!sftpConfig) { reply({ type: 'sync-run-result', id: m.id, ok: false, error: 'no sftp cred prepared' }); return; }
+  if (!rclone) { reply({ type: 'sync-run-result', id: m.id, ok: false, reason: 'rclone-unconfigured' }); return; }
+  if (!sftpConfig) { reply({ type: 'sync-run-result', id: m.id, ok: false, reason: 'no-cred-prepared' }); return; }
   if (!b.vault || !b.local || typeof b.remotePath !== 'string') {
-    reply({ type: 'sync-run-result', id: m.id, ok: false, error: 'sync-run needs vault, local, remotePath' });
+    reply({ type: 'sync-run-result', id: m.id, ok: false, reason: 'bad-run-spec' });
     return;
   }
   // One bisync at a time in the helper. The caller's global mutex already serialises runs, but if the
@@ -238,7 +241,10 @@ async function onSyncRun(m) {
       }));
     reply({ type: 'sync-run-result', id: m.id, ok: true, ran: r.ran, result: r.result, reason: r.reason, resyncRequired: r.resyncRequired, needsAttention: r.needsAttention, code: r.code, preserved: r.preserved });
   } catch (err) {
-    reply({ type: 'sync-run-result', id: m.id, ok: false, error: String((err && err.message) || err) });
+    // Never surface the raw run error — an rclone/engine exception message can carry a path. A bounded reason
+    // stands in; the class only is logged (leak-safe) for diagnosis.
+    try { console.error('[sync] run error:', (err && err.name) || 'Error'); } catch { /* ignore */ }
+    reply({ type: 'sync-run-result', id: m.id, ok: false, reason: 'run-error' });
   } finally {
     syncInFlight = false;
     sftpConfig = null; // a single-use credential is spent after its run — never leave one held between runs

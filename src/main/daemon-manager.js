@@ -104,7 +104,7 @@ class DaemonManager {
       }
       case 'sync-status': {
         const e = this._statusPending.get(m.id);
-        if (e) { this._statusPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, version: m.version || null, error: m.error || null }); }
+        if (e) { this._statusPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, version: m.version || null, reason: m.reason || null }); }
         break;
       }
       case 'sftp-cred-ack': {
@@ -119,7 +119,7 @@ class DaemonManager {
         const e = this._syncPending.get(m.id);
         if (e) {
           this._syncPending.delete(m.id); clearTimeout(e.timer);
-          e.resolve({ ok: !!m.ok, ran: !!m.ran, result: m.result || null, reason: m.reason || null, resyncRequired: !!m.resyncRequired, needsAttention: !!m.needsAttention, code: typeof m.code === 'number' ? m.code : null, preserved: typeof m.preserved === 'number' ? m.preserved : null, refused: m.refused || null, error: m.error || null });
+          e.resolve({ ok: !!m.ok, ran: !!m.ran, result: m.result || null, reason: m.reason || null, resyncRequired: !!m.resyncRequired, needsAttention: !!m.needsAttention, code: typeof m.code === 'number' ? m.code : null, preserved: typeof m.preserved === 'number' ? m.preserved : null, refused: m.refused || null });
         }
         break;
       }

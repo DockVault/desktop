@@ -48,7 +48,25 @@ test('runSync() round-trips a summarized bisync outcome (id-correlated), never r
   assert.deepStrictEqual(sent.spec, { vault: 'v1', local: 'l', remotePath: 'p', resync: true });
   assert.ok(typeof sent.id === 'number');
   mgr._onMessage({ type: 'sync-run-result', id: sent.id, ok: true, ran: true, result: 'abort-excessive-delete', resyncRequired: true, needsAttention: true, code: 2 });
-  assert.deepStrictEqual(await p, { ok: true, ran: true, result: 'abort-excessive-delete', reason: null, resyncRequired: true, needsAttention: true, code: 2, preserved: null, refused: null, error: null });
+  assert.deepStrictEqual(await p, { ok: true, ran: true, result: 'abort-excessive-delete', reason: null, resyncRequired: true, needsAttention: true, code: 2, preserved: null, refused: null });
+});
+
+test('sync-run-result and sync-status resolves carry a bounded reason, never a raw error string (leak-close)', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  let sent = null;
+  mgr.child = { postMessage: (m) => { sent = m; } };
+  // A run failure carries the bounded reason; any raw error a message might carry is dropped, never passed on.
+  const p1 = mgr.runSync({ vault: 'v', local: 'l', remotePath: 'p' }, 1000);
+  mgr._onMessage({ type: 'sync-run-result', id: sent.id, ok: false, reason: 'run-error', error: 'a raw message that could carry a host or path' });
+  const r1 = await p1;
+  assert.strictEqual(r1.reason, 'run-error');
+  assert.ok(!('error' in r1), 'the run resolve never carries an error field');
+  // The rclone health status is the same: a bounded reason only.
+  const p2 = mgr.syncStatus(1000);
+  mgr._onMessage({ type: 'sync-status', id: sent.id, ok: false, reason: 'rclone-unhealthy', error: 'a raw message that could carry a path' });
+  const r2 = await p2;
+  assert.strictEqual(r2.reason, 'rclone-unhealthy');
+  assert.ok(!('error' in r2), 'the status resolve never carries an error field');
 });
 
 test('runSync() surfaces a TYPED already-running refusal (never a failure or a completion)', async () => {

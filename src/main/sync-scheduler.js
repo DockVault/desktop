@@ -221,7 +221,7 @@ class SyncScheduler {
       // 'error', not 'done'. 'done' means the run ran; its typed result (which may still be a conflict or a
       // safety abort) is carried in `outcome` for the status model to classify.
       if (!outcome || outcome.ok === false) {
-        this._emit(vaultId, { phase: 'error', reason: (outcome && (outcome.error || outcome.result)) || 'run-failed', outcome: outcome || null });
+        this._emit(vaultId, { phase: 'error', reason: (outcome && (outcome.reason || outcome.error || outcome.result)) || 'run-failed', outcome: outcome || null });
       } else {
         this._emit(vaultId, { phase: 'done', outcome });
       }
