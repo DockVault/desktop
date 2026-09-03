@@ -76,6 +76,7 @@ let sessionBundle = null;
 let captureTimer = null;
 let restored = false; // the session is seeded once per run (on the first window); tray reopens keep it
 let daemon = null;    // the supervised background sync daemon (a forked utility child)
+let rcloneCfg = null; // the pinned rclone config { bin, version, sha256 }; `version` is the pin shown for a helper version-mismatch
 let lockState = null; // the single source of truth for lock state (main-owned)
 let autoLock = null;  // the automatic lock triggers (idle timer + OS suspend/screen-lock)
 let syncHub = null;   // the main-owned computed sync status (feeds the tray, notifications, channel)
@@ -205,7 +206,7 @@ async function boot() {
   // The background daemon owns the encrypted state store, so it starts only with a real secret store;
   // under a memory-only posture there is nothing durable for it and background sync is withheld.
   const secureStore = keyProtect.hasSecureStore(keyMode);
-  if (!SMOKE && secureStore) { daemon = new DaemonManager(app.getPath('userData'), resolveRcloneConfig()); daemon.start(); }
+  if (!SMOKE && secureStore) { rcloneCfg = resolveRcloneConfig(); daemon = new DaemonManager(app.getPath('userData'), rcloneCfg); daemon.start(); }
   // The main-owned computed sync status: the single source of truth the tray glance, the must-act
   // notifications, and the read-only status channel all render. It observes the supervised helper's
   // lifecycle and is fed lock/posture here; with no OS secret store it honestly reports sync as
@@ -419,7 +420,7 @@ function refreshTray() {
   try {
     if (!syncHub) { tray.setToolTip('DockVault'); tray.setContextMenu(buildTrayMenu([], null)); return; }
     const model = syncHub.current();
-    tray.setToolTip(trayPresentation.tooltip(model, effectiveLockPhase()));
+    tray.setToolTip(trayPresentation.tooltip(model, effectiveLockPhase(), rcloneCfg && rcloneCfg.version));
     tray.setContextMenu(buildTrayMenu(trayPresentation.mustActItems(model), model));
   } catch { /* tray gone */ }
 }
@@ -481,7 +482,24 @@ function handleMustAct(item) {
   // >50%-delete abort). It enqueues a manual repair run; the dispatch then asks the keep-both confirm
   // (confirmFirstUpload kind 'repair') before doing a zero-loss resync — nothing is auto-resynced.
   if (item && item.kind === 'repair' && item.vault) { if (syncScheduler) syncScheduler.requestRepair(item.vault); return; }
+  // The sync helper (rclone) isn't ready — there is NO in-app install flow (the binary + its pinned version and
+  // checksum come from the environment), so this action shows a real how-to dialog rather than a door to nowhere.
+  if (item && item.kind === 'setup-helper') { showHelperFixDialog(item); return; }
   void showOrCreateWindow();
+}
+
+// A native how-to dialog for an unready sync helper: the specific reason + the pinned version + the (non-secret)
+// config variable NAMES + "restart after fixing". Leak-safe — never a path, a value, or a SHA. The helper is
+// env-configured until packaging bundles it, so correcting those settings and relaunching is the fix.
+function showHelperFixDialog(item) {
+  const detail = trayPresentation.helperDetail(item && item.sub, item && item.installed, rcloneCfg && rcloneCfg.version);
+  try {
+    dialog.showMessageBox(mainWindow, {
+      type: 'warning', noLink: true, buttons: ['OK'], defaultId: 0,
+      message: "The sync helper isn't ready",
+      detail: `${detail}\n\nThe sync helper (rclone) is configured from these settings: DOCKVAULT_RCLONE (the binary), DOCKVAULT_RCLONE_VERSION, and DOCKVAULT_RCLONE_SHA256. Correct whichever is wrong or missing, then restart DockVault.`,
+    });
+  } catch { /* dialog unavailable; nothing else to offer */ }
 }
 
 // The make-private consent dialog, shared by setup and by run-time drift recovery. Its fail-safe default
@@ -598,6 +616,9 @@ function mustActBody(item) {
   // The unlock-and-reopen guidance already carries its own reassurance and next step — use it verbatim rather
   // than appending the generic "Your files are safe." (which it already states).
   if (item && item.kind === 'reopen') return (item && item.label) || 'DockVault could not read its saved sync state. Your files are safe.';
+  // The sync helper isn't ready: the notification body is the per-sub detail (with the app's pinned version for
+  // a version-mismatch). The menu label carries the "Set up the sync helper" fix; the body says what's wrong.
+  if (item && item.kind === 'setup-helper') return trayPresentation.helperDetail(item.sub, item.installed, rcloneCfg && rcloneCfg.version);
   const base = (item && item.label) || 'A sync item needs your attention';
   return `${base}. Your files are safe.`;
 }

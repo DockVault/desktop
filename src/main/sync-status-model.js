@@ -138,7 +138,7 @@ function vaultState(v) {
   // strictly more severe completed outcome (e.g. a prior sync problem) is not masked by it.
   const cond = v.condition && v.condition.state ? v.condition : null;
   const out = (cond && RANK[cond.state] >= RANK[base.state])
-    ? { vault: v.vault, state: cond.state, reason: cond.reason || null, running, resyncRequired }
+    ? { vault: v.vault, state: cond.state, reason: cond.reason || null, sub: cond.sub || null, installed: cond.installed || null, running, resyncRequired }
     : base;
   // progress rides along ONLY while the vault is actually syncing; any other state clears it so a stale
   // count never trails a finished or paused vault.
@@ -214,7 +214,7 @@ function computeStatus(s) {
   if (!s.crashLoopLatched && (s.daemon === 'starting' || s.daemon === 'crashed')) {
     contributors.push({ state: STATE.PAUSED, reason: 'reconnecting' });
   }
-  for (const v of vaults) contributors.push({ state: v.state, reason: v.reason, vault: v.vault, progress: v.progress || null });
+  for (const v of vaults) contributors.push({ state: v.state, reason: v.reason, vault: v.vault, progress: v.progress || null, sub: v.sub || null, installed: v.installed || null });
 
   // The aggregate is the highest-precedence contributor; ties keep the first seen (global before
   // per-vault only where ranks are equal, which does not change the surfaced severity).
@@ -226,6 +226,10 @@ function computeStatus(s) {
     state: winner.state,
     label: LABEL[winner.state],
     reason: winner.reason || null,
+    // The helper-not-ready DETAIL (the specific sub + the daemon-detected installed version) rides on the
+    // aggregate when the winner is a helper-not-ready vault, so the tray can compose the per-sub message.
+    sub: winner.sub || null,
+    installed: winner.installed || null,
     // The glance's transfer detail, present only when the winning contributor is a syncing vault.
     progress: (winner.state === STATE.SYNCING && winner.progress) ? winner.progress : null,
     vaults,

@@ -127,15 +127,26 @@ function onInit(m) {
 // Standard-vault sync health: verify the pinned rclone once (checksum + version) and report its
 // version. This is the daemon supervising rclone through a one-shot child — no listener, no key material.
 async function onSyncStatus(m) {
-  if (!rclone) { reply({ type: 'sync-status', id: m.id, ok: false, reason: 'rclone-unconfigured' }); return; }
+  if (!rclone) { reply({ type: 'sync-status', id: m.id, ok: false, sub: 'prepare-failed' }); return; }
   try {
+    // Per-dispatch TOCTOU re-check: re-hash the pinned binary (TTL-governed, no spawn). A same-path swap since
+    // the first ready() is caught HERE — it sticky-flips verified false and throws 'checksum-mismatch', so the
+    // gate reports not-ready and every spawn refuses until a fresh matching hash. Never green on a stale boolean.
+    rclone.recheck();
     if (!syncReady) syncReady = await rclone.ready();
     reply({ type: 'sync-status', id: m.id, ok: true, version: syncReady.version });
   } catch (err) {
-    // Never surface the raw readiness error — its message can carry the rclone binary path or checksum
-    // detail. Report a bounded reason; log the class only (leak-safe) for diagnosis.
-    try { console.error('[sync] rclone health check failed:', (err && err.name) || 'Error'); } catch { /* ignore */ }
-    reply({ type: 'sync-status', id: m.id, ok: false, reason: 'rclone-unhealthy' });
+    // If the TOCTOU rail flipped the runner unverified, DROP the cached readiness so the next call re-verifies
+    // and this reply reports the typed sub — never a stale cached version behind an unverified binary.
+    if (rclone && !rclone.isVerified()) syncReady = null;
+    // Carry the SAME bounded sub enum the cred path uses (the runner tags checksum/binary-missing/spawn/version/
+    // obscure; anything else is 'prepare-failed') plus the non-secret installed/pinned version strings — never
+    // the raw message, path, or SHA, and never an `error` field. The readiness gate's signal: main skips the mint.
+    const sub = (err && typeof err.subReason === 'string') ? err.subReason : 'prepare-failed';
+    const installed = err && err.installed != null ? String(err.installed) : null;
+    const pinned = err && err.pinned != null ? String(err.pinned) : null;
+    try { console.error('[sync] rclone health check failed sub=' + sub); } catch { /* ignore */ }
+    reply({ type: 'sync-status', id: m.id, ok: false, sub, installed, pinned });
   }
 }
 
@@ -145,7 +156,7 @@ async function onSyncStatus(m) {
 // reports readiness only — never the credential or the config.
 async function onSftpCred(m) {
   const b = (m && m.bundle) || {};
-  if (!rclone) { reply({ type: 'sftp-cred-ack', id: m.id, ok: false }); return; }
+  if (!rclone) { reply({ type: 'sftp-cred-ack', id: m.id, ok: false, sub: 'prepare-failed' }); return; }
   try {
     if (!syncReady) syncReady = await rclone.ready();
     const obscuredPass = await rclone.obscure(b.password);
@@ -156,10 +167,17 @@ async function onSftpCred(m) {
     reply({ type: 'sftp-cred-ack', id: m.id, ok: true });
   } catch (err) {
     sftpConfig = null;
-    // Never surface the raw error text to main: an rclone/obscure failure message can carry the host or a
-    // path. The ack reports failure only; the caller derives an honest reason. When the helper later carries a
-    // typed `sub` enum, the surfaced reason enriches with no change here — the raw string never leaves the helper.
-    reply({ type: 'sftp-cred-ack', id: m.id, ok: false });
+    if (rclone && !rclone.isVerified()) syncReady = null; // rail flipped unverified — drop the stale cache
+    // Categorize WHY the helper could not prepare a credential into ONE bounded, leak-safe sub-reason. The runner
+    // tags its errors (checksum-mismatch / binary-missing / spawn-failed / version-mismatch / obscure-failed); a
+    // malformed config is named here as the FIXED enum value (the message is only TESTED, never surfaced);
+    // anything else is the generic 'prepare-failed'. The ack carries the enum + the non-secret installed/pinned
+    // strings ONLY — never the raw message, path, or SHA (that would reopen the raw-error leak).
+    const sub = (err && typeof err.subReason === 'string') ? err.subReason
+      : (/invalid sftp config value|invalid remote name/i.test(String((err && err.message) || '')) ? 'config-format-failed' : 'prepare-failed');
+    const installed = err && err.installed != null ? String(err.installed) : null;
+    const pinned = err && err.pinned != null ? String(err.pinned) : null;
+    reply({ type: 'sftp-cred-ack', id: m.id, ok: false, sub, installed, pinned });
   }
 }
 
@@ -241,6 +259,9 @@ async function onSyncRun(m) {
       }));
     reply({ type: 'sync-run-result', id: m.id, ok: true, ran: r.ran, result: r.result, reason: r.reason, resyncRequired: r.resyncRequired, needsAttention: r.needsAttention, code: r.code, preserved: r.preserved });
   } catch (err) {
+    // If a per-spawn re-hash flipped the rail unverified mid-run (a binary swap), drop the cached readiness so
+    // the NEXT dispatch's gate re-verifies and refuses with the typed helper-not-ready(checksum-mismatch).
+    if (rclone && !rclone.isVerified()) syncReady = null;
     // Never surface the raw run error — an rclone/engine exception message can carry a path. A bounded reason
     // stands in; the class only is logged (leak-safe) for diagnosis.
     try { console.error('[sync] run error:', (err && err.name) || 'Error'); } catch { /* ignore */ }

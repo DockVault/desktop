@@ -122,6 +122,11 @@ function makeSchedulerIo(deps) {
     secureFolder: deps.secureFolder,
     classify: deps.classify,
     refreshCred: (vaultId) => deps.credCache.ensureSent(vaultId),
+    // gate-before-mint readiness check: the helper's health (rclone checksum + version), side-effect-free (no
+    // mint, no SFTP) and cheap (cached on a healthy helper — one `rclone version` spawn only while not ready).
+    // A not-ready result carries the typed sub in the same {ok:false,sub,installed,pinned} no-error shape, so
+    // the dispatch surfaces helper-not-ready and SKIPS the mint rather than burn a single-use credential.
+    helperReady: () => deps.daemon.syncStatus(),
     confirmFirstUpload: deps.confirmFirstUpload,
     runSync: fx.runSync,
     runResync: fx.runResync,
@@ -172,7 +177,14 @@ function applySchedulerEvent(hub, vaultId, ev) {
     case 'skipped':
     case 'paused': {
       const cond = conditionForReason(phase, reason);
-      if (cond) hub.recordCondition(vaultId, cond);
+      if (cond) {
+        // Carry the helper-not-ready DETAIL (the specific sub + the daemon-detected installed version) onto the
+        // condition for the tray's per-sub message. The sub NEVER affects the state — that is fixed to the
+        // single non-retrying 'helper-not-ready' reason at conditionForReason, so an unknown sub cannot escape.
+        if (ev.sub != null) cond.sub = ev.sub;
+        if (ev.installed != null) cond.installed = ev.installed;
+        hub.recordCondition(vaultId, cond);
+      }
       // A transient skip must NOT erase a persistent condition — only an actual run (setRunning true) or a
       // completed run (recordOutcome) clears it. Otherwise one lock/unlock or uncertain tick would flip a
       // stuck vault back to its stale last state. So just stop showing running and keep whatever holds.
@@ -205,6 +217,10 @@ function conditionForReason(phase, reason) {
     // NOT in RETRYABLE_FAILURE_REASONS, so it surfaces once and stays put rather than looping.
     case 'needs-unlock':     return { state: STATE.NEEDS_DECISION, reason: 'needs-unlock' };
     case 'host-key-unavailable': return { state: STATE.PAUSED, reason: 'cannot-verify-yet' }; // older/unverifiable server — calm, not an alarm
+    // The sync helper (rclone) is not ready — a wrong version, a failed checksum, or it could not start/prepare.
+    // ONE non-retrying must-act, decided at the gate; the specific sub rides as a DETAIL, never as the reason,
+    // so an unknown/new sub can never fall through to the calm 'retrying' default. NOT in RETRYABLE below.
+    case 'helper-not-ready': return { state: STATE.SYNC_PROBLEM, reason: 'helper-not-ready' };
     case 'consent-declined': return { state: STATE.WAITING, reason: 'consent-needed' }; // a user choice: re-offerable, never a notification
     case 'waiting-to-reconnect':
     case 'paused-locked':

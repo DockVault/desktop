@@ -52,6 +52,18 @@ test('ensureSent classifies a mint code-fault as a non-retryable internal-error,
   assert.deepStrictEqual(await transport.ensureSent('v1'), { ok: false, reason: 'mint-failed' });
 });
 
+test('ensureSent maps a typed helper sub to the single non-retrying helper-not-ready (carrying sub + installed); a plain failure to cred-send-failed', async () => {
+  const bundle = () => [{ user: 'u', password: 'p', hostKeys: 'PIN1', expiresAt: FRESH }];
+  const mk = (sub, installed) => new CredCache({ mint: mintSeq(bundle()).mint, send: async () => ({ ok: false, sub, installed }), now: () => NOW });
+  // A typed helper readiness/prepare failure: the ack's sub + the daemon-detected installed version.
+  assert.deepStrictEqual(await mk('version-mismatch', '1.60.0').ensureSent('v1'), { ok: false, reason: 'helper-not-ready', sub: 'version-mismatch', installed: '1.60.0' });
+  // An UNKNOWN sub still maps to helper-not-ready (fail-safe) — never a calm reason.
+  assert.deepStrictEqual(await mk('a-new-sub', null).ensureSent('v1'), { ok: false, reason: 'helper-not-ready', sub: 'a-new-sub', installed: null });
+  // A plain send failure (NO sub) stays the genuine transient cred-send-failed.
+  const plain = new CredCache({ mint: mintSeq(bundle()).mint, send: async () => ({ ok: false }), now: () => NOW });
+  assert.deepStrictEqual(await plain.ensureSent('v1'), { ok: false, reason: 'cred-send-failed' });
+});
+
 // The consequence-2 regression: the server BURNS a temp credential on first use, so a second dispatch must
 // present a FRESH credential — never re-send the spent one. (The reverse — re-send-until-near-expiry — made
 // the second routine tick fail 'auth-failed' with a latched false "sign in" on a healthy server.)

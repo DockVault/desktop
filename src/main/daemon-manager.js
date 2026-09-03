@@ -104,15 +104,14 @@ class DaemonManager {
       }
       case 'sync-status': {
         const e = this._statusPending.get(m.id);
-        if (e) { this._statusPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, version: m.version || null, reason: m.reason || null }); }
+        if (e) { this._statusPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, version: m.version || null, sub: m.sub || null, installed: m.installed || null, pinned: m.pinned || null }); }
         break;
       }
       case 'sftp-cred-ack': {
         const e = this._credPending.get(m.id);
-        // Carry a typed reason enum (`sub`) only — never a free-text error. The helper stopped echoing raw
-        // failure strings (which could carry a host or path); `sub` stays null until the helper carries a typed
-        // reason enum, at which point the surfaced reason enriches with no change here.
-        if (e) { this._credPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, sub: m.sub || null }); }
+        // Carry the typed reason enum (`sub`) plus the non-secret version strings (installed/pinned, for the
+        // "update the sync helper X→Y" remedy) — NEVER a free-text error (which could carry a host or path).
+        if (e) { this._credPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, sub: m.sub || null, installed: m.installed || null, pinned: m.pinned || null }); }
         break;
       }
       case 'sync-run-result': {

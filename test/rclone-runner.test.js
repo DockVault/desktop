@@ -52,9 +52,12 @@ test('run() BEFORE ready() fails closed — the checksum gate cannot be bypassed
   await assert.rejects(() => r.run(['version']), /not verified; call ready\(\) first/);
 });
 
-test('the spawn chokepoint refuses to run before the binary checksum is verified', async () => {
-  const r = makeRunner('', 0);
-  await assert.rejects(() => r.version(), /binary not verified/); // version() uses the chokepoint directly
+test('the spawn chokepoint re-verifies the pinned binary AT spawn time and refuses a mismatch (checksum gate cannot be bypassed)', async () => {
+  const bytes = Buffer.from('rclone-binary-bytes');
+  const r = new RcloneRunner({ rcloneBin: '/pinned/rclone', expectSha256: 'deadbeef', readFileFn: () => bytes, spawnFn: () => fakeChild('', 0) });
+  // version() goes through the single spawn chokepoint, which re-hashes the pinned binary FIRST — a mismatch is
+  // refused with the typed checksum-mismatch and never spawned, even without a prior ready() (per-spawn gate).
+  await assert.rejects(() => r.version(), (e) => e && e.subReason === 'checksum-mismatch' && /checksum mismatch/.test(e.message));
 });
 
 test('run() REFUSES --force (exact and --force= form) so a local wipe cannot override rclone safety aborts', async () => {
@@ -148,4 +151,99 @@ test('ready() fails closed on a version mismatch, and on success enables run()',
   assert.strictEqual(v.version, '1.75.0');
   assert.strictEqual(okr._verified, true, 'ready() success enables run()');
   await okr.run(['version']); // now permitted
+});
+
+// ---- TOCTOU pin rail: per-spawn re-hash with a 60s matching-hash TTL, atomic hash-then-spawn, sticky fail-closed ----
+function toctouRunner({ ttl = 60000 } = {}) {
+  const GOOD = Buffer.from('good-rclone-binary');
+  const good = crypto.createHash('sha256').update(GOOD).digest('hex');
+  const state = { bytes: GOOD, now: 0, reads: 0, spawns: 0 };
+  const r = new RcloneRunner({
+    rcloneBin: '/pinned/rclone', expectSha256: good,
+    readFileFn: () => { state.reads += 1; if (state.bytes == null) { const e = new Error('ENOENT: no such file'); e.code = 'ENOENT'; throw e; } return state.bytes; },
+    spawnFn: () => { state.spawns += 1; return fakeChild('rclone v1.0.0\n', 0); },
+    now: () => state.now, hashTtlMs: ttl,
+  });
+  return { r, state, GOOD };
+}
+
+test('TOCTOU: a same-path binary swap between spawns is caught on the next spawn (TTL=0) — refuse + sticky verified=false', async () => {
+  const { r, state } = toctouRunner({ ttl: 0 });
+  await r.version();                 // hashes the good binary, verifies, spawns
+  assert.strictEqual(r.isVerified(), true);
+  state.bytes = Buffer.from('SWAPPED-rclone'); // same path, different bytes
+  await assert.rejects(() => r.version(), (e) => e && e.subReason === 'checksum-mismatch');
+  assert.strictEqual(r.isVerified(), false, 'sticky fail-closed: verified flipped false — every later spawn refuses');
+});
+
+test('TOCTOU: restoring the pinned binary recovers — the next spawn re-hashes and proceeds', async () => {
+  const { r, state, GOOD } = toctouRunner({ ttl: 0 });
+  await r.version();
+  state.bytes = Buffer.from('SWAPPED');
+  await assert.rejects(() => r.version(), (e) => e && e.subReason === 'checksum-mismatch');
+  assert.strictEqual(r.isVerified(), false);
+  state.bytes = GOOD;               // restored
+  await r.version();                // re-hashes -> matches -> recovers
+  assert.strictEqual(r.isVerified(), true, 'a fresh MATCHING hash recovers verified');
+});
+
+test('TOCTOU: an unreadable binary at re-check refuses (never spawns) — checksum-mismatch, verified=false', async () => {
+  const { r, state } = toctouRunner({ ttl: 0 });
+  await r.version();
+  const spawnsBefore = state.spawns;
+  state.bytes = null;               // readFileFn throws ENOENT (unreadable at re-check)
+  await assert.rejects(() => r.version(), (e) => e && e.subReason === 'checksum-mismatch');
+  assert.strictEqual(r.isVerified(), false);
+  assert.strictEqual(state.spawns, spawnsBefore, 'no spawn on an unreadable re-check');
+});
+
+test('TOCTOU: within the TTL, a 2nd spawn does NOT re-hash (uses the cached matching hash)', async () => {
+  const { r, state } = toctouRunner({ ttl: 60000 });
+  state.now = 1000;
+  await r.version();
+  const readsAfterFirst = state.reads;
+  state.now = 1000 + 30000;         // 30s later, within the 60s TTL
+  await r.version();
+  assert.strictEqual(state.reads, readsAfterFirst, 'no 2nd hash within the TTL window');
+});
+
+test('TOCTOU: the re-hash is TTL-driven, never metadata-gated — an expired TTL re-hashes even with byte-identical (unchanged size/mtime) contents', async () => {
+  const { r, state } = toctouRunner({ ttl: 60000 });
+  state.now = 0;
+  await r.version();
+  const readsAfterFirst = state.reads;
+  state.now = 61000;                // TTL expired; the bytes (hence any size/mtime) are unchanged
+  await r.version();
+  assert.strictEqual(state.reads, readsAfterFirst + 1, 'a re-hash happens on TTL expiry regardless of unchanged metadata (no stat can skip a hash)');
+});
+
+test('spawn errors are typed by e.code: ENOENT -> binary-missing (never an AV accusation), any other code -> spawn-failed', async () => {
+  const bytes = Buffer.from('good');
+  const good = crypto.createHash('sha256').update(bytes).digest('hex');
+  const mk = (spawnErr) => new RcloneRunner({ rcloneBin: '/x', expectSha256: good, readFileFn: () => bytes, spawnFn: () => { throw spawnErr; } });
+  await assert.rejects(() => mk(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' })).version(), (e) => e && e.subReason === 'binary-missing');
+  await assert.rejects(() => mk(Object.assign(new Error('spawn EACCES'), { code: 'EACCES' })).version(), (e) => e && e.subReason === 'spawn-failed');
+  // A win32 UNKNOWN errno (a SmartScreen/AV block) is NOT ENOENT -> spawn-failed (the AV-detail copy), never prepare-failed.
+  await assert.rejects(() => mk(Object.assign(new Error('spawn UNKNOWN'), { code: 'UNKNOWN', errno: -4094 })).version(), (e) => e && e.subReason === 'spawn-failed');
+});
+
+test('a version mismatch is typed version-mismatch and carries the daemon-detected installed + the pinned versions', async () => {
+  const bytes = Buffer.from('vbytes');
+  const sha = crypto.createHash('sha256').update(bytes).digest('hex');
+  const r = new RcloneRunner({ rcloneBin: '/pinned/rclone', expectVersion: '1.75.0', expectSha256: sha, readFileFn: () => bytes, spawnFn: () => fakeChild('rclone v1.70.0\n', 0) });
+  await assert.rejects(() => r.ready(), (e) => e && e.subReason === 'version-mismatch' && e.installed === '1.70.0' && e.pinned === '1.75.0');
+});
+
+// When a version is pinned, ready() owns _verified — a version mismatch flips it false. A later per-spawn SHA
+// re-hash (which matches, the bytes are the pinned ones) must NOT quietly re-mark the runner verified: the
+// binary is authentic but the WRONG version, so it stays refused until ready() re-confirms the version. Guards
+// verifyBinary's `if (!this.expectVersion) this._verified = true` — without that guard a re-hash flips it back.
+test('a version mismatch is not re-cleared by a later matching SHA re-hash — verified stays false while a version is pinned', async () => {
+  const bytes = Buffer.from('vbytes');
+  const sha = crypto.createHash('sha256').update(bytes).digest('hex');
+  const r = new RcloneRunner({ rcloneBin: '/pinned/rclone', expectVersion: '1.75.0', expectSha256: sha, hashTtlMs: 0, readFileFn: () => bytes, spawnFn: () => fakeChild('rclone v1.70.0\n', 0) });
+  await assert.rejects(() => r.ready(), (e) => e && e.subReason === 'version-mismatch');
+  assert.strictEqual(r.isVerified(), false, 'the version mismatch flipped verified false');
+  r.recheck(); // a fresh SHA re-hash with TTL=0 — the bytes match the pin, so verifyBinary succeeds...
+  assert.strictEqual(r.isVerified(), false, '...but a matching SHA must not silently re-verify a version-mismatched runner');
 });

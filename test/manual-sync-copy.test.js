@@ -52,6 +52,21 @@ test('manual completion: a host-key mismatch renders the identity alert, never t
   }
 });
 
+// An unready sync helper is a NON-retrying must-act, so a manual "Sync now" press that hits it must say so —
+// NEVER the calm "try again in a moment" that would tell a different story than the tray. Both the gate-refused
+// and cred-paused paths carry reason 'helper-not-ready'; the toast points at the tray's how-to-fix affordance.
+test('manual completion: an unready helper is a must-act (points at the fix), never the calm retry line', () => {
+  for (const ev of [
+    { phase: 'refused', reason: 'helper-not-ready', sub: 'version-mismatch' },
+    { phase: 'paused', reason: 'helper-not-ready', sub: 'binary-missing' },
+  ]) {
+    const msg = manualCompletionBody(ev, NAME);
+    assert.match(msg.body, /sync helper isn't ready/i, `${JSON.stringify(ev)} -> ${msg.body}`);
+    assert.match(msg.body, /how to fix it/i, `points at the fix: ${msg.body}`);
+    assert.doesNotMatch(msg.body, /try again in a moment/i, `never the false transient-retry line: ${msg.body}`);
+  }
+});
+
 // The defect this replaces: a fingerprint-only / unverifiable server is REACHABLE, so a cannot-verify pause
 // must NOT borrow the offline "can't reach the server" line. It reads as a verification pause, and promises no
 // specific remedy (the state also covers an absent endpoint or a failed fetch, not only a too-old server).

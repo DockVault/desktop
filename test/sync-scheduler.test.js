@@ -18,6 +18,7 @@ function harness(over = {}) {
     secureFolder: over.secureFolder || ((f) => { calls.secureFolder.push(f); return { ok: true }; }),
     classify: over.classify || ((f) => { calls.classify.push(f); return { ok: true }; }),
     refreshCred: over.refreshCred || (async (v) => { calls.refreshCred.push(v); return { ok: true }; }),
+    helperReady: over.helperReady, // undefined by default -> gate treats the helper as ready (other tests unaffected)
     confirmFirstUpload: over.confirmFirstUpload,
     vaultHasPassword: over.vaultHasPassword, // undefined by default -> remap inactive (existing sign-in behaviour)
     runSync: over.runSync || (async (spec) => { calls.runSync.push(spec.vaultId); return { result: 'ok', ran: true }; }),
@@ -37,6 +38,26 @@ test('normal completed vault -> runSync (not runResync), remote re-derived at ru
   assert.deepStrictEqual(calls.runResync, []);
   assert.strictEqual(calls.verifyEligible.length, 1, 'the run-time re-assert ran');
   assert.ok(phases(log, 'a').includes('running') && phases(log, 'a').includes('done'));
+});
+
+test('gate-before-mint: a NOT-READY helper (even an unknown sub) refuses with helper-not-ready and SKIPS the mint', async () => {
+  const { sch, calls, log } = harness({ helperReady: async () => ({ ok: false, sub: 'some-brand-new-sub', installed: '1.60.0' }) });
+  sch.requestSync('a');
+  await settle(sch);
+  const ev = log.find((e) => e.vaultId === 'a' && e.phase === 'refused');
+  assert.ok(ev, 'refused at the gate');
+  assert.strictEqual(ev.reason, 'helper-not-ready', 'reason fixed to helper-not-ready even for an unknown sub (never retrying)');
+  assert.strictEqual(ev.sub, 'some-brand-new-sub', 'the sub rides as a detail');
+  assert.deepStrictEqual(calls.refreshCred, [], 'the mint is SKIPPED — a not-ready helper never burns a single-use credential');
+  assert.deepStrictEqual(calls.runSync, [], 'and no run');
+});
+
+test('gate-before-mint: a READY helper proceeds to mint + run', async () => {
+  const { sch, calls } = harness({ helperReady: async () => ({ ok: true }) });
+  sch.requestSync('a');
+  await settle(sch);
+  assert.deepStrictEqual(calls.refreshCred, ['a'], 'a ready helper mints');
+  assert.deepStrictEqual(calls.runSync, ['a']);
 });
 
 test('never-run vault -> INITIAL resync via runResync (never a plain runSync)', async () => {

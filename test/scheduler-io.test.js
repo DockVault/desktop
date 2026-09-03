@@ -122,6 +122,18 @@ test('applySchedulerEvent: a code fault (internal-error / provider-error) is a d
   assert.strictEqual(vaultOf(hub).reason, 'sync-error');
 });
 
+test('applySchedulerEvent: helper-not-ready is a non-retrying sync problem even for an UNKNOWN sub, carrying the sub detail', () => {
+  const hub = hubWithVault();
+  // The gate sets reason='helper-not-ready' unconditionally; an unknown/new sub must NOT fall through to the
+  // calm paused/retrying default — it stays a fail-closed SYNC_PROBLEM, the sub carried ONLY as a detail.
+  applySchedulerEvent(hub, 'v1', { phase: 'refused', reason: 'helper-not-ready', sub: 'some-brand-new-sub', installed: '1.60.0' });
+  const v = vaultOf(hub);
+  assert.strictEqual(v.state, STATE.SYNC_PROBLEM, 'never the calm paused/retrying — fail-closed at the condition edge');
+  assert.strictEqual(v.reason, 'helper-not-ready');
+  assert.strictEqual(v.sub, 'some-brand-new-sub', 'the sub rides as a detail, never as the state-deciding reason');
+  assert.strictEqual(v.installed, '1.60.0');
+});
+
 test('applySchedulerEvent: blocked marks the resync-owed latch (needs a decision), does no work', () => {
   const hub = hubWithVault();
   applySchedulerEvent(hub, 'v1', { phase: 'blocked', reason: 'needs-repair' });
@@ -385,6 +397,20 @@ test('makeSchedulerIo assembles the io: run-state from the snapshot, resync rout
   assert.deepStrictEqual(calls.ensureSent, ['v1'], 'refreshCred -> the credential cache');
   await io.runResync({ vaultId: 'v1', local: '/l', remotePath: 'V1' });
   assert.strictEqual(calls.runSync[0].resync, true, 'runResync routes to the resync call');
+});
+
+// The scheduler gates BEFORE minting a credential: it asks io.helperReady() and refuses the run if the helper
+// isn't ready, so no temp credential is ever produced for a run that can't happen. That guard is `typeof
+// io.helperReady === 'function' ? await io.helperReady() : {ok:true}` — so a missing helperReady silently fails
+// OPEN (mints anyway). It must be exposed on the io and must forward to the daemon's own readiness report.
+test('makeSchedulerIo exposes helperReady, forwarding to the daemon readiness report (the gate-before-mint io contract)', async () => {
+  let asked = 0;
+  const daemon = { runSync: async () => ({ ok: true }), syncStatus: async () => { asked += 1; return { ok: false, sub: 'checksum-mismatch', installed: null }; } };
+  const io = makeSchedulerIo({ snapshot: { get: () => null, fresh: () => true }, credCache: {}, daemon, isAccountUsable: () => true, hasAccount: () => true, isOnline: () => true });
+  assert.strictEqual(typeof io.helperReady, 'function', 'helperReady is exposed on the io — else the gate fails open and mints anyway');
+  const r = await io.helperReady();
+  assert.strictEqual(asked, 1, 'helperReady forwards to daemon.syncStatus');
+  assert.deepStrictEqual(r, { ok: false, sub: 'checksum-mismatch', installed: null }, 'the daemon readiness verdict passes through untouched');
 });
 
 test('makeSchedulerIo: session reports uncertain when the snapshot is not fresh (fail-closed carried through)', () => {

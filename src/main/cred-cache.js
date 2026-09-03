@@ -70,7 +70,7 @@ class CredCache {
    * helper for exactly ONE rclone authentication. Never caches or re-sends: a temp credential is spent on its
    * first use. Fail-closed — any mint/pin/send failure returns { ok:false, reason } and leaves no credential in
    * play; the plaintext password is dropped once the helper holds it.
-   * @returns {Promise<{ok:true}|{ok:false,reason:string}>}
+   * @returns {Promise<{ok:true}|{ok:false,reason:string,sub?:string,installed?:(string|null)}>}
    */
   async ensureSent(vaultId) {
     let access;
@@ -85,10 +85,16 @@ class CredCache {
     catch (e) { this._zeroize(bundle); this._zeroize(access); return { ok: false, reason: (e && e.reason) || 'cred-send-failed' }; }
     // The helper now holds the obscured cred for its single run; drop our plaintext references.
     this._zeroize(bundle); this._zeroize(access);
-    // Surface only the helper's TYPED reason enum (`sub`), never a raw error string it might carry — an
-    // rclone/obscure failure message can hold the host or a path. A missing/untyped failure collapses to the
-    // known 'cred-send-failed', which counts toward not-syncing (escalates) rather than retrying forever.
-    if (!ack || !ack.ok) return { ok: false, reason: (ack && ack.sub) || 'cred-send-failed' };
+    // ANY typed helper sub (a readiness/prepare failure the daemon categorized) becomes the SINGLE
+    // non-retrying 'helper-not-ready' reason — a structural fail-safe so an unknown/new sub can never fall
+    // through to a calm retry. The specific sub rides separately (it drives ONLY the tray's per-sub detail),
+    // with the non-secret installed version from the ACK (the daemon's ground-truth detection; main holds only
+    // the pin). A failure with NO sub is a genuine transient send failure → the retryable 'cred-send-failed'.
+    // Never a raw error string (an rclone/obscure message can hold the host or a path).
+    if (!ack || !ack.ok) {
+      if (ack && ack.sub) return { ok: false, reason: 'helper-not-ready', sub: ack.sub, installed: ack.installed || null };
+      return { ok: false, reason: 'cred-send-failed' };
+    }
     return { ok: true };
   }
 

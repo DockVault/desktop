@@ -44,6 +44,11 @@ function bodyForConditionReason(reason, name) {
     case 'vault-unavailable': return `${name} can't be synced any more. Open DockVault for details.`;
     case 'conflict-keep-both': return `${name} has conflicting copies — open DockVault to review them.`;
     case 'not-syncing': return `${name} hasn't synced for a while. Open DockVault to check your connection.`;
+    case 'helper-not-ready':
+      // The sync helper (rclone) isn't ready — a NON-retrying must-act (a wrong/missing/blocked binary, or one
+      // that won't start), so NEVER the calm "try again in a moment" that would tell a different story than the
+      // tray. Points at the same how-to the tray offers; the per-sub specifics live on the glance/dialog.
+      return `${name} can't sync — the sync helper isn't ready. Open DockVault to see how to fix it.`;
     case 'error': return `${name} couldn't sync. Open DockVault to see why.`;
     case 'retrying':
     default: return `${name} couldn't sync just now. Try again in a moment.`;

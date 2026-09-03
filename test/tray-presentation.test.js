@@ -40,6 +40,49 @@ test("a code-fault sync problem reads as a calm, honest 'sync step hit a problem
   assert.match(tooltip(m, 'unlocked'), /a sync step hit a problem/);
 });
 
+const PINNED = '1.75.0';
+const helperVault = (sub, installed) => vault({ lastResult: 'ok', condition: { state: STATE.SYNC_PROBLEM, reason: 'helper-not-ready', sub, installed } });
+
+test('helper-not-ready renders the honest label + correct per-sub detail for all 7 subs AND an unknown/null — non-retrying, with the how-to-fix affordance', () => {
+  const cases = [
+    ['version-mismatch', '1.60.0', /is version 1\.60\.0, but this app needs 1\.75\.0/],
+    ['checksum-mismatch', null, /failed a safety check/],
+    ['binary-missing', null, /file is missing/],
+    ['spawn-failed', null, /blocked from starting/],
+    ['obscure-failed', null, /couldn't be set up/], // a started-then-failed obscure: the neutral lane, never an AV accusation
+    ['config-format-failed', null, /couldn't be set up/],
+    ['prepare-failed', null, /couldn't be set up/],
+    ['some-unknown-future-sub', null, /couldn't be set up/], // honest fallthrough — never blank, never a wrong lane
+    [null, null, /couldn't be set up/],
+  ];
+  for (const [sub, installed, re] of cases) {
+    const m = computeStatus({ ...secure, vaults: [helperVault(sub, installed)] });
+    assert.strictEqual(m.state, STATE.SYNC_PROBLEM, `${sub}: a non-retrying sync problem`);
+    assert.strictEqual(m.reason, 'helper-not-ready', `${sub}: the single helper-not-ready reason`);
+    const tip = tooltip(m, 'unlocked', PINNED);
+    assert.match(tip, /The sync helper isn't ready/, `${sub}: the honest helper label, not the generic Sync problem`);
+    assert.match(tip, re, `${sub}: the correct per-sub detail`);
+    assert.ok(mustActItems(m).some((it) => it.kind === 'setup-helper' && it.label === 'How to fix the sync helper'), `${sub}: the how-to-fix affordance is reachable`);
+  }
+});
+
+test('a helper that RAN is never blamed on antivirus (missing + obscure-failed); only a genuine start-block points at SmartScreen/AV', () => {
+  const missing = tooltip(computeStatus({ ...secure, vaults: [helperVault('binary-missing', null)] }), 'unlocked', PINNED);
+  assert.match(missing, /file is missing/);
+  assert.doesNotMatch(missing, /SmartScreen|antivirus/, 'a MISSING helper is never a blocked-by-AV accusation');
+  // obscure-failed is a started-then-failed obscure — it too must never read as an antivirus block.
+  const obscure = tooltip(computeStatus({ ...secure, vaults: [helperVault('obscure-failed', null)] }), 'unlocked', PINNED);
+  assert.match(obscure, /couldn't be set up/);
+  assert.doesNotMatch(obscure, /SmartScreen|antivirus/, 'a helper that RAN is never a blocked-by-AV accusation');
+  // Only a genuine START block (spawn-failed) points at SmartScreen/AV.
+  assert.match(tooltip(computeStatus({ ...secure, vaults: [helperVault('spawn-failed', null)] }), 'unlocked', PINNED), /SmartScreen/);
+});
+
+test('helper-not-ready is ONE app-scoped must-act even across multiple vaults (never duplicated per vault)', () => {
+  const m = computeStatus({ ...secure, vaults: [helperVault('checksum-mismatch', null), vault({ vault: 'w', lastResult: 'ok', condition: { state: STATE.SYNC_PROBLEM, reason: 'helper-not-ready', sub: 'checksum-mismatch' } })] });
+  assert.strictEqual(mustActItems(m).filter((it) => it.kind === 'setup-helper').length, 1, 'one app-scoped fix, never one per vault');
+});
+
 test('state-unreadable surfaces the unlock-and-reopen guidance as a must-act item, no dead reset reference', () => {
   const m = computeStatus({ hasSecureStore: true, daemon: 'init-failed', vaults: [vault({ lastResult: 'ok' })] });
   const it = mustActItems(m).find((x) => x.kind === 'reopen');

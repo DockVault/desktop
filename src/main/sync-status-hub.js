@@ -146,9 +146,11 @@ class SyncStatusHub {
    * cause), so it stops reading as its stale last state. Distinct from a completed outcome — it leaves
    * lastResult/resyncRequired untouched and is cleared once the vault actually runs or completes.
    */
-  recordCondition(vault, { state, reason } = {}) {
+  recordCondition(vault, { state, reason, sub, installed } = {}) {
     const e = this._vaults.get(vault); if (!e || !state) return;
-    e.condition = { state, reason: reason || null };
+    // `sub`/`installed` are the helper-not-ready DETAIL (a bounded enum + a non-secret version string) — carried
+    // for the tray's per-sub message only; they never affect the state, which the reason alone decides.
+    e.condition = { state, reason: reason || null, sub: sub || null, installed: installed || null };
     e.running = false;
     e.transferring = false; // a vault that cannot run is not transferring
     e.progress = null;

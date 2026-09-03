@@ -63,9 +63,10 @@ test('sync-run-result and sync-status resolves carry a bounded reason, never a r
   assert.ok(!('error' in r1), 'the run resolve never carries an error field');
   // The rclone health status is the same: a bounded reason only.
   const p2 = mgr.syncStatus(1000);
-  mgr._onMessage({ type: 'sync-status', id: sent.id, ok: false, reason: 'rclone-unhealthy', error: 'a raw message that could carry a path' });
+  mgr._onMessage({ type: 'sync-status', id: sent.id, ok: false, sub: 'checksum-mismatch', installed: null, pinned: '1.65.2', error: 'a raw message that could carry a path' });
   const r2 = await p2;
-  assert.strictEqual(r2.reason, 'rclone-unhealthy');
+  assert.strictEqual(r2.sub, 'checksum-mismatch');
+  assert.strictEqual(r2.pinned, '1.65.2');
   assert.ok(!('error' in r2), 'the status resolve never carries an error field');
 });
 
@@ -219,7 +220,7 @@ test('clearSftpCred() sends sftp-cred-clear and resolves ok on the ack; ok (vacu
   assert.strictEqual(sent.type, 'sftp-cred-clear');
   assert.ok(typeof sent.id === 'number');
   mgr._onMessage({ type: 'sftp-cred-ack', id: sent.id, ok: true });
-  assert.deepStrictEqual(await p, { ok: true, sub: null });
+  assert.deepStrictEqual(await p, { ok: true, sub: null, installed: null, pinned: null });
   mgr.child = null;
   assert.deepStrictEqual(await mgr.clearSftpCred(20), { ok: true }, 'no daemon holds no credential — nothing to clear');
 });
@@ -233,12 +234,12 @@ test('sftp-cred-ack carries only the typed `sub` enum, never a raw error string 
   const p1 = mgr.sendSftpCred({ vault: 'v1', host: 'h', port: 22, user: 'u', password: 'p', hostKeys: ['k'] }, 1000);
   mgr._onMessage({ type: 'sftp-cred-ack', id: sent.id, ok: false, error: 'raw failure text that could carry a host or path' });
   const r1 = await p1;
-  assert.deepStrictEqual(r1, { ok: false, sub: null }, 'a raw error on the ack is dropped, not surfaced');
+  assert.deepStrictEqual(r1, { ok: false, sub: null, installed: null, pinned: null }, 'a raw error on the ack is dropped, not surfaced');
   assert.ok(!('error' in r1), 'the resolved ack never carries an error field');
-  // Forward-compat: when the helper later carries a typed reason, `sub` passes through unchanged.
+  // The typed sub + the non-secret version strings pass through; a raw error never does.
   const p2 = mgr.sendSftpCred({ vault: 'v1', host: 'h', port: 22, user: 'u', password: 'p', hostKeys: ['k'] }, 1000);
-  mgr._onMessage({ type: 'sftp-cred-ack', id: sent.id, ok: false, sub: 'helper-version-mismatch' });
-  assert.deepStrictEqual(await p2, { ok: false, sub: 'helper-version-mismatch' });
+  mgr._onMessage({ type: 'sftp-cred-ack', id: sent.id, ok: false, sub: 'version-mismatch', installed: '1.60.0', pinned: '1.65.2', error: 'raw text with a /path that must not pass' });
+  assert.deepStrictEqual(await p2, { ok: false, sub: 'version-mismatch', installed: '1.60.0', pinned: '1.65.2' });
 });
 
 test('runStates() round-trips the per-vault snapshot; null for a never-run vault', async () => {

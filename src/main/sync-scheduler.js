@@ -157,9 +157,18 @@ class SyncScheduler {
       const cl = io.classify(cfg.localFolder);
       if (!cl || !cl.ok) { this._emit(vaultId, { phase: 'refused', reason: (cl && cl.reason) || 'folder-rejected' }); return; }
 
-      // Refresh + re-send the credential before dispatch; a refresh failure fails closed.
+      // gate-before-mint: verify the sync helper is READY before minting a single-use credential. A not-ready
+      // helper (wrong version, failed checksum, can't start/prepare) surfaces as the single non-retrying
+      // 'helper-not-ready' — the reason is set HERE, unconditionally, for EVERY not-ready result (any sub, or
+      // none), so an unknown sub can never fall through to a calm retry; the sub rides only as a detail. This
+      // SKIPS the mint, so a not-ready helper never burns a single-use server credential.
+      const hr = io.helperReady ? await io.helperReady() : { ok: true };
+      if (!hr || !hr.ok) { this._emit(vaultId, { phase: 'refused', reason: 'helper-not-ready', sub: (hr && hr.sub) || null, installed: (hr && hr.installed) || null }); return; }
+
+      // Refresh + re-send the credential before dispatch; a refresh failure fails closed. A readiness/prepare
+      // failure that surfaces HERE (past the gate) is likewise the non-retrying 'helper-not-ready' + its sub.
       const cr = await io.refreshCred(vaultId);
-      if (!cr || !cr.ok) { this._emit(vaultId, { phase: 'paused', reason: (cr && cr.reason) || 'cred-refresh-failed' }); return; }
+      if (!cr || !cr.ok) { this._emit(vaultId, { phase: 'paused', reason: (cr && cr.reason) || 'cred-refresh-failed', sub: (cr && cr.sub) || null, installed: (cr && cr.installed) || null }); return; }
 
       const spec = { vaultId, local: cfg.localFolder, remotePath };
       const useResync = repair || neverRun; // initial baseline OR deliberate Repair — always zero-loss (keep-both)

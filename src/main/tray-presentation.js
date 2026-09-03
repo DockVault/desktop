@@ -63,7 +63,24 @@ function progressDetail(progress) {
   return parts.length ? parts.join(' · ') : null;
 }
 
-function tooltip(model, lockPhase) {
+// The per-sub helper-not-ready DETAIL — composed from the bounded sub + the non-secret installed/pinned version
+// strings ONLY (never the raw message, path, or SHA). Every known sub gets a specific line; an unknown/null sub
+// falls through to an honest generic — NEVER a blank, never a misleading "blocked by antivirus" for a MISSING
+// binary (its own line), and never "couldn't verify" for a config/prepare failure.
+function helperDetail(sub, installed, pinned) {
+  switch (sub) {
+    case 'version-mismatch': return `The sync helper (rclone) is version ${installed || 'unknown'}, but this app needs ${pinned || 'a different version'}.`;
+    case 'checksum-mismatch': return "The sync helper failed a safety check — it doesn't match its expected version.";
+    case 'binary-missing': return 'The sync helper file is missing. Set it up again.';
+    // Only a genuinely-blocked START (a present file that won't launch — SmartScreen / antivirus). A helper that
+    // RAN and then failed (obscure-failed) is NOT a start-block, so it falls to the neutral default — asserting an
+    // antivirus block for it would be a wrong-cause accusation, the same mistake removed from the missing case.
+    case 'spawn-failed': return 'The sync helper was blocked from starting — this can be Windows SmartScreen or your antivirus.';
+    default: return "The sync helper couldn't be set up — check its setup."; // obscure-failed / config-format-failed / prepare-failed / null / any unknown
+  }
+}
+
+function tooltip(model, lockPhase, pinned) {
   if (lockPhase === 'locking') return 'DockVault — Locking…';
   if (lockPhase === 'lock-error') return 'DockVault — Lock error (retrying)';
   if (model.condition === 'unavailable') return 'DockVault — Sync unavailable';
@@ -72,6 +89,9 @@ function tooltip(model, lockPhase) {
   // A persistent no-sync is a must-act, but its glance reads by duration, not alarm (it is usually a
   // connection or sign-in issue). Keep the calm phrasing rather than the bare "Sync problem" label.
   if (model.state === STATE.SYNC_PROBLEM && model.reason === 'not-syncing') return "DockVault — Sync hasn't run for a while";
+  // The sync helper (rclone) isn't ready — override the generic "Sync problem" label with the honest helper
+  // phrasing + the per-sub detail. `pinned` is supplied by main (the app's pinned version) for version-mismatch.
+  if (model.state === STATE.SYNC_PROBLEM && model.reason === 'helper-not-ready') return "DockVault — The sync helper isn't ready · " + helperDetail(model.sub, model.installed, pinned);
   // While transferring, show the honest count detail ("Syncing… · 3 files · 4.2 MB") — numbers only, no
   // percentage and no total implied, from the aggregate counts the daemon parsed.
   if (model.state === STATE.SYNCING) {
@@ -118,7 +138,13 @@ function mustActItems(model) {
   if (model.state === STATE.SYNC_PROBLEM && model.reason === 'state-unreadable') {
     items.push({ kind: 'reopen', label: "The saved sync state can't be unlocked on this machine — your files are safe and sync is paused. Try unlocking your login keychain and reopening DockVault." });
   }
+  // The sync helper (rclone) isn't ready — an APP-scoped problem (one shared binary), so it surfaces as ONE
+  // must-act with the "Set up the sync helper" fix even if several vaults hit it, carrying the sub/installed
+  // for the per-sub notification detail. The per-vault loop below skips these so it is never duplicated.
+  const hnr = model.vaults.find((v) => v.state === STATE.SYNC_PROBLEM && v.reason === 'helper-not-ready');
+  if (hnr) items.push({ kind: 'setup-helper', label: 'How to fix the sync helper', sub: hnr.sub || null, installed: hnr.installed || null });
   for (const v of model.vaults) {
+    if (v.reason === 'helper-not-ready') continue; // handled once, app-scoped, above
     if (v.state === STATE.NEEDS_DECISION || v.state === STATE.SYNC_PROBLEM) items.push(itemForVault(v));
   }
   return items;
@@ -179,4 +205,4 @@ function vaultRows(configured, modelVaults, now) {
   });
 }
 
-module.exports = { tooltip, mustActItems, syncNowItem, lastSyncedLabel, vaultRows, formatBytes, progressDetail, REASON_DETAIL };
+module.exports = { tooltip, mustActItems, syncNowItem, lastSyncedLabel, vaultRows, formatBytes, progressDetail, helperDetail, REASON_DETAIL };
