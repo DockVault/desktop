@@ -34,6 +34,7 @@ function bodyForConditionReason(reason, name) {
       // manual press. Never the vague "couldn't sync": the user must be told to stop and check.
       return `${name}'s server identity has changed — don't sync until you've confirmed this is really your server. Open DockVault.`;
     case 'sign-in-needed': return `Sign in to keep ${name} syncing.`;
+    case 'needs-unlock': return `Unlock ${name} to sync it.`; // password-protected vault: unlock it in DockVault so its password reaches the sync (provisional copy)
     case 'needs-repair':
     case 'confirm-large-delete': return `${name} needs a repair before it can sync. Open DockVault to fix it.`;
     case 'path-too-long': return `A file in ${name} needs a shorter path. Open DockVault to fix it.`;

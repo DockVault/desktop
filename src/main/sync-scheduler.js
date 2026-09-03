@@ -205,6 +205,17 @@ class SyncScheduler {
         if (!this._queue.some((q) => q.vaultId === vaultId)) this._queue.push({ vaultId, manual: !!item.manual, repair: !!repair });
         return outcome;
       }
+      // a persistent auth-failed (past its one retry) for a PASSWORD-PROTECTED vault is far more likely a
+      // server-side vault-password ROTATION — the mint's password proof was voided — than a dead account session.
+      // Route it to the "needs unlock" must-act (re-enter the vault password), NOT the sign-in latch, by rewriting
+      // the latching outcome to a distinct typed result the status model maps to that state. A vault with no
+      // password still latches sign-in (its auth-failed can only be the account credential).
+      if (outcome && outcome.ran === true && outcome.result === 'auth-failed'
+          && typeof this._io.vaultHasPassword === 'function' && this._io.vaultHasPassword(vaultId)) {
+        this._authRetried.delete(vaultId);
+        this._emit(vaultId, { phase: 'done', outcome: { ...outcome, result: 'auth-failed-locked' } });
+        return outcome;
+      }
       if (!(outcome && outcome.ran === true && outcome.result === 'auth-failed')) this._authRetried.delete(vaultId);
       // A run that could not EXECUTE (timeout / no helper / send-failed) resolves { ok:false } — that is an
       // 'error', not 'done'. 'done' means the run ran; its typed result (which may still be a conflict or a

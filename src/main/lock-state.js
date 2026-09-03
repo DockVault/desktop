@@ -63,7 +63,14 @@ class LockState {
     this.rendererTimeoutMs = t.rendererTimeoutMs || DEFAULTS.rendererTimeoutMs;
     this.daemonTimeoutMs = t.daemonTimeoutMs || DEFAULTS.daemonTimeoutMs;
     this.daemonAttempts = t.daemonAttempts || DEFAULTS.daemonAttempts;
-    this.unlocked = false;      // no ZK key until an unlock flow (a later phase) provides one
+    this.unlocked = false;      // ZK-KEY-PRESENT gate — no ZK key until an unlock flow (a later phase) provides one.
+                                // STRICTLY SEPARATE from appLocked below: nothing on the Standard-sync path reads this,
+                                // and appLocked never implies it. Standard-tier sync does NOT use the ZK key.
+    this.appLocked = false;     // ACCOUNT-TIER gate for Standard-vault sync: false = the app is active (signed-in +
+                                // not idle/OS/manually-locked) so account-tier sync may run; true = paused by a lock.
+                                // Standard sync gates on this (isAccountUsable), NEVER on `unlocked`. Distinct booleans
+                                // by design: a lock sets it true (alongside the ZK purge); a resume clears it WITHOUT
+                                // ever touching `unlocked`.
     this.lastReason = null;
     this.locking = false;       // a lock() transaction is in flight
   }
@@ -72,6 +79,23 @@ class LockState {
 
   /** Called by the unlock flow (a later phase) once a ZK key is present. */
   markUnlocked() { this.unlocked = true; this.lastReason = null; this.onChange('unlocked'); }
+
+  /**
+   * The ACCOUNT-TIER gate Standard-vault sync dispatch + the credProvider read: true when the app is active for
+   * account-tier sync (a live account session and not currently locked). Deliberately independent of isUnlocked()
+   * (the ZK key), because Standard sync authenticates with the account session + the daemon-held DB key and never the
+   * ZK key — so gating it on the ZK unlock would keep it dead for an account/Standard user forever.
+   */
+  isAccountUsable() { return !this.appLocked; }
+
+  /**
+   * The reverse edge for the account tier: re-enable account-tier sync after a lock (an OS resume/unlock-screen, or a
+   * manual "Resume sync"). Clears ONLY appLocked — it NEVER sets `unlocked` (no ZK key is asserted), keeping the two
+   * tiers separate. Re-minting on the next dispatch uses the still-live account session. Notifies observers with a
+   * DISTINCT 'account-active' event (NEVER the ZK 'unlocked') so the status glance clears "locked" and a sync is
+   * kicked — otherwise a silent flip would leave the tray reading "locked" until the next routine tick.
+   */
+  resumeAccount() { this.appLocked = false; this.onChange('account-active', this.lastReason); }
 
   /**
    * Atomic dual-key purge. Async: closes the unlocked gate immediately, then confirms the renderer
@@ -84,6 +108,8 @@ class LockState {
   async lock(reason) {
     this.lastReason = reason || 'manual';
     this.unlocked = false;          // gate closes now: no crypto op may use the ZK key once lock begins
+    this.appLocked = true;          // account-tier: pause Standard-vault sync (dispatch refuses; the cred is dropped
+                                    // by the existing onChange('locked') -> clearSftpCred hygiene). Cleared by resumeAccount().
     this.locking = true;
     this.onChange('locking', this.lastReason); // honest transitional state; never "safe" mid-purge
 
@@ -146,7 +172,7 @@ class LockState {
     });
   }
 
-  snapshot() { return { unlocked: this.unlocked, reason: this.lastReason }; }
+  snapshot() { return { unlocked: this.unlocked, appLocked: this.appLocked, reason: this.lastReason }; }
 }
 
 module.exports = { LockState, RENDERER_PURGE_JS };

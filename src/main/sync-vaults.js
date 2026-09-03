@@ -23,6 +23,16 @@ function isStandardVault(v) {
   return vaultTier(v) === 'standard';
 }
 
+// Whether a vault is password-protected, per the server's own record. FAIL-SAFE: only an explicit
+// boolean `false` reads as "no password"; a true, missing, or non-boolean flag reads as protected.
+// This direction is load-bearing — a protected vault minted WITHOUT its held password makes the server
+// treat it like a wrong password: it returns 400 and burns an attempt on a rate limiter it SHARES with
+// the web UI's vault-open, so an unknown protection status must never lead to a password-less mint.
+function vaultHasPassword(v) {
+  const h = v && (v.has_password != null ? v.has_password : (v.password_protected != null ? v.password_protected : v.requires_password));
+  return h === false ? false : true;
+}
+
 // Filter a raw vault list to the Standard-eligible set (fail-closed: zk/unknown/missing excluded).
 function filterStandardVaults(list) {
   return (Array.isArray(list) ? list : []).filter(isStandardVault);
@@ -38,7 +48,7 @@ function filterStandardVaults(list) {
  * @param {string} o.serverOrigin  the account server origin
  * @param {string} o.sessionToken  the account session bearer
  * @param {(url:string, init:object)=>Promise<{ok:boolean,status:number,json:()=>Promise<any>}>} fetchFn
- * @returns {Promise<{vaults:Array<{vaultId:string, vaultName:string}>, someExcluded:boolean}>}
+ * @returns {Promise<{vaults:Array<{vaultId:string, vaultName:string, hasPassword:boolean}>, someExcluded:boolean}>}
  */
 async function fetchStandardVaults({ serverOrigin, sessionToken }, fetchFn) {
   if (!serverOrigin || !sessionToken) throw new Error('the vault list needs a server origin and an account session');
@@ -50,7 +60,9 @@ async function fetchStandardVaults({ serverOrigin, sessionToken }, fetchFn) {
   // Filter on the RAW records (server tier), then expose only id + name for the picker.
   const vaults = filterStandardVaults(arr)
     .filter((v) => v && typeof v.id === 'string' && typeof v.name === 'string')
-    .map((v) => ({ vaultId: v.id, vaultName: v.name }));
+    // `hasPassword` (fail-safe true) rides along so the mint path can refuse to mint a protected vault
+    // without a held password — the server-authoritative protection flag, resolved here, not client-side.
+    .map((v) => ({ vaultId: v.id, vaultName: v.name, hasPassword: vaultHasPassword(v) }));
   // A BARE BOOLEAN only: whether the account has any vault that is not offer-eligible (zero-knowledge
   // or otherwise). It carries no count, and the excluded vaults' ids, names, and tier never leave the
   // main process — just enough for an honest "some vaults aren't shown here" note.
@@ -58,4 +70,4 @@ async function fetchStandardVaults({ serverOrigin, sessionToken }, fetchFn) {
   return { vaults, someExcluded };
 }
 
-module.exports = { vaultTier, isStandardVault, filterStandardVaults, fetchStandardVaults };
+module.exports = { vaultTier, isStandardVault, vaultHasPassword, filterStandardVaults, fetchStandardVaults };

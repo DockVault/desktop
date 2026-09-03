@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { vaultTier, isStandardVault, filterStandardVaults, fetchStandardVaults } = require('../src/main/sync-vaults');
+const { vaultTier, isStandardVault, vaultHasPassword, filterStandardVaults, fetchStandardVaults } = require('../src/main/sync-vaults');
 
 test('vaultTier reads the server field (vault_type preferred, type accepted); non-string => null', () => {
   assert.strictEqual(vaultTier({ vault_type: 'standard' }), 'standard');
@@ -52,8 +52,33 @@ test('fetchStandardVaults: GETs /vaults with the account bearer and returns only
   const out = await fetchStandardVaults({ serverOrigin: 'https://vault.example/', sessionToken: 'tok' }, fetchFn);
   assert.strictEqual(seen.url, 'https://vault.example/vaults', 'trailing slash trimmed; /vaults path');
   assert.strictEqual(seen.init.headers.Authorization, 'Bearer tok');
-  assert.deepStrictEqual(out.vaults, [{ vaultId: 'a', vaultName: 'Marketing' }, { vaultId: 'c', vaultName: 'Ops' }]);
+  // hasPassword rides along; with no server flag on these records it is fail-safe true (never mint without a password).
+  assert.deepStrictEqual(out.vaults, [{ vaultId: 'a', vaultName: 'Marketing', hasPassword: true }, { vaultId: 'c', vaultName: 'Ops', hasPassword: true }]);
   assert.strictEqual(out.someExcluded, true, 'a bare boolean: the account has non-eligible (zk/unknown) vaults');
+});
+
+test('vaultHasPassword is fail-safe: only an explicit boolean false reads as unprotected', () => {
+  assert.strictEqual(vaultHasPassword({ has_password: true }), true);
+  assert.strictEqual(vaultHasPassword({ has_password: false }), false, 'explicit false -> unprotected');
+  assert.strictEqual(vaultHasPassword({ password_protected: false }), false, 'accepts the alternate server field');
+  assert.strictEqual(vaultHasPassword({ requires_password: false }), false, 'accepts a third alternate field');
+  assert.strictEqual(vaultHasPassword({}), true, 'a missing flag is treated as protected');
+  assert.strictEqual(vaultHasPassword({ has_password: 'no' }), true, 'a non-boolean flag is treated as protected');
+  assert.strictEqual(vaultHasPassword(null), true);
+});
+
+test('fetchStandardVaults: carries the server has_password flag through, fail-safe true when absent', async () => {
+  const fetchFn = async () => ({ ok: true, status: 200, json: async () => [
+    { id: 'a', name: 'Protected', type: 'standard', has_password: true },
+    { id: 'b', name: 'Open', type: 'standard', has_password: false },
+    { id: 'c', name: 'Unmarked', type: 'standard' /* no flag */ },
+  ] });
+  const out = await fetchStandardVaults({ serverOrigin: 'https://v', sessionToken: 't' }, fetchFn);
+  assert.deepStrictEqual(out.vaults, [
+    { vaultId: 'a', vaultName: 'Protected', hasPassword: true },
+    { vaultId: 'b', vaultName: 'Open', hasPassword: false },
+    { vaultId: 'c', vaultName: 'Unmarked', hasPassword: true },
+  ]);
 });
 
 test('fetchStandardVaults: someExcluded is false when every vault is eligible', async () => {
@@ -61,7 +86,7 @@ test('fetchStandardVaults: someExcluded is false when every vault is eligible', 
     { id: 'a', name: 'A', type: 'standard' }, { id: 'b', name: 'B', vault_type: 'standard' },
   ] });
   const out = await fetchStandardVaults({ serverOrigin: 'https://v', sessionToken: 't' }, fetchFn);
-  assert.deepStrictEqual(out, { vaults: [{ vaultId: 'a', vaultName: 'A' }, { vaultId: 'b', vaultName: 'B' }], someExcluded: false });
+  assert.deepStrictEqual(out, { vaults: [{ vaultId: 'a', vaultName: 'A', hasPassword: true }, { vaultId: 'b', vaultName: 'B', hasPassword: true }], someExcluded: false });
 });
 
 test('fetchStandardVaults: fails closed on a non-OK response and on missing inputs', async () => {

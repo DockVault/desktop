@@ -85,9 +85,27 @@ let credCache = null;        // per-vault SFTP credential cache (mint via the ac
 let syncTickTimer = null;    // the routine sync cadence timer
 const SYNC_TICK_MS = 5 * 60 * 1000; // a locked/offline/no-session/uncertain/no-config tick is a cheap gated skip
 const BOOT_SYNC_KICK_MS = 2000; // a first gated pass shortly after boot when already unlocked (no lock->unlock transition fires)
-let lockPhase = 'unlocked'; // the lock machine's current phase, for the tray glance (locking/lock-error/…)
+let lockPhase = null; // the lock machine's last phase; only the transients colour the glance (see effectiveLockPhase)
+// The lock phase the tray glance may use. Only the in-flight transients (locking / lock-error) colour the
+// glance; every settled phase is carried by the honest sync model instead. Returning null for a settled
+// phase means main never asserts a literal "unlocked" before the first lock event — which on a fresh boot
+// would glance unlocked while the account gate is still resolving. Derived, never a stale literal.
+function effectiveLockPhase() {
+  return (lockPhase === 'locking' || lockPhase === 'lock-error') ? lockPhase : null;
+}
 let lastSomeExcluded = false; // whether the last vault listing had non-eligible vaults (a bare flag for the picker note)
 let syncFlowBusy = false;     // single-flight guard: one enable/stop-sync flow at a time (no dialog races)
+// vaultId -> whether the server marks it password-protected, learned from the server-authoritative vault
+// listing on every fetch. The mint path consults it to refuse minting a protected vault with no held
+// password; an id never seen (or absent from a listing) is treated as protected (fail-safe true).
+const standardVaultHasPassword = new Map();
+function rememberVaultPasswordFlags(vaults) {
+  try { for (const v of (Array.isArray(vaults) ? vaults : [])) if (v && typeof v.vaultId === 'string') standardVaultHasPassword.set(v.vaultId, v.hasPassword !== false); } catch { /* best effort */ }
+}
+function vaultRequiresPassword(vaultId) {
+  // Fail-safe: only an id the server has EXPLICITLY marked unprotected skips the password requirement.
+  return standardVaultHasPassword.get(vaultId) !== false;
+}
 
 let mainWindow = null;
 let tray = null;
@@ -218,12 +236,20 @@ async function boot() {
       // Lock is an input to the computed sync status (a locked vault pauses, but an unresolved item
       // still outranks it). The in-flight transients (locking / lock-error) colour the glance directly.
       lockPhase = s;
-      if (syncHub && (s === 'locked' || s === 'unlocked')) syncHub.setLocked(s === 'locked');
+      // The hub's locked signal tracks the ACCOUNT-TIER pause, read from the lock-state source of truth (appLocked)
+      // rather than the zero-knowledge 'locked'/'unlocked' event vocabulary — so a lock pauses the glance, an
+      // account-tier resume clears it, and a (future) zero-knowledge unlock can never clear it while account-tier
+      // sync is still paused. The two tiers stay separate on the hub path too.
+      if (syncHub) syncHub.setLocked(lockState.snapshot().appLocked);
       // #5 clear-on-lock: a lock pauses sync dispatch, so drop the account-tier SFTP credential as hygiene
       // — the main-side cache AND the helper's prepared config — re-minted from the still-live session on
-      // unlock. (The account session itself persists across a lock; only the derived credential is dropped.)
+      // unlock/resume. (The account session itself persists across a lock; only the derived credential is dropped.)
       if (s === 'locked') { if (credCache) credCache.clear(); if (daemon) void daemon.clearSftpCred(); }
-      if (s === 'unlocked') { void maybeOfferSyncSetup(); void tickSync(); } // nudge setup + kick a sync now the credential can re-mint
+      // An account-tier resume ('account-active') re-enables dispatch: nudge setup + kick a sync now the credential
+      // can re-mint. Keyed on the account-tier signal, never the zero-knowledge 'unlocked' event, so the sync path
+      // stays independent of the zero-knowledge key. 'account-active' asserts NO zero-knowledge key; the lock UI is
+      // untouched.
+      if (s === 'account-active') { void maybeOfferSyncSetup(); void tickSync(); }
       refreshTray();
     },
   });
@@ -236,10 +262,11 @@ async function boot() {
       onDegraded: (code) => { console.warn('[dockvault] auto-lock posture degraded:', code); },
     });
     autoLock.start();
-    // A first sync pass shortly after boot when the app starts already unlocked: the on-unlock hook only
-    // kicks on a lock->unlock TRANSITION, so a cold start that is already unlocked would otherwise sit until
-    // the routine interval. Deferred a moment so the window and account session settle; gated like any tick.
-    if (lockState.isUnlocked()) { const t = setTimeout(() => { void tickSync(); }, BOOT_SYNC_KICK_MS); if (t.unref) t.unref(); }
+    // A first sync pass shortly after boot when the app starts active for account-tier sync: the resume hook
+    // only kicks on a lock->resume TRANSITION, so a cold start (appLocked defaults false) would otherwise sit
+    // until the routine interval. Deferred a moment so the window and account session settle; gated like any
+    // tick (the dispatch still re-checks the live account session, so no run starts before sign-in completes).
+    if (lockState.isAccountUsable()) { const t = setTimeout(() => { void tickSync(); }, BOOT_SYNC_KICK_MS); if (t.unref) t.unref(); }
   }
   await finishSmokeIfNeeded();
 }
@@ -319,6 +346,47 @@ async function seedRestoredSession(win) {
   } catch { /* best effort; a failed restore just shows the sign-in screen */ }
 }
 
+// The Standard-vault ACCESS password is NOT a zero-knowledge secret — the reused web UI already holds it
+// in the clear and sends it to the server as the X-Vault-Password header to unlock a password-protected
+// vault. To sync such a vault, that same password must reach the SFTP-credential mint. It is pulled from
+// the renderer ONCE, at mint time, in a single eval, and bound to the exact vault whose run is in flight:
+//   - bound:      the renderer returns the password ONLY when its currently-open vault IS `vaultId`; a
+//                 password entered for a different vault is never handed over.
+//   - typed:      main accepts only a non-empty string within a sane length bound; anything else -> null.
+//   - fresh:      main independently enforces the 15-minute freshness from the renderer's timestamp, so a
+//                 stale password (the UI's own expiry not yet swept) is refused here too.
+//   - single-use: pulled fresh for THIS mint and never stashed in main; the caller zeroizes after use.
+//   - lifecycle:  nothing is retained, so a lock/sign-out purge has nothing to clear here.
+// Returns the password string, or null when none is validly available (the caller then refuses to mint
+// and surfaces 'needs-unlock' WITHOUT calling the server — so no attempt is spent on the shared limiter).
+const VAULT_PW_MAX_LEN = 1024;              // a generous upper bound; longer -> reject as malformed
+const VAULT_PW_WINDOW_MS = 15 * 60 * 1000;  // main-enforced freshness, matching the renderer's own window
+async function pullVaultPasswordForMint(vaultId) {
+  const win = mainWindow;
+  if (!win || win.isDestroyed() || typeof vaultId !== 'string' || !vaultId) return null;
+  let pulled = null;
+  try {
+    // Bind in the eval: the raw fields are read only when the open vault matches; the password is
+    // never returned for a different or no open vault. `state` is app.js's top-level classic-script binding.
+    pulled = await win.webContents.executeJavaScript(
+      `(() => { try {`
+      + ` if (typeof state === 'undefined' || !state) return null;`
+      + ` const want = ${JSON.stringify(vaultId)};`
+      + ` if (!state.currentVaultId || String(state.currentVaultId) !== String(want)) return null;`
+      + ` const pw = state.vaultPassword;`
+      + ` if (typeof pw !== 'string' || pw.length === 0) return null;`
+      + ` return { password: pw, ts: state.vaultPasswordTimestamp };`
+      + ` } catch (e) { return null; } })()`, true);
+  } catch { return null; } // a failed eval is a missing password, never a proceed-without-one
+  if (!pulled || typeof pulled.password !== 'string') return null;
+  const pw = pulled.password;
+  if (pw.length === 0 || pw.length > VAULT_PW_MAX_LEN) { pulled.password = ''; return null; } // typed: reject empty/oversize
+  const ts = typeof pulled.ts === 'number' ? pulled.ts : 0;                                    // fresh: the renderer timestamp
+  if (!ts || (Date.now() - ts) > VAULT_PW_WINDOW_MS) { pulled.password = ''; return null; }
+  pulled.password = ''; // drop our reference to the wrapper's copy; the returned string is the only live one
+  return pw;
+}
+
 // ---------------------------------------------------------------------------------------------
 function trayImage() {
   try {
@@ -351,7 +419,7 @@ function refreshTray() {
   try {
     if (!syncHub) { tray.setToolTip('DockVault'); tray.setContextMenu(buildTrayMenu([], null)); return; }
     const model = syncHub.current();
-    tray.setToolTip(trayPresentation.tooltip(model, lockPhase));
+    tray.setToolTip(trayPresentation.tooltip(model, effectiveLockPhase()));
     tray.setContextMenu(buildTrayMenu(trayPresentation.mustActItems(model), model));
   } catch { /* tray gone */ }
 }
@@ -387,9 +455,16 @@ function buildTrayMenu(items, model) {
     }
     template.push({ type: 'separator' });
   }
+  template.push({ label: 'Open DockVault', click: () => { void showOrCreateWindow(); } });
+  // When the account tier is paused by a lock, offer an explicit way back rather than a "Lock now" that is
+  // already in effect. An idle / OS lock resumes on its own when input returns, but a deliberate "Lock now"
+  // does NOT auto-resume (by design) — so this is the affordance that keeps a lock from being a one-way door
+  // until relaunch. resumeAccount() re-enables ONLY the account tier; it never asserts the ZK key.
+  const accountPaused = (() => { try { const s = lockState && lockState.snapshot(); return !!(s && s.appLocked); } catch { return false; } })();
+  template.push(accountPaused
+    ? { label: 'Resume sync', click: () => { if (lockState) lockState.resumeAccount(); } }
+    : { label: 'Lock now', click: () => { if (lockState) void lockState.lock('manual').catch(() => { /* state machine surfaces lock-error */ }); } });
   template.push(
-    { label: 'Open DockVault', click: () => { void showOrCreateWindow(); } },
-    { label: 'Lock now', click: () => { if (lockState) void lockState.lock('manual').catch(() => { /* state machine surfaces lock-error */ }); } },
     { type: 'separator' },
     { label: 'Quit DockVault', click: () => { isQuitting = true; app.quit(); } },
   );
@@ -700,7 +775,20 @@ function startSyncScheduler() {
       const origin = serverConfig.readServerOrigin(dir);
       const token = await resolveAccountToken();
       if (!origin || !token) { const e = new Error('not signed in'); e.status = 401; throw e; } // -> 'no-session' -> sign in
-      return mintSftpAccess({ serverOrigin: origin, sessionToken: token, vaultId }, mainHttpJson);
+      // A password-protected vault must never be minted without its held password: the server treats a
+      // missing password like a wrong one — 400 plus a burnt attempt on the limiter it SHARES with the web
+      // UI's vault-open. So pull the access password (bound to THIS vault, fresh) and refuse BEFORE any
+      // server call when it isn't available, surfacing the non-retrying 'needs-unlock' rather than minting.
+      let vaultPassword;
+      if (vaultRequiresPassword(vaultId)) {
+        vaultPassword = await pullVaultPasswordForMint(vaultId);
+        if (!vaultPassword) { const e = new Error('vault password not available'); e.reason = 'needs-unlock'; throw e; }
+      }
+      try {
+        return await mintSftpAccess({ serverOrigin: origin, sessionToken: token, vaultId, vaultPassword }, mainHttpJson);
+      } finally {
+        vaultPassword = ''; // single-use: drop the plaintext the moment the mint request has been issued
+      }
     },
     send: (bundle) => daemon.sendSftpCred(bundle),
   });
@@ -712,7 +800,9 @@ function startSyncScheduler() {
       const origin = serverConfig.readServerOrigin(dir);
       const token = await resolveAccountToken();
       if (!origin || !token) { const e = new Error('not signed in'); e.reason = 'no-session'; throw e; }
-      return syncVaults.fetchStandardVaults({ serverOrigin: origin, sessionToken: token }, mainHttpJson);
+      const res = await syncVaults.fetchStandardVaults({ serverOrigin: origin, sessionToken: token }, mainHttpJson);
+      rememberVaultPasswordFlags(res && res.vaults); // keep the per-vault protection flags current for the mint gate
+      return res;
     },
     remotePathForVault: syncConfig.remotePathForVault,
     secureFolder: async (folder) => {
@@ -737,7 +827,8 @@ function startSyncScheduler() {
     credCache,
     daemon,
     confirmFirstUpload: (o) => confirmFirstUpload(o, entryFor(o.vaultId)),
-    isUnlocked: () => !!(lockState && lockState.isUnlocked()),
+    isAccountUsable: () => !!(lockState && lockState.isAccountUsable()),
+    vaultHasPassword: (vaultId) => vaultRequiresPassword(vaultId), // route a persistent auth-failed here to needs-unlock
     hasAccount: () => { try { return !!(serverConfig.readServerOrigin(dir) && ((sessionBundle && sessionBundle.authToken) || (tokenStore.loadSession(safeStorage, dir) || {}).authToken)); } catch { return false; } },
     isOnline: isOnlineNow, // the one online source — shared with the status hub's glance (tickSync setOnline)
     onEvent: (vaultId, ev) => {
@@ -765,12 +856,13 @@ function startSyncScheduler() {
   syncScheduler = new SyncScheduler(io);
   // Authorise the helper's per-step credential requests (a resync mints one fresh single-use credential per
   // rclone process). Main holds the say: it mints ONLY for the vault whose run is in flight right now, and only
-  // while the app is unlocked with a live account. The helper's requested vaultId is CHECKED against the
-  // scheduler's in-flight vault, never trusted as an input; the fresh credential is delivered on the existing
-  // sftp-cred path, and this returns only { ok, reason }.
+  // while the app is active for account-tier sync (not lock-paused) with a live account. The gate is the
+  // account tier (isAccountUsable), NEVER the ZK unlocked state — Standard sync does not use the ZK key. The
+  // helper's requested vaultId is CHECKED against the scheduler's in-flight vault, never trusted as an input;
+  // the fresh credential is delivered on the existing sftp-cred path, and this returns only { ok, reason }.
   if (daemon) daemon.setCredProvider(async (vault) => {
     if (!syncScheduler || syncScheduler.current() !== vault) return { ok: false, reason: 'not-in-flight' };
-    if (!(lockState && lockState.isUnlocked())) return { ok: false, reason: 'paused-locked' };
+    if (!(lockState && lockState.isAccountUsable())) return { ok: false, reason: 'paused-locked' };
     if (!io.hasAccount()) return { ok: false, reason: 'no-session' };
     return credCache.ensureSent(vault);
   });
@@ -795,6 +887,7 @@ function buildEnableIo() {
       if (!origin || !token) { const e = new Error('not signed in'); e.reason = 'no-session'; throw e; }
       const { vaults, someExcluded } = await syncVaults.fetchStandardVaults({ serverOrigin: origin, sessionToken: token }, mainHttpJson);
       lastSomeExcluded = !!someExcluded; // a bare flag for the picker note; excluded vaults never leave main
+      rememberVaultPasswordFlags(vaults); // the picker fetch also refreshes the protection flags for the mint gate
       return vaults;
     },
     pickVault: async (vaults) => {

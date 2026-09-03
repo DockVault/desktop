@@ -81,6 +81,7 @@ function itemForVault(v) {
   switch (v.reason) {
     case 'conflict-keep-both': return { kind: 'review', vault: v.vault, label: `Review conflicting copies in ${v.vault}` };
     case 'sign-in-needed': return { kind: 'sign-in', vault: v.vault, label: `Sign in to keep ${v.vault} syncing` };
+    case 'needs-unlock': return { kind: 'unlock', vault: v.vault, label: `Unlock ${v.vault} to sync it` };
     case 'needs-repair':
     case 'confirm-large-delete': return { kind: 'repair', vault: v.vault, label: `Repair sync for ${v.vault}` };
     case 'path-too-long': return { kind: 'repair', vault: v.vault, label: `A file in ${v.vault} needs a shorter path` };

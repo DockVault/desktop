@@ -33,6 +33,11 @@ function classifyMintError(e) {
   if (reason === 'host-key-unverified') return 'host-key-unavailable';
   if (reason) return reason;
   const status = e && e.status;
+  // A vault-password mint refusal (400) or its rate limit (429): a NON-retrying must-act, NEVER retryable
+  // 'mint-failed'. The server treats a missing/wrong vault password like a wrong one and burns an attempt on a
+  // limiter it SHARES with the web UI's vault open — so retrying would lock the owner out of their own vault in
+  // the browser. Surfaced as 'needs-unlock' (unlock the vault so its password reaches the mint), a must-act.
+  if (status === 400 || status === 429) return 'needs-unlock';
   if (status === 401 || status === 403) return 'no-session';
   return 'mint-failed';
 }

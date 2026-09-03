@@ -92,6 +92,9 @@ const OUTCOME_STATE = Object.freeze({
   // resync to re-establish the baseline — surfaced as a repair, NOT as a "large delete" (which it is not).
   'abort-all-changed': { state: STATE.NEEDS_DECISION, reason: 'needs-repair' },
   'auth-failed': { state: STATE.NEEDS_DECISION, reason: 'sign-in-needed' },
+  // A persistent auth-failed for a password-protected vault (past its one retry): the likely cause is a rotated
+  // vault password, so the remedy is to unlock the vault (re-enter its password), NOT to sign in again.
+  'auth-failed-locked': { state: STATE.NEEDS_DECISION, reason: 'needs-unlock' },
   'path-too-long': { state: STATE.NEEDS_DECISION, reason: 'path-too-long' },
   'host-key-unverified': { state: STATE.PAUSED, reason: 'cannot-verify-yet' },
   'host-key-mismatch': { state: STATE.SYNC_PROBLEM, reason: 'host-key-mismatch' },

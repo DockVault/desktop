@@ -16,9 +16,14 @@ function fakePower() {
 function fakeLock() {
   return {
     unlocked: true,
+    appLocked: false,
     reasons: [],
+    lastReason: null,
     isUnlocked() { return this.unlocked; },
-    lock(r) { this.reasons.push(r); this.unlocked = false; return Promise.resolve(true); },
+    isAccountUsable() { return !this.appLocked; },
+    resumeAccount() { this.appLocked = false; this.resumes = (this.resumes || 0) + 1; },
+    snapshot() { return { unlocked: this.unlocked, appLocked: this.appLocked, reason: this.lastReason }; },
+    lock(r) { this.reasons.push(r); this.unlocked = false; this.appLocked = true; this.lastReason = r; return Promise.resolve(true); },
   };
 }
 function fakeWin() {
@@ -109,6 +114,30 @@ test('idle locks also arm the unattended escalation', () => {
   al.start();
   power.idle = 2; captured.poll();
   assert.ok(captured.esc, 'an idle lock arms the escalation too');
+});
+
+test('reverse edge: idle fires the lock for an account-only user (no ZK key), and input-resumed reverses it', () => {
+  const lock = fakeLock();
+  lock.unlocked = false; lock.appLocked = false;      // account-only: signed in, no ZK key, active
+  const { al, captured, power } = harness({ lock });
+  al.start();
+  power.idle = 2; captured.poll();                    // idle crosses -> fires via the ACCOUNT tier (isUnlocked() is false)
+  assert.deepStrictEqual(lock.reasons, ['idle'], 'the idle lock fires for an account-only user');
+  assert.strictEqual(lock.isAccountUsable(), false, 'account-tier sync is paused by the idle lock');
+  power.idle = 0; captured.poll();                    // input resumed below the threshold -> the reverse edge
+  assert.strictEqual(lock.isAccountUsable(), true, 'input-resumed re-enables account-tier sync');
+  assert.ok(lock.resumes >= 1, 'resumeAccount ran on the reverse edge');
+});
+
+test('reverse edge: a manual lock is NOT auto-resumed by an OS resume signal (waits for the explicit Resume item)', () => {
+  const lock = fakeLock();
+  lock.unlocked = false; lock.appLocked = false;
+  const { al, power } = harness({ lock });
+  al.start();
+  lock.lock('manual');                                // a deliberate manual pause
+  assert.strictEqual(lock.isAccountUsable(), false);
+  power.emit('resume');                               // an OS resume must NOT auto-resume a manual lock
+  assert.strictEqual(lock.isAccountUsable(), false, 'a manual lock stays paused until the explicit Resume item');
 });
 
 test('an unavailable OS idle clock surfaces a one-time degraded posture (not silent)', () => {

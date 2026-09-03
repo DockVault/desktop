@@ -167,6 +167,13 @@ test('a 401 at mint time is classified as a sign-in need, not a generic retry', 
   assert.deepStrictEqual(await cc.ensureSent('v1'), { ok: false, reason: 'no-session' });
 });
 
+test('a 400/429 at mint time is a NON-retrying needs-unlock — never a retry that would burn the shared vault rate limit', async () => {
+  for (const status of [400, 429]) {
+    const cc = new CredCache({ mint: async () => { const e = new Error(`mint refused: ${status}`); e.status = status; throw e; }, send: async () => ({ ok: true }), now: () => NOW });
+    assert.deepStrictEqual(await cc.ensureSent('v1'), { ok: false, reason: 'needs-unlock' }, `${status} -> needs-unlock (not the retryable mint-failed)`);
+  }
+});
+
 test('an unverifiable host key is classified as host-key-unavailable (a calm cannot-verify-yet upstream)', async () => {
   const cc = new CredCache({ mint: async () => { const e = new Error('host key unavailable'); e.reason = 'host-key-unverified'; throw e; }, send: async () => ({ ok: true }), now: () => NOW });
   assert.deepStrictEqual(await cc.ensureSent('v1'), { ok: false, reason: 'host-key-unavailable' });

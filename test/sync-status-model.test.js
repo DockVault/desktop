@@ -69,6 +69,12 @@ test('auth-failed is a decision (sign in), not a problem', () => {
   assert.strictEqual(r.reason, 'sign-in-needed');
 });
 
+test('auth-failed-locked (a password vault past its retry) is a decision to unlock the vault, not to sign in', () => {
+  const r = computeStatus({ ...secure, vaults: [vault({ lastResult: 'auth-failed-locked' })] });
+  assert.strictEqual(r.state, STATE.NEEDS_DECISION);
+  assert.strictEqual(r.reason, 'needs-unlock');
+});
+
 test('a resync-required latch never reads green, even if the last outcome looked ok', () => {
   const r = vaultState(vault({ lastResult: 'ok', resyncRequired: true }));
   assert.strictEqual(r.state, STATE.NEEDS_DECISION);

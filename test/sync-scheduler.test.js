@@ -19,6 +19,7 @@ function harness(over = {}) {
     classify: over.classify || ((f) => { calls.classify.push(f); return { ok: true }; }),
     refreshCred: over.refreshCred || (async (v) => { calls.refreshCred.push(v); return { ok: true }; }),
     confirmFirstUpload: over.confirmFirstUpload,
+    vaultHasPassword: over.vaultHasPassword, // undefined by default -> remap inactive (existing sign-in behaviour)
     runSync: over.runSync || (async (spec) => { calls.runSync.push(spec.vaultId); return { result: 'ok', ran: true }; }),
     runResync: over.runResync || (async (spec) => { calls.runResync.push(spec.vaultId); return { result: 'resync-ok', ran: true }; }),
     onEvent: (vaultId, ev) => { log.push({ vaultId, ...ev }); },
@@ -282,7 +283,7 @@ const { makeSession } = require('../src/main/scheduler-io');
 
 test('a not-fresh run-state snapshot makes the session state-uncertain -> the scheduler SKIPS, never dispatches (fail-closed)', async () => {
   let fresh = false;
-  const session = makeSession({ isUnlocked: () => true, hasAccount: () => true, isOnline: () => true, snapshotFresh: () => fresh });
+  const session = makeSession({ isAccountUsable: () => true, hasAccount: () => true, isOnline: () => true, snapshotFresh: () => fresh });
   const a = harness({ session });
   a.sch.requestSync('a'); await settle(a.sch);
   assert.deepStrictEqual(a.calls.runSync, [], 'a stale/failed run-state view blocks dispatch');
@@ -323,6 +324,35 @@ test('a single auth-failed retries once with a fresh mint before latching a sign
   assert.ok(ph.includes('done'), 'the second consecutive auth-failed falls through to done -> sign-in-needed');
 });
 
+test('a persistent auth-failed for a PASSWORD-PROTECTED vault latches needs-unlock, not the sign-in latch', async () => {
+  // Past its one retry, an auth-failed on a has_password vault is far more likely a rotated vault password
+  // (the mint proof voided) than a dead account session, so it must route to "unlock this vault", not "sign in".
+  let runs = 0;
+  const { sch, log } = harness({
+    runSync: async () => { runs += 1; return { ok: true, ran: true, result: 'auth-failed' }; },
+    vaultHasPassword: () => true,
+  });
+  sch.requestSync('a');
+  await settle(sch);
+  assert.strictEqual(runs, 2, 'still retried exactly once before latching');
+  const done = log.find((e) => e.vaultId === 'a' && e.phase === 'done');
+  assert.ok(done, 'the second auth-failed latches via a completed event');
+  assert.strictEqual(done.outcome && done.outcome.result, 'auth-failed-locked', 'the latching outcome is remapped so the model reads needs-unlock, not sign-in');
+});
+
+test('without a password (or no predicate), a persistent auth-failed still latches the plain sign-in outcome', async () => {
+  let runs = 0;
+  const { sch, log } = harness({
+    runSync: async () => { runs += 1; return { ok: true, ran: true, result: 'auth-failed' }; },
+    vaultHasPassword: () => false,
+  });
+  sch.requestSync('a');
+  await settle(sch);
+  const done = log.find((e) => e.vaultId === 'a' && e.phase === 'done');
+  assert.ok(done, 'it latches via a completed event');
+  assert.strictEqual(done.outcome && done.outcome.result, 'auth-failed', 'a passwordless vault keeps the sign-in-needed outcome');
+});
+
 test('an auth-failed cleared by a success gets a fresh one-shot retry next time', async () => {
   const results = ['auth-failed', 'ok', 'auth-failed', 'ok'];
   let i = 0;
@@ -348,4 +378,48 @@ test('a Repair that hits the auth race retries AS a repair, never a blocked plai
   assert.deepStrictEqual(calls.runSync, [], 'never fell back to a plain runSync');
   assert.ok(!phases(log, 'a').includes('blocked'), 'the retry never hit the blocked gate');
   assert.ok(phases(log, 'a').includes('done'), 'the repair retry completed');
+});
+
+// The real-transition test: a REAL LockState (never a hand-called markUnlocked / hand-flipped gate)
+// drives the account-tier eligibility through a cold boot, an idle lock, and a resume. It proves the whole
+// reverse edge on the real seam — a signed-in cold start dispatches AND mints a fresh credential; an idle lock
+// pauses dispatch and fires the 'locked' signal the shell consumes to drop the account credential; a resume
+// reopens dispatch, fires the DISTINCT 'account-active' signal (never the zero-knowledge 'unlocked') that kicks
+// the re-mint, and never asserts a zero-knowledge key.
+const { LockState } = require('../src/main/lock-state');
+
+test('real LockState drives boot -> dispatch+mint -> idle-lock pause -> resume re-mint (no hand-called markUnlocked)', async () => {
+  const events = [];
+  const ls = new LockState({
+    getWindow: () => null, getDaemon: () => null,
+    onChange: (s) => events.push(s),
+    timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 },
+  });
+  // The account-tier gate reads the REAL LockState (signed in + online + a fresh run-state view).
+  const session = makeSession({ isAccountUsable: () => ls.isAccountUsable(), hasAccount: () => true, isOnline: () => true, snapshotFresh: () => true });
+  const { sch, calls } = harness({ session });
+
+  // COLD BOOT: markUnlocked() is NEVER called (the old dead gate needed it). appLocked defaults active, so a
+  // signed-in account-tier user dispatches immediately — and the zero-knowledge key is absent throughout.
+  assert.strictEqual(ls.isUnlocked(), false, 'no zero-knowledge key at boot');
+  sch.requestSync('a'); await settle(sch);
+  assert.deepStrictEqual(calls.runSync, ['a'], 'a cold, signed-in, never-hand-unlocked start dispatches');
+  assert.deepStrictEqual(calls.refreshCred, ['a'], 'that run minted a fresh credential');
+
+  // IDLE LOCK: the real lock() transaction pauses account-tier dispatch and fires the 'locked' signal the shell
+  // consumes to drop the account credential; the zero-knowledge key stays absent (an idle lock asserts none).
+  await ls.lock('idle');
+  assert.ok(events.includes('locked'), "lock fires the 'locked' signal that drops the account credential");
+  assert.strictEqual(ls.isUnlocked(), false, 'an idle lock never asserts a zero-knowledge key');
+  sch.requestSync('a'); await settle(sch);
+  assert.deepStrictEqual(calls.runSync, ['a'], 'no run dispatches while idle-locked');
+
+  // RESUME: the real resumeAccount() reopens dispatch and fires the DISTINCT 'account-active' signal (never the
+  // zero-knowledge 'unlocked') that kicks the re-mint. The next run mints a FRESH credential.
+  ls.resumeAccount();
+  assert.ok(events.includes('account-active'), "resume fires the distinct 'account-active' signal");
+  assert.ok(!events.includes('unlocked'), "the account-tier resume never emits the zero-knowledge 'unlocked' event");
+  sch.requestSync('a'); await settle(sch);
+  assert.deepStrictEqual(calls.runSync, ['a', 'a'], 'resume lets the next run dispatch again');
+  assert.deepStrictEqual(calls.refreshCred, ['a', 'a'], 're-mint: a FRESH credential is minted on the post-resume run');
 });

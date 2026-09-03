@@ -313,7 +313,7 @@ test('StatusSink: a noop neither increments nor resets the failure streak', () =
 });
 
 test('makeSession: a fresh snapshot yields the three eligibility booleans; not-fresh yields state-uncertain', () => {
-  const base = { isUnlocked: () => true, hasAccount: () => true, isOnline: () => true };
+  const base = { isAccountUsable: () => true, hasAccount: () => true, isOnline: () => true };
   assert.deepStrictEqual(makeSession({ ...base, snapshotFresh: () => true })(), { locked: false, accountLive: true, online: true });
   const stale = makeSession({ ...base, snapshotFresh: () => false })();
   assert.strictEqual(typeof stale.locked, 'undefined', 'no booleans when the run-state view is stale (scheduler reads state-uncertain)');
@@ -321,7 +321,7 @@ test('makeSession: a fresh snapshot yields the three eligibility booleans; not-f
 });
 
 test('makeSession reflects lock / account / online state', () => {
-  const s = makeSession({ isUnlocked: () => false, hasAccount: () => false, isOnline: () => false, snapshotFresh: () => true })();
+  const s = makeSession({ isAccountUsable: () => false, hasAccount: () => false, isOnline: () => false, snapshotFresh: () => true })();
   assert.deepStrictEqual(s, { locked: true, accountLive: false, online: false });
 });
 
@@ -337,7 +337,7 @@ test('makeSchedulerIo assembles the io: run-state from the snapshot, resync rout
     remotePathForVault: (n) => n,
     secureFolder: () => ({ ok: true }), classify: () => ({ ok: true }),
     credCache, daemon, confirmFirstUpload: async () => true,
-    isUnlocked: () => true, hasAccount: () => true, isOnline: () => true, onEvent: () => {},
+    isAccountUsable: () => true, hasAccount: () => true, isOnline: () => true, onEvent: () => {},
   });
   assert.deepStrictEqual(io.runState('v1'), { lastResult: 'ok', resyncRequired: false });
   assert.strictEqual(io.runState('other'), null, 'unknown vault -> never-run');
@@ -350,6 +350,6 @@ test('makeSchedulerIo assembles the io: run-state from the snapshot, resync rout
 });
 
 test('makeSchedulerIo: session reports uncertain when the snapshot is not fresh (fail-closed carried through)', () => {
-  const io = makeSchedulerIo({ snapshot: { get: () => null, fresh: () => false }, credCache: {}, daemon: {}, isUnlocked: () => true, hasAccount: () => true, isOnline: () => true });
+  const io = makeSchedulerIo({ snapshot: { get: () => null, fresh: () => false }, credCache: {}, daemon: {}, isAccountUsable: () => true, hasAccount: () => true, isOnline: () => true });
   assert.strictEqual(io.session().uncertain, true);
 });

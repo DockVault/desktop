@@ -53,7 +53,7 @@ test('a real response body is parsed and filtered to Standard vaults, with the e
     (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(list)); },
     async (origin) => {
       const { vaults, someExcluded } = await fetchStandardVaults({ serverOrigin: origin, sessionToken: 't' }, httpJson);
-      assert.deepStrictEqual(vaults, [{ vaultId: 'v1', vaultName: 'Docs' }, { vaultId: 'v3', vaultName: 'Photos' }]);
+      assert.deepStrictEqual(vaults, [{ vaultId: 'v1', vaultName: 'Docs', hasPassword: true }, { vaultId: 'v3', vaultName: 'Photos', hasPassword: true }]);
       assert.strictEqual(someExcluded, true, 'the zero-knowledge vault is excluded and the note flag is set');
     },
   );

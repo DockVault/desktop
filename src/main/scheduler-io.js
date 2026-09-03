@@ -54,16 +54,20 @@ function makeVerifyEligible({ fetchStandard, remotePathForVault }) {
 
 /*
  * Build the scheduler's session() signal — the eligibility gate read before every dispatch. It reports the
- * three booleans the scheduler needs (unlocked, a live account session, online) EXCEPT when the run-state
- * snapshot is not fresh, when it reports state-uncertain (an object carrying no booleans) so the scheduler
- * SKIPS rather than deciding never-run-vs-blocked from a stale or failed run-state view. This is where the
- * run-state fail-closed is realized: the snapshot only carries `fresh`; the caller must gate on it here.
- * @param {{ isUnlocked:()=>boolean, hasAccount:()=>boolean, isOnline:()=>boolean, snapshotFresh:()=>boolean }} io
+ * three booleans the scheduler needs (account-usable, a live account session, online) EXCEPT when the
+ * run-state snapshot is not fresh, when it reports state-uncertain (an object carrying no booleans) so the
+ * scheduler SKIPS rather than deciding never-run-vs-blocked from a stale or failed run-state view. This is
+ * where the run-state fail-closed is realized: the snapshot only carries `fresh`; the caller must gate here.
+ *
+ * `locked` is the ACCOUNT-TIER pause: the negation of isAccountUsable() (app active + not lock-paused). It is
+ * deliberately NOT the ZK unlocked state — Standard-vault sync authenticates with the account session and the
+ * daemon-held DB key, never the zero-knowledge key, so this path must never read isUnlocked().
+ * @param {{ isAccountUsable:()=>boolean, hasAccount:()=>boolean, isOnline:()=>boolean, snapshotFresh:()=>boolean }} io
  */
-function makeSession({ isUnlocked, hasAccount, isOnline, snapshotFresh }) {
+function makeSession({ isAccountUsable, hasAccount, isOnline, snapshotFresh }) {
   return () => {
     if (!snapshotFresh()) return { uncertain: true }; // no fresh run-state view → don't decide blind
-    return { locked: !isUnlocked(), accountLive: !!hasAccount(), online: !!isOnline() };
+    return { locked: !isAccountUsable(), accountLive: !!hasAccount(), online: !!isOnline() };
   };
 }
 
@@ -83,7 +87,7 @@ function makeSession({ isUnlocked, hasAccount, isOnline, snapshotFresh }) {
  * @param {{ensureSent:(v:string)=>Promise<object>}} deps.credCache
  * @param {{runSync:(spec:object)=>Promise<object>}} deps.daemon
  * @param {(o:object)=>Promise<boolean>} [deps.confirmFirstUpload]
- * @param {()=>boolean} deps.isUnlocked
+ * @param {()=>boolean} deps.isAccountUsable
  * @param {()=>boolean} deps.hasAccount
  * @param {()=>boolean} deps.isOnline
  * @param {(vaultId:string, ev:object)=>void} deps.onEvent
@@ -93,7 +97,7 @@ function makeSchedulerIo(deps) {
   return {
     listConfigured: deps.listConfigured,
     runState: (vaultId) => deps.snapshot.get(vaultId),
-    session: makeSession({ isUnlocked: deps.isUnlocked, hasAccount: deps.hasAccount, isOnline: deps.isOnline, snapshotFresh: () => deps.snapshot.fresh() }),
+    session: makeSession({ isAccountUsable: deps.isAccountUsable, hasAccount: deps.hasAccount, isOnline: deps.isOnline, snapshotFresh: () => deps.snapshot.fresh() }),
     verifyEligible: makeVerifyEligible({ fetchStandard: deps.fetchStandard, remotePathForVault: deps.remotePathForVault }),
     secureFolder: deps.secureFolder,
     classify: deps.classify,
@@ -171,6 +175,11 @@ function conditionForReason(phase, reason) {
     // fix it, so this is a distinct decision from a folder that is simply gone/unusable (choose-folder).
     case 'folder-problem':   return { state: STATE.NEEDS_DECISION, reason: 'folder-problem' };
     case 'no-session':       return { state: STATE.NEEDS_DECISION, reason: 'sign-in-needed' };
+    // A password-protected vault whose password main does not hold (window closed to tray, or not captured), or a
+    // vault-password mint refusal (400/429). A NON-retrying must-act: the remedy is to unlock THIS vault so its
+    // password reaches the mint — never a retry (which would burn the server's shared vault rate limit). Deliberately
+    // NOT in RETRYABLE_FAILURE_REASONS, so it surfaces once and stays put rather than looping.
+    case 'needs-unlock':     return { state: STATE.NEEDS_DECISION, reason: 'needs-unlock' };
     case 'host-key-unavailable': return { state: STATE.PAUSED, reason: 'cannot-verify-yet' }; // older/unverifiable server — calm, not an alarm
     case 'consent-declined': return { state: STATE.WAITING, reason: 'consent-needed' }; // a user choice: re-offerable, never a notification
     case 'waiting-to-reconnect':

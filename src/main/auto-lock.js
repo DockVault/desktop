@@ -67,9 +67,10 @@ class AutoLock {
       // The user has stepped away — drop the key immediately, then arm the unattended escalation.
       this.power.on('suspend', () => this._trigger('sleep'));
       this.power.on('lock-screen', () => this._trigger('os-lock'));
-      // OS input resumed — allow the idle timer to arm again.
-      this.power.on('resume', () => { this._idleLatched = false; });
-      this.power.on('unlock-screen', () => { this._idleLatched = false; });
+      // OS input resumed — allow the idle timer to arm again, and auto-resume account-tier sync if it was paused by
+      // an OS/idle lock (never a manual "Lock now", which waits for the explicit Resume item).
+      this.power.on('resume', () => { this._idleLatched = false; this._maybeAutoResume(); });
+      this.power.on('unlock-screen', () => { this._idleLatched = false; this._maybeAutoResume(); });
     }
     // The idle poll is installed only if the OS input-idle clock is actually usable. If it is not, the
     // degraded posture is surfaced once (not silent): the OS suspend/screen-lock triggers and the reused
@@ -97,11 +98,27 @@ class AutoLock {
     let idleSec = 0;
     try { idleSec = this.power.getSystemIdleTime(); } catch { this._reportDegraded('idle-clock-unavailable'); return; }
     if (idleSec * 1000 >= this.idleThresholdMs) {
-      if (!this._idleLatched && this.lockState.isUnlocked()) this._trigger('idle');
+      // Fire the idle lock when EITHER tier is active: the ZK key present, OR the account tier usable. A Standard-only
+      // user has no ZK key (isUnlocked() is always false), so without the account-tier condition the idle lock would
+      // never fire for them and account sync + its credential would live on unattended. lock() is safe with no ZK key
+      // (the purge no-ops) and still pauses dispatch + drops the account credential via onChange('locked').
+      if (!this._idleLatched && (this.lockState.isUnlocked() || this.lockState.isAccountUsable())) this._trigger('idle');
       this._idleLatched = true; // don't re-fire until OS input resumes
     } else {
       this._idleLatched = false;
+      this._maybeAutoResume(); // input resumed below the idle threshold -> reverse an idle lock for the account tier
     }
+  }
+
+  // Reverse edge for the account tier: re-enable Standard-vault sync once the user returns (input resumed / screen
+  // unlocked / system resumed), but ONLY for the auto (UNATTENDED) reasons — a manual "Lock now" is a deliberate pause
+  // and waits for the explicit "Resume sync" item, never auto-resumed here. Idempotent: acts only while sync is paused.
+  _maybeAutoResume() {
+    try {
+      if (this.lockState.isAccountUsable()) return;                  // already active — nothing to resume
+      if (!UNATTENDED.has(this.lockState.snapshot().reason)) return; // a manual lock waits for the Resume item
+      this.lockState.resumeAccount();
+    } catch { /* the SoT surfaces its own errors; never break the poll */ }
   }
 
   _trigger(reason) {
@@ -114,7 +131,7 @@ class AutoLock {
     if (this._escalateTimer) return; // one pending escalation is enough
     this._escalateTimer = this._setTimeout(() => {
       this._escalateTimer = null;
-      if (this.lockState.isUnlocked()) return; // unlocked again -> the user came back; leave the window
+      if (this.lockState.isUnlocked() || this.lockState.isAccountUsable()) return; // came back (ZK unlock OR account resume) -> leave the window
       const win = this.getWindow();
       if (win && !win.isDestroyed() && typeof win.destroy === 'function') {
         try { win.destroy(); } catch { /* already gone */ }

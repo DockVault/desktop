@@ -112,11 +112,17 @@ test('FAIL-CLOSED escalation: a renderer purge that TIMES OUT escalates P1 -> P2
   assert.strictEqual(ok, true);
 });
 
-test('the account-session lifecycle is separate — lock only affects the ZK unlocked state', async () => {
+test('the two lock tiers are separate — a lock pauses account-tier sync + drops the ZK key; resumeAccount is ZK-independent', async () => {
   const ls = new LockState({ getWindow: () => null, getDaemon: () => null, timeouts: FAST });
-  ls.markUnlocked();
+  ls.markUnlocked();                                   // ZK key present
+  assert.strictEqual(ls.isAccountUsable(), true, 'account-tier sync usable before any lock');
   await ls.lock('idle');
-  assert.deepStrictEqual(ls.snapshot(), { unlocked: false, reason: 'idle' });
-  // There is no API on this SoT that clears the account token — the two lifecycles are separate by
-  // construction, so an idle/OS lock can never become an account sign-out.
+  assert.deepStrictEqual(ls.snapshot(), { unlocked: false, appLocked: true, reason: 'idle' });
+  assert.strictEqual(ls.isUnlocked(), false, 'a lock drops the ZK key');
+  assert.strictEqual(ls.isAccountUsable(), false, 'a lock pauses account-tier sync');
+  // The reverse edge re-enables account-tier sync WITHOUT asserting a ZK key — the tiers never conflate.
+  ls.resumeAccount();
+  assert.strictEqual(ls.isAccountUsable(), true, 'resume re-enables account-tier sync');
+  assert.strictEqual(ls.isUnlocked(), false, 'resume NEVER sets the ZK unlocked flag');
+  // There is no API on this SoT that clears the account token — an idle/OS lock can never become an account sign-out.
 });
