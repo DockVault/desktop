@@ -47,9 +47,22 @@ class SyncStatusHub {
 
   _wireDaemon() {
     this._daemon.on('ready', (m) => {
-      const noStore = !!(m && m.encrypted === false);
-      this._sig.daemon = noStore ? 'ready-no-store' : 'ready';
-      if (noStore) this._sig.hasSecureStore = false;
+      const reason = m && m.reason;
+      if (reason === 'db-key-unreadable' || reason === 'db-unreadable') {
+        // The saved sync state EXISTS on this machine but cannot be unlocked/opened (the wrapped key won't
+        // unwrap, or the database itself won't open). This is NOT a benign no-store — it is a real problem
+        // the person must resolve, and it must never present as a calm 'starting' that retries every tick.
+        // The store is present (it just can't be opened), so this is a sync PROBLEM, not an "unavailable"
+        // (no-keychain) — force hasSecureStore true so the problem surfaces instead of reading unavailable.
+        this._sig.daemon = 'init-failed';
+        this._sig.hasSecureStore = true;
+      } else if (m && m.encrypted === false) {
+        // A benign no-store: no secure keychain backend. Nothing durable to sync => unavailable.
+        this._sig.daemon = 'ready-no-store';
+        this._sig.hasSecureStore = false;
+      } else {
+        this._sig.daemon = 'ready';
+      }
       this._sig.crashLoopLatched = false;
       this._recompute();
     });

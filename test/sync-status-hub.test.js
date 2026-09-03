@@ -47,6 +47,30 @@ test('daemon lifecycle drives the state: crash -> paused(reconnecting), crash-lo
   assert.ok(statuses.length > 0);
 });
 
+test("daemon 'ready' with an unreadable-state reason is a non-retrying sync problem, not a benign no-store", () => {
+  const { hub, daemon } = harness();
+  hub.setVaults(['a']);
+  // The wrapped key won't unwrap on this machine: the saved state EXISTS but is locked. A sync PROBLEM,
+  // never a calm 'starting'/'reconnecting', and never a benign 'unavailable'.
+  daemon.emit('ready', { encrypted: false, reason: 'db-key-unreadable' });
+  assert.strictEqual(hub.current().state, STATE.SYNC_PROBLEM);
+  assert.strictEqual(hub.current().reason, 'state-unreadable');
+  // The database itself won't open — same honest problem.
+  daemon.emit('ready', { encrypted: false, reason: 'db-unreadable' });
+  assert.strictEqual(hub.current().state, STATE.SYNC_PROBLEM);
+  assert.strictEqual(hub.current().reason, 'state-unreadable');
+  // A later clean start clears it (the store recovered).
+  daemon.emit('ready', { encrypted: true });
+  assert.notStrictEqual(hub.current().state, STATE.SYNC_PROBLEM);
+});
+
+test("daemon 'ready' encrypted:false with a no-secure-store reason is a benign unavailable, not a problem", () => {
+  const { hub, daemon } = harness();
+  hub.setVaults(['a']);
+  daemon.emit('ready', { encrypted: false, reason: 'no-secure-store' });
+  assert.strictEqual(hub.current().state, STATE.UNAVAILABLE);
+});
+
 test('a must-act item notifies once, not on every recompute, and re-notifies only after it clears and recurs', () => {
   const { hub, notifies } = harness();
   hub.setVaults(['a']);

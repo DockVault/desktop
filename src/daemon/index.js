@@ -98,15 +98,26 @@ function onInit(m) {
     catch (err) { reply({ type: 'error', op: 'sweep-stale-configs', message: String((err && err.message) || err) }); }
   }
   if (!m.dbk) {
-    // Fail-closed: with no key (e.g. a non-secure keychain) the encrypted store is not created and no
-    // zero-knowledge metadata is persisted; background ZK sync stays disabled until a key is available.
-    reply({ type: 'ready', encrypted: false, reason: 'no-key' });
+    // No key was handed in. Two DISTINCT cases, kept distinct because recovery differs: an insecure
+    // keychain backend ('no-secure-store' — nothing durable can be stored, a benign unavailable) versus a
+    // wrapped key that exists on disk but could not be unwrapped ('db-key-unreadable' — the saved state is
+    // present but locked, an honest problem a deliberate reset resolves). Either way the encrypted store is
+    // not created and no zero-knowledge metadata is persisted; the run-state layer reports 'unknown' so no
+    // vault is mistaken for never-run while the store is unavailable.
+    reply({ type: 'ready', encrypted: false, reason: m.keyReason || 'no-secure-store' });
     return;
   }
   const dbk = Buffer.from(m.dbk); // a private copy we control + can zeroize
   try {
     db = stateDb.openStateDb(m.dir, dbk);
     reply({ type: 'ready', encrypted: true });
+  } catch {
+    // The wrapped key unwrapped fine but the database itself could not be opened (a corrupt DB, or a key
+    // that no longer matches this DB). Do NOT let the throw escape as a dropped {type:'error'} that leaves
+    // the supervisor stuck 'starting' forever. Report ready WITHOUT a store and with a typed, bounded reason
+    // so the status layer surfaces an honest, non-retrying problem; the DB file is left intact for a reset.
+    db = null;
+    reply({ type: 'ready', encrypted: false, reason: 'db-unreadable' });
   } finally {
     dbk.fill(0);                          // zeroize our copy
     try { if (m.dbk.fill) m.dbk.fill(0); } catch { /* the transferred view too */ }

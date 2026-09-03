@@ -40,6 +40,34 @@ test('DBK is minted once and then loaded (stable across calls), 32 bytes, not pl
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('an existing wrapped key that FAILS to decrypt is never overwritten — throws db-key-unreadable, bytes intact, recoverable', () => {
+  const dir = tmp();
+  const good = mockSafe('gnome_libsecret');
+  const key = loadOrMintDBK(good, dir);          // mint the real key on true first use
+  const before = fs.readFileSync(dbkPath(dir));  // snapshot the wrapped-key bytes
+  // A TRANSIENT keychain error: decrypt throws for the existing key file. Minting a fresh key over it would
+  // orphan the encrypted DB (only the old key can open it) and destroy the run-state — so it must NOT happen.
+  const flaky = { ...good, decryptString: () => { throw new Error('keychain temporarily unavailable'); } };
+  assert.throws(() => loadOrMintDBK(flaky, dir), (e) => e && e.reason === 'db-key-unreadable',
+    'an undecryptable existing key throws the typed db-key-unreadable, never mints');
+  assert.deepStrictEqual(fs.readFileSync(dbkPath(dir)), before, 'the wrapped-key file bytes are UNCHANGED (no overwrite = no data loss)');
+  // When the keychain recovers, the ORIGINAL key loads again — the encrypted DB is still openable.
+  assert.deepStrictEqual(loadOrMintDBK(good, dir), key, 'the same key is recovered once decrypt works again');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('an existing wrapped key that decrypts to the WRONG LENGTH throws db-key-unreadable, bytes intact', () => {
+  const dir = tmp();
+  const good = mockSafe('gnome_libsecret');
+  loadOrMintDBK(good, dir);
+  const before = fs.readFileSync(dbkPath(dir));
+  // decrypt yields a short (non-32-byte) key — a truncated/corrupt wrapping. Fail closed, do not re-mint.
+  const shortKey = { ...good, decryptString: () => Buffer.from([1, 2, 3]).toString('base64') };
+  assert.throws(() => loadOrMintDBK(shortKey, dir), (e) => e && e.reason === 'db-key-unreadable');
+  assert.deepStrictEqual(fs.readFileSync(dbkPath(dir)), before, 'a wrong-length decrypt leaves the key file bytes unchanged');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('encrypted state DB round-trips, is ciphertext at rest, and rejects a wrong key', () => {
   const dir = tmp();
   const dbk = nodeCrypto.randomBytes(32);

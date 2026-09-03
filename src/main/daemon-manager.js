@@ -134,7 +134,13 @@ class DaemonManager {
         if (e) { this._runStatePending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: true, states: (m.states && typeof m.states === 'object') ? m.states : {} }); }
         break;
       }
-      case 'error': this._emit('error', m); break;
+      case 'error':
+        // Surface the FACT of a daemon-side error for diagnosis — the op only, never the message (which can
+        // carry a path or host). Init failures no longer arrive here (they come back as a typed ready reply);
+        // this catches the rest so none is silently dropped.
+        try { console.error('[sync] daemon error op=' + ((m && m.op) || 'unknown')); } catch { /* ignore */ }
+        this._emit('error', m);
+        break;
       default: break;
     }
   }
@@ -142,9 +148,18 @@ class DaemonManager {
   // Unwrap the DB key with the keychain and hand it in once. Fail-closed: a null key tells the daemon
   // to run without an encrypted store. The main-side copies are zeroized immediately after sending.
   _sendInit() {
-    const dbk = stateDb.loadOrMintDBK(safeStorage, this.dir);
+    let dbk = null;
+    let keyReason = null; // a bounded reason when a wrapped key exists but could not be unwrapped
+    try { dbk = stateDb.loadOrMintDBK(safeStorage, this.dir); }
+    catch (e) {
+      // A wrapped key exists on disk but did not unwrap (a transient keychain error, or a corrupt/rotated
+      // key). loadOrMintDBK deliberately did NOT overwrite it — the existing database is intact but locked.
+      // Start the daemon WITHOUT a key and carry the typed reason so it reports an honest, non-retrying
+      // problem, rather than silently minting a fresh key (which would orphan the database).
+      keyReason = (e && e.reason) || 'db-key-unreadable';
+    }
     const view = dbk ? new Uint8Array(dbk) : null;
-    try { this.child.postMessage({ type: 'init', dir: this.dir, dbk: view, rclone: this.rcloneConfig }); }
+    try { this.child.postMessage({ type: 'init', dir: this.dir, dbk: view, keyReason, rclone: this.rcloneConfig }); }
     finally {
       if (dbk) dbk.fill(0);
       if (view) view.fill(0);

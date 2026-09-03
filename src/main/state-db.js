@@ -8,7 +8,7 @@
  * so the whole database is encrypted with a maintained, vetted whole-database cipher (no column is left
  * queryable in plaintext, so there is no missed-column or blind-index-at-rest risk).
  *
- * Key handling (the key material is reviewed separately by the crypto reviewer):
+ * Key handling:
  *  - The database key (DBK) is 32 random bytes, minted once per device. It is NOT the zero-knowledge key
  *    and NOT passphrase-derived, so the daemon can read the operational columns (relative path, counts)
  *    while the vault is locked — which is what lets a "N changes waiting" state be shown honestly.
@@ -16,8 +16,7 @@
  *    system whose keychain backend is the hardcoded-key fallback, no key is minted and no encrypted
  *    database is created — the sensitive metadata simply never lands on disk there.
  *  - The DBK is fed to the cipher as the raw page key (hex), so the cipher's own passphrase KDF is not
- *    run over an already-random key. The exact cipher/mode is pinned by the crypto reviewer; the default
- *    below is a placeholder the pin replaces.
+ *    run over an already-random key. The exact cipher/mode is pinned in CIPHER below.
  *  - The DBK and database are wiped only when the relationship ends (uninstall / forget-device / reset),
  *    never on an idle-lock. The DBK is never logged and never sent over IPC.
  */
@@ -30,7 +29,7 @@ const { isSecureBackend } = require('./token-store');
 const DBK_FILE = 'state-dbk.bin';
 const DB_FILE = 'state.db';
 
-// Cipher parameters, pinned by the crypto review: the SQLCipher scheme (AES-256-CBC + per-page
+// Cipher parameters (pinned): the SQLCipher scheme (AES-256-CBC + per-page
 // HMAC-SHA512), the SQLCipher-v4 compatibility level (fixes page size and HMAC to explicit values so a
 // library-default shift cannot silently render the DB unreadable), and a raw page key (kdfIter 0 skips
 // the passphrase KDF over an already-random key). On this native build AES has CPU acceleration, so
@@ -41,22 +40,42 @@ function dbkPath(dir) { return path.join(dir, DBK_FILE); }
 function dbPath(dir) { return path.join(dir, DB_FILE); }
 
 /**
- * Load the wrapped DBK, or mint one on first use. Returns a 32-byte Buffer, or null when the keychain
- * backend is not secure (fail-closed: the caller must then NOT persist any zero-knowledge metadata).
+ * Load the wrapped DBK, or mint one on first use. Three outcomes, kept strictly distinct because they
+ * demand different handling:
+ *   - returns a 32-byte Buffer — the key was read, or freshly minted on true first use;
+ *   - returns null — the keychain backend is NOT secure (fail-closed: the caller persists no
+ *     zero-knowledge metadata). The insecure-backend case, NOT a failure to read an existing key;
+ *   - THROWS an Error carrying reason:'db-key-unreadable' — a wrapped key already exists on disk but
+ *     could not be unwrapped into a 32-byte key (a transient keychain error, a wrong length, or a
+ *     truncated file). The existing key is left BYTE-FOR-BYTE intact and NO fresh key is minted:
+ *     overwriting it would orphan the existing encrypted database (only the old key can open it) and
+ *     silently destroy the sync run-state. The caller surfaces an honest, non-retrying problem; recovery
+ *     is a deliberate, user-initiated reset — never an automatic re-mint.
  */
 function loadOrMintDBK(safeStorage, dir) {
   if (!isSecureBackend(safeStorage)) return null;
   const p = dbkPath(dir);
-  try {
-    if (fs.existsSync(p)) {
-      const dbk = Buffer.from(safeStorage.decryptString(fs.readFileSync(p)), 'base64');
-      if (dbk.length === 32) return dbk;
-    }
-  } catch { /* unreadable/rotated -> mint a fresh one below */ }
+  if (fs.existsSync(p)) {
+    let dbk;
+    try { dbk = Buffer.from(safeStorage.decryptString(fs.readFileSync(p)), 'base64'); }
+    catch { throw keyUnreadableError(); }
+    if (dbk.length !== 32) throw keyUnreadableError();
+    return dbk;
+  }
+  // True first use on this device: no wrapped key yet. Mint one and persist it (0600).
   const dbk = nodeCrypto.randomBytes(32);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(p, safeStorage.encryptString(dbk.toString('base64')), { mode: 0o600 });
   return dbk;
+}
+
+// A wrapped key exists but could not be unwrapped to 32 bytes. Typed and bounded (no raw cause, which
+// could carry a path); the caller maps `reason` to an honest, non-retrying status and NEVER overwrites
+// the existing key on this path.
+function keyUnreadableError() {
+  const e = new Error('state-db: the wrapped DBK exists but could not be unwrapped to 32 bytes');
+  e.reason = 'db-key-unreadable';
+  return e;
 }
 
 /**

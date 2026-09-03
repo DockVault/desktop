@@ -174,7 +174,8 @@ function baseVaultState(v, transferring, running, resyncRequired) {
  * @param {boolean} [s.hasSecureStore]  false => 'unavailable' (nothing durable to sync)
  * @param {boolean} [s.locked]          the app is locked => paused (unless something unresolved outranks it)
  * @param {boolean} [s.online=true]     false => a calm "waiting to reconnect" (a paused-tier transient)
- * @param {string}  [s.daemon]          supervised-helper lifecycle: 'ready'|'starting'|'crashed'|'stopped'
+ * @param {string}  [s.daemon]          supervised-helper lifecycle: 'ready'|'starting'|'crashed'|'stopped',
+ *   plus 'init-failed' when the saved state exists but its key won't unwrap / its DB won't open (a problem)
  * @param {boolean} [s.crashLoopLatched] the supervisor gave up after repeated crashes => a sync problem
  * @param {Array}   [s.vaults]          per-vault signals (see vaultState)
  * @returns {{state:string, label:string, reason:(string|null), vaults:Array, condition:(string|null)}}
@@ -183,6 +184,14 @@ function computeStatus(s) {
   const store = s.hasSecureStore !== false;
   if (!store) {
     return { state: STATE.UNAVAILABLE, label: LABEL[STATE.UNAVAILABLE], reason: 'no-secure-store', vaults: [], condition: 'unavailable' };
+  }
+  // The saved sync state exists but cannot be unlocked/opened on this machine (its wrapped key won't
+  // unwrap, or the database itself won't open). A real, NON-retrying problem that must surface even before
+  // the per-vault view — and even when the vault list cannot be read because the store is down, so it is
+  // never masked as "not configured". The person's files are untouched; sync is paused until it is reset.
+  if (s.daemon === 'init-failed') {
+    const vaults = Array.isArray(s.vaults) ? s.vaults.map(vaultState) : [];
+    return { state: STATE.SYNC_PROBLEM, label: LABEL[STATE.SYNC_PROBLEM], reason: 'state-unreadable', vaults, condition: null };
   }
   const vaults = Array.isArray(s.vaults) ? s.vaults.map(vaultState) : [];
   if (vaults.length === 0) {

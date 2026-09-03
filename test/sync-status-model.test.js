@@ -13,6 +13,18 @@ test('no secure store => unavailable (sync is not dressed up as a running state)
   assert.strictEqual(r.condition, 'unavailable');
 });
 
+test("a daemon 'init-failed' is a non-retrying sync problem, surfaced even with no readable vaults", () => {
+  // The saved state exists but its key won't unwrap / its DB won't open. The aggregate must be a SYNC_PROBLEM
+  // ('state-unreadable'), never a calm 'reconnecting', and never masked as 'not configured' when the vault
+  // list cannot be read because the store is down.
+  const withVaults = computeStatus({ hasSecureStore: true, daemon: 'init-failed', vaults: [{ vault: 'v1', lastResult: 'ok' }] });
+  assert.strictEqual(withVaults.state, STATE.SYNC_PROBLEM);
+  assert.strictEqual(withVaults.reason, 'state-unreadable');
+  const noVaults = computeStatus({ hasSecureStore: true, daemon: 'init-failed', vaults: [] });
+  assert.strictEqual(noVaults.state, STATE.SYNC_PROBLEM, 'never masked as not-configured when the store is down');
+  assert.strictEqual(noVaults.reason, 'state-unreadable');
+});
+
 test('no vault configured => not-configured (never a false green)', () => {
   const r = computeStatus({ ...secure, vaults: [] });
   assert.strictEqual(r.state, STATE.NOT_CONFIGURED);
