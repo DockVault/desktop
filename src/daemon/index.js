@@ -26,7 +26,7 @@
  *   child  -> parent : { type: 'hello' }          sent once the child is up, before init
  *                     { type: 'ready', encrypted, reason? }
  *                     { type: 'pong', t }         { type: 'sync-status', id, ok, version?, error? }
- *                     { type: 'sftp-cred-ack', id, ok, error? }   (never echoes the cred or the config)
+ *                     { type: 'sftp-cred-ack', id, ok, sub? }   (never echoes the cred, the config, or a raw error message; `sub` is a typed reason enum only)
  *                     { type: 'run-state-result', id, states }    per-vault { lastResult, resyncRequired }, null
  *                       (a real missing row = never-run), or 'unknown' (unreadable / no state DB — not never-run)
  *                     { type: 'sync-run-result', id, ok, ran?, result?, resyncRequired?, needsAttention?,
@@ -131,7 +131,7 @@ async function onSyncStatus(m) {
 // reports readiness only — never the credential or the config.
 async function onSftpCred(m) {
   const b = (m && m.bundle) || {};
-  if (!rclone) { reply({ type: 'sftp-cred-ack', id: m.id, ok: false, error: 'rclone not configured' }); return; }
+  if (!rclone) { reply({ type: 'sftp-cred-ack', id: m.id, ok: false }); return; }
   try {
     if (!syncReady) syncReady = await rclone.ready();
     const obscuredPass = await rclone.obscure(b.password);
@@ -142,7 +142,10 @@ async function onSftpCred(m) {
     reply({ type: 'sftp-cred-ack', id: m.id, ok: true });
   } catch (err) {
     sftpConfig = null;
-    reply({ type: 'sftp-cred-ack', id: m.id, ok: false, error: String((err && err.message) || err) });
+    // Never surface the raw error text to main: an rclone/obscure failure message can carry the host or a
+    // path. The ack reports failure only; the caller derives an honest reason. When the helper later carries a
+    // typed `sub` enum, the surfaced reason enriches with no change here — the raw string never leaves the helper.
+    reply({ type: 'sftp-cred-ack', id: m.id, ok: false });
   }
 }
 

@@ -109,7 +109,10 @@ class DaemonManager {
       }
       case 'sftp-cred-ack': {
         const e = this._credPending.get(m.id);
-        if (e) { this._credPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, error: m.error || null }); }
+        // Carry a typed reason enum (`sub`) only — never a free-text error. The helper stopped echoing raw
+        // failure strings (which could carry a host or path); `sub` stays null until the helper carries a typed
+        // reason enum, at which point the surfaced reason enriches with no change here.
+        if (e) { this._credPending.delete(m.id); clearTimeout(e.timer); e.resolve({ ok: !!m.ok, sub: m.sub || null }); }
         break;
       }
       case 'sync-run-result': {

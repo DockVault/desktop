@@ -161,9 +161,26 @@ test('clearSftpCred() sends sftp-cred-clear and resolves ok on the ack; ok (vacu
   assert.strictEqual(sent.type, 'sftp-cred-clear');
   assert.ok(typeof sent.id === 'number');
   mgr._onMessage({ type: 'sftp-cred-ack', id: sent.id, ok: true });
-  assert.deepStrictEqual(await p, { ok: true, error: null });
+  assert.deepStrictEqual(await p, { ok: true, sub: null });
   mgr.child = null;
   assert.deepStrictEqual(await mgr.clearSftpCred(20), { ok: true }, 'no daemon holds no credential — nothing to clear');
+});
+
+test('sftp-cred-ack carries only the typed `sub` enum, never a raw error string (leak-close)', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  let sent = null;
+  mgr.child = { postMessage: (m) => { sent = m; } };
+  // A failure ack from a helper that no longer echoes the raw error resolves with sub:null (=> the caller
+  // maps to a generic, honest reason), and any stray `error` the helper might send is dropped, never passed on.
+  const p1 = mgr.sendSftpCred({ vault: 'v1', host: 'h', port: 22, user: 'u', password: 'p', hostKeys: ['k'] }, 1000);
+  mgr._onMessage({ type: 'sftp-cred-ack', id: sent.id, ok: false, error: 'raw failure text that could carry a host or path' });
+  const r1 = await p1;
+  assert.deepStrictEqual(r1, { ok: false, sub: null }, 'a raw error on the ack is dropped, not surfaced');
+  assert.ok(!('error' in r1), 'the resolved ack never carries an error field');
+  // Forward-compat: when the helper later carries a typed reason, `sub` passes through unchanged.
+  const p2 = mgr.sendSftpCred({ vault: 'v1', host: 'h', port: 22, user: 'u', password: 'p', hostKeys: ['k'] }, 1000);
+  mgr._onMessage({ type: 'sftp-cred-ack', id: sent.id, ok: false, sub: 'helper-version-mismatch' });
+  assert.deepStrictEqual(await p2, { ok: false, sub: 'helper-version-mismatch' });
 });
 
 test('runStates() round-trips the per-vault snapshot; null for a never-run vault', async () => {

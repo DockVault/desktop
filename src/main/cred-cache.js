@@ -46,7 +46,7 @@ class CredCache {
   /**
    * @param {object} io
    * @param {(vaultId:string)=>Promise<{user:string,password:string,hostKeys:string,expiresAt:string,host?:string,port?:number}>} io.mint  mint a fresh single-use access bundle (mintSftpAccess)
-   * @param {(bundle:object)=>Promise<{ok:boolean,error?:string}>} io.send  hand the helper the bundle (sendSftpCred)
+   * @param {(bundle:object)=>Promise<{ok:boolean,sub?:string}>} io.send  hand the helper the bundle (sendSftpCred). On failure it carries a typed reason enum (`sub`) only — never a raw error string.
    * @param {()=>number} [io.now]
    */
   constructor(io = {}) {
@@ -76,7 +76,10 @@ class CredCache {
     catch (e) { this._zeroize(bundle); this._zeroize(access); return { ok: false, reason: (e && e.reason) || 'cred-send-failed' }; }
     // The helper now holds the obscured cred for its single run; drop our plaintext references.
     this._zeroize(bundle); this._zeroize(access);
-    if (!ack || !ack.ok) return { ok: false, reason: (ack && ack.error) || 'cred-send-failed' };
+    // Surface only the helper's TYPED reason enum (`sub`), never a raw error string it might carry — an
+    // rclone/obscure failure message can hold the host or a path. A missing/untyped failure collapses to the
+    // known 'cred-send-failed', which counts toward not-syncing (escalates) rather than retrying forever.
+    if (!ack || !ack.ok) return { ok: false, reason: (ack && ack.sub) || 'cred-send-failed' };
     return { ok: true };
   }
 
