@@ -595,6 +595,9 @@ function notifyMustAct(item) {
 
 function mustActBody(item) {
   if (item && item.kind === 'restart') return 'Sync stopped working. Your files are safe. Open DockVault to restart it.';
+  // The unlock-and-reopen guidance already carries its own reassurance and next step — use it verbatim rather
+  // than appending the generic "Your files are safe." (which it already states).
+  if (item && item.kind === 'reopen') return (item && item.label) || 'DockVault could not read its saved sync state. Your files are safe.';
   const base = (item && item.label) || 'A sync item needs your attention';
   return `${base}. Your files are safe.`;
 }

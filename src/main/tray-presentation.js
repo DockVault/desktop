@@ -98,6 +98,9 @@ function itemForVault(v) {
     case 'folder-problem': return { kind: 'recover-folder', vault: v.vault, label: `The sync folder for ${v.vault} is shared again — make it private` };
     case 'folder-insecure':
     case 'folder-rejected': return { kind: 'choose-folder', vault: v.vault, label: `The sync folder for ${v.vault} can't be used — choose a folder again` };
+    // A code fault in our OWN sync path — own it plainly so the person doesn't go hunting their own
+    // connection/sign-in/keychain for a fault only we can fix. (A "Report a problem" action is a follow-up.)
+    case 'sync-error': return { kind: 'open', vault: v.vault, label: "Something in DockVault's own sync step failed — this is on our side, not your connection or sign-in." };
     default: return { kind: 'open', vault: v.vault, label: `Sync problem with ${v.vault}` };
   }
 }
@@ -108,6 +111,12 @@ function mustActItems(model) {
   // A stuck helper is one global action: restart it deliberately.
   if (model.state === STATE.SYNC_PROBLEM && model.reason === 'sync-stopped') {
     items.push({ kind: 'restart', label: 'Restart sync' });
+  }
+  // The saved state can't be unlocked on this machine. Give the real, NON-destructive next step available
+  // now (no dedicated button needed): unlock the login keychain and reopen. Clicking opens the app (the
+  // "reopen" half); the deliberate "Reset sync state" is a follow-up, appended to this copy only when it ships.
+  if (model.state === STATE.SYNC_PROBLEM && model.reason === 'state-unreadable') {
+    items.push({ kind: 'reopen', label: "The saved sync state can't be unlocked on this machine — your files are safe and sync is paused. Try unlocking your login keychain and reopening DockVault." });
   }
   for (const v of model.vaults) {
     if (v.state === STATE.NEEDS_DECISION || v.state === STATE.SYNC_PROBLEM) items.push(itemForVault(v));

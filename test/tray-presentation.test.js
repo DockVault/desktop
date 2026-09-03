@@ -40,6 +40,22 @@ test("a code-fault sync problem reads as a calm, honest 'sync step hit a problem
   assert.match(tooltip(m, 'unlocked'), /a sync step hit a problem/);
 });
 
+test('state-unreadable surfaces the unlock-and-reopen guidance as a must-act item, no dead reset reference', () => {
+  const m = computeStatus({ hasSecureStore: true, daemon: 'init-failed', vaults: [vault({ lastResult: 'ok' })] });
+  const it = mustActItems(m).find((x) => x.kind === 'reopen');
+  assert.ok(it, 'a reopen-guidance must-act item is present (a real next step now)');
+  assert.match(it.label, /unlocking your login keychain and reopening/);
+  assert.doesNotMatch(it.label, /reset/i); // no dangling reset reference until that button ships
+});
+
+test('a sync-error vault owns the fault in its must-act item (our side, not the user)', () => {
+  const m = computeStatus({ ...secure, vaults: [vault({ lastResult: 'sync-error' })] });
+  const it = mustActItems(m).find((x) => x.vault === 'v');
+  assert.ok(it);
+  assert.match(it.label, /on our side/);
+  assert.match(it.label, /not your connection or sign-in/);
+});
+
 test('the calm states carry a short why-suffix; up to date is bare', () => {
   assert.strictEqual(tooltip(computeStatus({ ...secure, vaults: [vault({ lastResult: 'ok' })] }), 'unlocked'), 'DockVault — Up to date');
   assert.strictEqual(tooltip(computeStatus({ ...secure, vaults: [vault({ lastResult: 'host-key-unverified' })] }), 'unlocked'), 'DockVault — Paused · cannot verify the server yet');
