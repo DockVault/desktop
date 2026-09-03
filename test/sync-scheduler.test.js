@@ -18,7 +18,9 @@ function harness(over = {}) {
     secureFolder: over.secureFolder || ((f) => { calls.secureFolder.push(f); return { ok: true }; }),
     classify: over.classify || ((f) => { calls.classify.push(f); return { ok: true }; }),
     refreshCred: over.refreshCred || (async (v) => { calls.refreshCred.push(v); return { ok: true }; }),
-    helperReady: over.helperReady, // undefined by default -> gate treats the helper as ready (other tests unaffected)
+    // The gate fails CLOSED on a missing helperReady, so the harness always wires one; a test that wants a
+    // not-ready helper passes its own over.helperReady. (Production wires it via makeSchedulerIo; see the io-contract test.)
+    helperReady: over.helperReady || (async () => ({ ok: true })),
     confirmFirstUpload: over.confirmFirstUpload,
     vaultHasPassword: over.vaultHasPassword, // undefined by default -> remap inactive (existing sign-in behaviour)
     runSync: over.runSync || (async (spec) => { calls.runSync.push(spec.vaultId); return { result: 'ok', ran: true }; }),
@@ -58,6 +60,33 @@ test('gate-before-mint: a READY helper proceeds to mint + run', async () => {
   await settle(sch);
   assert.deepStrictEqual(calls.refreshCred, ['a'], 'a ready helper mints');
   assert.deepStrictEqual(calls.runSync, ['a']);
+});
+
+test('gate-before-mint fails CLOSED: an io with NO helperReady refuses (never mints) — a mis-wired gate cannot fall open', async () => {
+  const log = [];
+  const calls = { refreshCred: [], runSync: [] };
+  // A deliberately mis-wired io: everything a run needs EXCEPT helperReady. A missing gate must NOT fall open.
+  const io = {
+    listConfigured: () => [vault('a')],
+    runState: () => ({ lastResult: 'ok', resyncRequired: false }),
+    session: () => ({ locked: false, online: true, accountLive: true }),
+    verifyEligible: async (v) => ({ ok: true, remotePath: v.toUpperCase() }),
+    secureFolder: () => ({ ok: true }),
+    classify: () => ({ ok: true }),
+    refreshCred: async (v) => { calls.refreshCred.push(v); return { ok: true }; },
+    // helperReady: DELIBERATELY ABSENT
+    runSync: async (spec) => { calls.runSync.push(spec.vaultId); return { result: 'ok', ran: true }; },
+    runResync: async (spec) => { calls.runSync.push(spec.vaultId); return { result: 'resync-ok', ran: true }; },
+    onEvent: (vaultId, ev) => { log.push({ vaultId, ...ev }); },
+  };
+  const sch = new SyncScheduler(io);
+  sch.requestSync('a');
+  for (let i = 0; i < 300 && (sch._busy || sch._queue.length); i++) await new Promise((r) => setTimeout(r, 2));
+  const ev = log.find((e) => e.vaultId === 'a' && e.phase === 'refused');
+  assert.ok(ev, 'a missing helperReady refuses at the gate');
+  assert.strictEqual(ev.reason, 'helper-not-ready', 'fail-closed reason, not a silent proceed');
+  assert.deepStrictEqual(calls.refreshCred, [], 'no mint — the gate did not fall open');
+  assert.deepStrictEqual(calls.runSync, [], 'and no run');
 });
 
 test('never-run vault -> INITIAL resync via runResync (never a plain runSync)', async () => {

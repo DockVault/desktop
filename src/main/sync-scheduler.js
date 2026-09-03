@@ -162,7 +162,10 @@ class SyncScheduler {
       // 'helper-not-ready' — the reason is set HERE, unconditionally, for EVERY not-ready result (any sub, or
       // none), so an unknown sub can never fall through to a calm retry; the sub rides only as a detail. This
       // SKIPS the mint, so a not-ready helper never burns a single-use server credential.
-      const hr = io.helperReady ? await io.helperReady() : { ok: true };
+      // A MISSING io.helperReady is a wiring fault, not a green light: fail CLOSED (treat the helper as not
+      // ready) so a gate that was never wired can never mint a credential — the io-contract test guarantees the
+      // method is present in production, so this fallback is only reachable in a mis-wired build or a bare test.
+      const hr = typeof io.helperReady === 'function' ? await io.helperReady() : { ok: false, sub: 'prepare-failed' };
       if (!hr || !hr.ok) { this._emit(vaultId, { phase: 'refused', reason: 'helper-not-ready', sub: (hr && hr.sub) || null, installed: (hr && hr.installed) || null }); return; }
 
       // Refresh + re-send the credential before dispatch; a refresh failure fails closed. A readiness/prepare

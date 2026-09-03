@@ -141,13 +141,28 @@ test('runSync() resolves not-ok when there is no daemon, or the send fails', asy
   assert.deepStrictEqual(await mgr.runSync({ vault: 'v', local: 'l', remotePath: 'p' }, 20), { ok: false, ran: false, error: 'send failed' });
 });
 
-test('a daemon exit mid-run resolves the pending bisync as not-ok (never hangs)', async () => {
+test('a daemon exit mid-run resolves the pending bisync as not-ok with a typed reason (never hangs)', async () => {
   const mgr = new DaemonManager('/nonexistent');
   mgr.stopping = true;
   mgr.child = { postMessage: () => {} };
   const p = mgr.runSync({ vault: 'v', local: 'l', remotePath: 'p' }, 5000);
   mgr._onExit(1);
-  assert.deepStrictEqual(await p, { ok: false, ran: false, error: 'daemon exited' });
+  // A daemon exit resolves in-flight requests with a BOUNDED typed reason ('daemon-exited'), never a free-text
+  // string — consistent with the op-only error events, so no raw text rides the exit path either.
+  assert.deepStrictEqual(await p, { ok: false, ran: false, reason: 'daemon-exited' });
+});
+
+test('a daemon exit resolves in-flight status + cred requests with the same typed reason (no free-text, no bundle echo)', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  mgr.stopping = true;
+  mgr.child = { postMessage: () => {} };
+  const ps = mgr.syncStatus(5000);
+  const pc = mgr.sendSftpCred({ host: 'h', port: 22, user: 'u', password: 'topsecret', hostKeys: 'k' }, 5000);
+  mgr._onExit(1);
+  assert.deepStrictEqual(await ps, { ok: false, version: null, reason: 'daemon-exited' });
+  const cred = await pc;
+  assert.deepStrictEqual(cred, { ok: false, reason: 'daemon-exited' }, 'typed reason only — no free-text error, no credential echoed back');
+  assert.ok(!JSON.stringify(cred).includes('topsecret'), 'the bundle never rides the exit resolve');
 });
 
 // ---- crash-loop ceiling ----

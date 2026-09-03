@@ -33,7 +33,7 @@
  *                        code?, error? }  (a summarized, typed outcome only — never raw output or the cred)
  *                     { type: 'sync-progress', vault, files, bytes }  (in-flight; the TWO aggregate integers
  *                        only — never a line, never a file path; unsolicited, no id, fired as a transfer moves)
- *                     { type: 'bye' }             { type: 'error', op, message }
+ *                     { type: 'bye' }             { type: 'error', op }   (op only — never a raw message)
  *
  * The key is used only to open the database and is then zeroized in this process; it is never logged.
  */
@@ -42,6 +42,7 @@ const path = require('node:path');
 const stateDb = require(path.join(__dirname, '..', 'main', 'state-db'));
 const { RcloneRunner } = require('./rclone-runner');
 const ephemeralConfig = require('./ephemeral-config');
+const { deriveCredSub } = require('./helper-sub');
 const syncEngine = require('./sync-engine');
 const { runVaultSync } = require('./sync-run');
 
@@ -95,7 +96,7 @@ function onInit(m) {
     // Crash-sweep: remove any per-run cred config orphaned by a prior crash before sync resumes.
     // Fail-closed — a lingering cred file is surfaced, never left silently.
     try { ephemeralConfig.sweepStaleConfigs(rcloneRunDir); }
-    catch (err) { reply({ type: 'error', op: 'sweep-stale-configs', message: String((err && err.message) || err) }); }
+    catch { reply({ type: 'error', op: 'sweep-stale-configs' }); } // op only — a raw error message never reaches the wire
   }
   if (!m.dbk) {
     // No key was handed in. Two DISTINCT cases, kept distinct because recovery differs: an insecure
@@ -168,13 +169,12 @@ async function onSftpCred(m) {
   } catch (err) {
     sftpConfig = null;
     if (rclone && !rclone.isVerified()) syncReady = null; // rail flipped unverified — drop the stale cache
-    // Categorize WHY the helper could not prepare a credential into ONE bounded, leak-safe sub-reason. The runner
-    // tags its errors (checksum-mismatch / binary-missing / spawn-failed / version-mismatch / obscure-failed); a
-    // malformed config is named here as the FIXED enum value (the message is only TESTED, never surfaced);
-    // anything else is the generic 'prepare-failed'. The ack carries the enum + the non-secret installed/pinned
-    // strings ONLY — never the raw message, path, or SHA (that would reopen the raw-error leak).
-    const sub = (err && typeof err.subReason === 'string') ? err.subReason
-      : (/invalid sftp config value|invalid remote name/i.test(String((err && err.message) || '')) ? 'config-format-failed' : 'prepare-failed');
+    // Categorize WHY the helper could not prepare a credential into ONE bounded, leak-safe sub-reason (see
+    // deriveCredSub): a runner-tagged failure passes through, a malformed config becomes the FIXED enum
+    // 'config-format-failed' (message TESTED, never surfaced), anything else is the generic 'prepare-failed'.
+    // The ack carries the enum + the non-secret installed/pinned strings ONLY — never the raw message, path,
+    // or SHA (that would reopen the raw-error leak).
+    const sub = deriveCredSub(err);
     const installed = err && err.installed != null ? String(err.installed) : null;
     const pinned = err && err.pinned != null ? String(err.pinned) : null;
     reply({ type: 'sftp-cred-ack', id: m.id, ok: false, sub, installed, pinned });
@@ -301,10 +301,10 @@ process.parentPort.on('message', (event) => {
         db = null;
         reply({ type: 'bye' });
         break;
-      default: reply({ type: 'error', op: String(m.type), message: 'unknown message' });
+      default: reply({ type: 'error', op: String(m.type) });
     }
-  } catch (err) {
-    reply({ type: 'error', op: String(m && m.type), message: String((err && err.message) || err) });
+  } catch {
+    reply({ type: 'error', op: String(m && m.type) }); // op only — a handler throw's raw message never reaches the wire
   }
 });
 

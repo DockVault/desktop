@@ -175,13 +175,13 @@ class DaemonManager {
     for (const e of this._lockPending.values()) { clearTimeout(e.timer); e.resolve(true); }
     this._lockPending.clear();
     // A dead daemon can't answer a status request — resolve any in-flight one as not-ok, never hang.
-    for (const e of this._statusPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, version: null, error: 'daemon exited' }); }
+    for (const e of this._statusPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, version: null, reason: 'daemon-exited' }); }
     this._statusPending.clear();
-    for (const e of this._credPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, error: 'daemon exited' }); }
+    for (const e of this._credPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, reason: 'daemon-exited' }); }
     this._credPending.clear();
     // A dead daemon can't finish a bisync — resolve any in-flight run as not-ok (never hang). It stays
     // fail-closed: the caller sees a failed run and the resync block (if any) is untouched on disk.
-    for (const e of this._syncPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, ran: false, error: 'daemon exited' }); }
+    for (const e of this._syncPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, ran: false, reason: 'daemon-exited' }); }
     this._syncPending.clear();
     // A dead daemon can't answer a run-state query — resolve any in-flight one as a FAILURE (ok:false),
     // distinct from a successful-but-empty snapshot, so the caller fails closed (never reads it as
