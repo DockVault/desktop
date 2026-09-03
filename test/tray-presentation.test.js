@@ -27,6 +27,19 @@ test('a configured-but-never-run vault reads the set-up-not-running label, never
   assert.doesNotMatch(tooltip(m, 'unlocked'), /Syncing/);
 });
 
+test('an unreadable saved-state problem reassures the reader their files are safe', () => {
+  const m = computeStatus({ hasSecureStore: true, daemon: 'init-failed', vaults: [vault({ lastResult: 'ok' })] });
+  assert.strictEqual(m.state, STATE.SYNC_PROBLEM);
+  assert.strictEqual(m.reason, 'state-unreadable');
+  assert.match(tooltip(m, 'unlocked'), /your files are safe/);
+});
+
+test("a code-fault sync problem reads as a calm, honest 'sync step hit a problem'", () => {
+  const m = computeStatus({ ...secure, vaults: [vault({ lastResult: 'sync-error' })] });
+  assert.strictEqual(m.state, STATE.SYNC_PROBLEM);
+  assert.match(tooltip(m, 'unlocked'), /a sync step hit a problem/);
+});
+
 test('the calm states carry a short why-suffix; up to date is bare', () => {
   assert.strictEqual(tooltip(computeStatus({ ...secure, vaults: [vault({ lastResult: 'ok' })] }), 'unlocked'), 'DockVault — Up to date');
   assert.strictEqual(tooltip(computeStatus({ ...secure, vaults: [vault({ lastResult: 'host-key-unverified' })] }), 'unlocked'), 'DockVault — Paused · cannot verify the server yet');

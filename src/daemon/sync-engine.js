@@ -122,6 +122,10 @@ const CRED_REASON_RESULT = Object.freeze({
   'host-key-mismatch': 'host-key-mismatch',
   'host-key-unavailable': 'host-key-unverified',
   'no-session': 'auth-failed',
+  // A code fault in the credential path (the provider threw, or an unclassified internal error) is a distinct
+  // NON-retrying problem, never the generic retryable 'error'.
+  'provider-error': 'sync-error',
+  'internal-error': 'sync-error',
 });
 // A TRANSIENT authority refusal (a lock, or a lost connection, mid-resync) is not a failure: the run simply did
 // not happen, and it must read as the SAME calm skip the pre-dispatch gate emits — never a "couldn't sync"

@@ -65,6 +65,22 @@ test('verifyEligible fails closed when the current name is no longer a single sa
   assert.deepStrictEqual(await verify('v1'), { ok: false, reason: 'bad-vault-name' });
 });
 
+test('verifyEligible: a genuine transport failure is a retryable vault-list-unavailable', async () => {
+  const verify = makeVerifyEligible({
+    fetchStandard: async () => { const e = new Error('server down'); e.status = 503; throw e; },
+    remotePathForVault,
+  });
+  assert.deepStrictEqual(await verify('v1'), { ok: false, reason: 'vault-list-unavailable' });
+});
+
+test('verifyEligible: a CODE fault (no status, no network code) is a non-retryable internal-error, not a retryable list-unavailable', async () => {
+  const verify = makeVerifyEligible({
+    fetchStandard: async () => { throw new TypeError('x is not a function'); }, // a bug in our own path
+    remotePathForVault,
+  });
+  assert.deepStrictEqual(await verify('v1'), { ok: false, reason: 'internal-error' });
+});
+
 test('applySchedulerEvent: a dispatched run is quiet until it transfers; a transfer shows syncing; done records the outcome', () => {
   const hub = hubWithVault();
   applySchedulerEvent(hub, 'v1', { phase: 'running' });
@@ -91,6 +107,19 @@ test('applySchedulerEvent: an error reads as a sync problem and is never left ru
   applySchedulerEvent(hub, 'v1', { phase: 'error', reason: 'run-failed' });
   assert.strictEqual(vaultOf(hub).state, STATE.SYNC_PROBLEM);
   assert.strictEqual(vaultOf(hub).running, false);
+});
+
+test('applySchedulerEvent: a code fault (internal-error / provider-error) is a distinct non-retrying sync problem, in any phase', () => {
+  // Pre-dispatch: an eligibility or mint code fault surfaces as a refused/paused reason.
+  let hub = hubWithVault();
+  applySchedulerEvent(hub, 'v1', { phase: 'refused', reason: 'internal-error' });
+  assert.strictEqual(vaultOf(hub).state, STATE.SYNC_PROBLEM);
+  assert.strictEqual(vaultOf(hub).reason, 'sync-error', 'a distinct sync-error, not the generic retryable error');
+  // Run-time: the per-step credential provider threw, surfacing as a skipped reason mid-resync.
+  hub = hubWithVault();
+  applySchedulerEvent(hub, 'v1', { phase: 'skipped', reason: 'provider-error' });
+  assert.strictEqual(vaultOf(hub).state, STATE.SYNC_PROBLEM);
+  assert.strictEqual(vaultOf(hub).reason, 'sync-error');
 });
 
 test('applySchedulerEvent: blocked marks the resync-owed latch (needs a decision), does no work', () => {

@@ -17,6 +17,7 @@
  */
 
 const { STATE } = require('./sync-status-model');
+const { isTransportError } = require('./net-errors');
 
 /**
  * Bind the scheduler's run effects to a ready helper handle whose runSync(spec) takes
@@ -42,7 +43,15 @@ function makeVerifyEligible({ fetchStandard, remotePathForVault }) {
   return async (vaultId) => {
     let res;
     try { res = await fetchStandard(); }
-    catch (e) { return { ok: false, reason: (e && e.reason) || 'vault-list-unavailable' }; }
+    catch (e) {
+      if (e && e.reason) return { ok: false, reason: e.reason };
+      // A genuine fetch/transport failure is a retryable 'vault-list-unavailable'. A code fault (no status, no
+      // network code) is NOT connectivity — surface it as a non-retryable 'internal-error' and log its
+      // class/code, rather than retrying a programming bug forever behind the retryable reason.
+      if (isTransportError(e)) return { ok: false, reason: 'vault-list-unavailable' };
+      try { console.error('[sync] eligibility internal error:', (e && e.name) || 'Error', (e && e.code) || ''); } catch { /* ignore */ }
+      return { ok: false, reason: 'internal-error' };
+    }
     const v = (res && res.vaults || []).find((x) => x && x.vaultId === vaultId);
     if (!v) return { ok: false, reason: 'not-standard-or-removed' }; // re-tiered / renamed-away id / deleted → all fail closed
     let remotePath;
@@ -146,6 +155,10 @@ function applySchedulerEvent(hub, vaultId, ev) {
   const phase = ev && ev.phase;
   const reason = ev && ev.reason;
   if (reason === 'host-key-mismatch') { hub.recordOutcome(vaultId, { result: 'host-key-mismatch' }); return; }
+  // A code fault in our OWN path — a credential provider that threw, or an unclassified internal error — is a
+  // NON-retrying problem regardless of the phase it surfaced in. Record it as a distinct sync-problem outcome
+  // so it reads as a problem at once, never the generic retryable 'error' that retries-then-escalates.
+  if (reason === 'provider-error' || reason === 'internal-error') { hub.recordOutcome(vaultId, { result: 'sync-error' }); return; }
   switch (phase) {
     case 'running': hub.setRunning(vaultId, true); return;
     case 'done': {

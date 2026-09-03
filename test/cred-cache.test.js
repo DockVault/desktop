@@ -41,6 +41,17 @@ test('ensureSent mints a fresh single-use credential and sends it (pinned host k
   assert.strictEqual(s.sent[0].password, 'p1');
 });
 
+test('ensureSent classifies a mint code-fault as a non-retryable internal-error, a transport failure as retryable mint-failed', async () => {
+  const s = sendRec();
+  // A bug in our own mint path (no status, no network code) must surface at once as a non-retryable problem,
+  // never be retried forever behind the generic 'mint-failed'.
+  const codeFault = new CredCache({ mint: async () => { throw new TypeError('bad call'); }, send: s.send, now: () => NOW });
+  assert.deepStrictEqual(await codeFault.ensureSent('v1'), { ok: false, reason: 'internal-error' });
+  // A genuine transport failure IS a retryable hiccup.
+  const transport = new CredCache({ mint: async () => { const e = new Error('down'); e.status = 503; throw e; }, send: s.send, now: () => NOW });
+  assert.deepStrictEqual(await transport.ensureSent('v1'), { ok: false, reason: 'mint-failed' });
+});
+
 // The consequence-2 regression: the server BURNS a temp credential on first use, so a second dispatch must
 // present a FRESH credential — never re-send the spent one. (The reverse — re-send-until-near-expiry — made
 // the second routine tick fail 'auth-failed' with a latched false "sign in" on a healthy server.)

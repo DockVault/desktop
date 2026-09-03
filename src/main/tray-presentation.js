@@ -28,6 +28,13 @@ const REASON_DETAIL = Object.freeze({
   'cannot-verify-yet': 'cannot verify the server yet',
   'retrying': 'retrying',
   'consent-needed': 'approve syncing to start',
+  // The saved sync state exists but cannot be unlocked/opened on this machine. Lead with reassurance —
+  // the person's actual files are never touched by this — because a bare "sync problem" over an unreadable
+  // database could read as data loss. (The deliberate reset that clears it is a fast-follow.)
+  'state-unreadable': "the saved state can't be unlocked here — your files are safe",
+  // A sync step failed in our own code path (an unclassified internal error, or a credential provider that
+  // threw) rather than a connection/sign-in issue. Honest and non-alarming; not retried forever.
+  'sync-error': 'a sync step hit a problem',
   // 'waiting-first-sync' carries no suffix: the "Waiting to start" label already says it plainly, and
   // a configured-but-never-run vault must read as not-yet-running, never as active "syncing".
 });

@@ -103,6 +103,9 @@ const OUTCOME_STATE = Object.freeze({
   // A must-act — sync is not happening — but framed by DURATION, not danger: it is far more often a
   // connection/sign-in issue than corruption, so its copy stays calm.
   'not-syncing': { state: STATE.SYNC_PROBLEM, reason: 'not-syncing' },
+  // A code fault in our own sync path (a credential provider that threw, or an unclassified internal error),
+  // not a connection issue: a distinct NON-retrying problem, surfaced at once rather than retried as 'error'.
+  'sync-error': { state: STATE.SYNC_PROBLEM, reason: 'sync-error' },
 });
 
 /**

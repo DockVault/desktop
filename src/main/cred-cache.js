@@ -25,9 +25,12 @@
  * Electron, a network, or a real helper.
  */
 
+const { isTransportError } = require('./net-errors');
+
 // Turn a mint/host-key error into a status reason the scheduler can map honestly: an expired/invalid account
-// session (401/403) needs a sign-in; a server that cannot be verified yet is a calm "can't verify"; anything
-// else (throttle, 5xx, network) is a retryable failure. A pre-tagged reason wins.
+// session (401/403) needs a sign-in; a server that cannot be verified yet is a calm "can't verify"; a genuine
+// transport failure (a 5xx or a network code) is a retryable hiccup. A pre-tagged reason wins. An error with
+// NONE of those markers is a code fault in our OWN path, not connectivity — a non-retryable 'internal-error'.
 function classifyMintError(e) {
   const reason = e && e.reason;
   if (reason === 'host-key-unverified') return 'host-key-unavailable';
@@ -39,7 +42,13 @@ function classifyMintError(e) {
   // the browser. Surfaced as 'needs-unlock' (unlock the vault so its password reaches the mint), a must-act.
   if (status === 400 || status === 429) return 'needs-unlock';
   if (status === 401 || status === 403) return 'no-session';
-  return 'mint-failed';
+  // Any other transport/HTTP failure (a 5xx, a recognizable network code) is a genuine, retryable hiccup.
+  if (isTransportError(e)) return 'mint-failed';
+  // No reason, no status, no network code: a CODE fault in our own path (a bad call, a type error), NOT a
+  // connectivity blip. Classify it non-retryable and log its class/code, so a programming fault surfaces as an
+  // honest problem quickly instead of being retried forever as 'mint-failed'.
+  try { console.error('[sync] mint internal error:', (e && e.name) || 'Error', (e && e.code) || ''); } catch { /* ignore */ }
+  return 'internal-error';
 }
 
 class CredCache {

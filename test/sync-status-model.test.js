@@ -25,6 +25,13 @@ test("a daemon 'init-failed' is a non-retrying sync problem, surfaced even with 
   assert.strictEqual(noVaults.reason, 'state-unreadable');
 });
 
+test("a 'sync-error' outcome (a code fault in the sync path) reads as a sync problem, distinct from a retryable run error", () => {
+  const r = computeStatus({ hasSecureStore: true, online: true, daemon: 'ready', vaults: [{ vault: 'v', lastResult: 'sync-error', resyncRequired: false }] });
+  assert.strictEqual(r.state, STATE.SYNC_PROBLEM);
+  assert.strictEqual(r.vaults[0].state, STATE.SYNC_PROBLEM);
+  assert.strictEqual(r.vaults[0].reason, 'sync-error');
+});
+
 test('no vault configured => not-configured (never a false green)', () => {
   const r = computeStatus({ ...secure, vaults: [] });
   assert.strictEqual(r.state, STATE.NOT_CONFIGURED);

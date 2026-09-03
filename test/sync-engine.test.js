@@ -6,8 +6,20 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const nodeCrypto = require('node:crypto');
-const { buildBisyncArgs, runBisync, bisyncWorkdir, MAX_DELETE_PERCENT } = require('../src/daemon/sync-engine');
+const { buildBisyncArgs, runBisync, bisyncWorkdir, MAX_DELETE_PERCENT, credPrepareOutcome } = require('../src/daemon/sync-engine');
 const { openStateDb, getRunState } = require('../src/main/state-db');
+
+test('credPrepareOutcome: a code-fault cred reason (provider-error / internal-error) is a distinct non-retrying sync-error outcome', () => {
+  // Nothing ran, so the resync-owed latch is carried through untouched; the result is the distinct sync-error,
+  // never the generic retryable 'error' (which would retry-then-escalate a code bug forever).
+  const a = credPrepareOutcome('provider-error', true);
+  assert.strictEqual(a.result, 'sync-error');
+  assert.strictEqual(a.ran, false);
+  assert.strictEqual(a.resyncRequired, true);
+  assert.strictEqual(credPrepareOutcome('internal-error', false).result, 'sync-error');
+  // A transient authority refusal stays a calm skip (result null + the reason), unchanged by this.
+  assert.strictEqual(credPrepareOutcome('paused-locked', false).result, null);
+});
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'dv-syn-')); }
 // A fake runner standing in for a ready RcloneRunner: records the argv + options and returns a canned exit.
