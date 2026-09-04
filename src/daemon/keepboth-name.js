@@ -5,8 +5,7 @@
  * resync. When a resync would otherwise overwrite or delete a file's other-side version, that version is
  * preserved under this name so both copies survive.
  *
- * The canonical/original name is NEVER changed - only the diverging copy is renamed to this. The form
- * (from the UX spec) is:
+ * The canonical/original name is NEVER changed - only the diverging copy is renamed to this. The form is:
  *
  *   <base> (conflicting copy from <source>, <friendly date>)<.ext>
  *   e.g. "Q3 Budget (conflicting copy from the vault, Sep 1 2026 2.14pm).xlsx"

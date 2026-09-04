@@ -52,7 +52,7 @@ function bodyForConditionReason(reason, name) {
     case 'helper-unavailable':
       // The sync helper did NOT answer (the daemon is down / restarting) — DISTINCT from 'helper-not-ready'
       // (a misconfigured helper): this one self-recovers, so it is a calm, retryable line, NEVER the "how to
-      // fix it" setup pointer, and never "misconfigured". (Provisional copy — finalized with the human copy pass.)
+      // fix it" setup pointer, and never "misconfigured".
       return `Can't reach the sync helper for ${name} right now — it'll keep trying.`;
     case 'error': return `${name} couldn't sync. Open DockVault to see why.`;
     case 'retrying':

@@ -200,7 +200,7 @@ function applySchedulerEvent(hub, vaultId, ev) {
 
 // The ratified persistent-vs-transient table. A persistent reason yields a live can't-run condition
 // (a non-green honest state); a transient one yields null (keep the last state). Exact reason->state
-// vocabulary owned by the status/UX side; the persistent-vs-transient distinction is the anti-lie rule.
+// vocabulary is a presentation-layer concern; the persistent-vs-transient distinction is the anti-lie rule.
 function conditionForReason(phase, reason) {
   switch (reason) {
     case 'not-standard-or-removed':

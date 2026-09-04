@@ -504,7 +504,7 @@ function showHelperFixDialog(item) {
 
 // The make-private consent dialog, shared by setup and by run-time drift recovery. Its fail-safe default
 // (both the default and the cancel button are "Choose a different folder") means Enter or dismissing the
-// dialog declines — only an explicit "Make it private" click strips access. Wording is provisional (ux).
+// dialog declines — only an explicit "Make it private" click strips access. Wording is provisional.
 async function confirmMakePrivateDialog(folder) {
   const res = await dialog.showMessageBox(mainWindow, {
     type: 'warning', title: 'This folder is shared', noLink: true,

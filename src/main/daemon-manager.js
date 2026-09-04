@@ -222,10 +222,11 @@ class DaemonManager {
    * The deliberate "Restart sync" action. Recovers the helper in BOTH stuck shapes: a crash-LOOPED helper
    * (the ceiling was hit — latched, no live child) AND a WEDGED helper (a live child that stopped responding
    * but never exited, so there is NO latch — the case a persistent 'helper-unavailable' escalates to). It
-   * clears any latch, backoff, and pending respawn, then: if a child is alive it KILLS it so the supervisor's
-   * exit handler respawns exactly ONE fresh helper (never a second concurrent one); if none is alive it spawns
-   * directly. It never no-ops on a wedge — otherwise "Restart sync" would be a phantom for the likelier stuck
-   * shape (a wedged process has no latch, so the old latched-only resume did nothing for it).
+   * clears any latch, backoff, and pending respawn, drains in-flight requests, KILLS a live child if there is
+   * one, and spawns exactly ONE fresh helper DIRECTLY — never a second concurrent one, because the replaced
+   * child's late exit is ignored by the handle guard and so cannot spawn a second. It never no-ops on a wedge —
+   * otherwise "Restart sync" would be a phantom for the likelier stuck shape (a wedged process has no latch, so
+   * the old latched-only resume did nothing for it).
    */
   restart() {
     const old = this.child;
