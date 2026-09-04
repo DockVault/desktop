@@ -157,16 +157,25 @@ class SyncScheduler {
       const cl = io.classify(cfg.localFolder);
       if (!cl || !cl.ok) { this._emit(vaultId, { phase: 'refused', reason: (cl && cl.reason) || 'folder-rejected' }); return; }
 
-      // gate-before-mint: verify the sync helper is READY before minting a single-use credential. A not-ready
-      // helper (wrong version, failed checksum, can't start/prepare) surfaces as the single non-retrying
-      // 'helper-not-ready' — the reason is set HERE, unconditionally, for EVERY not-ready result (any sub, or
-      // none), so an unknown sub can never fall through to a calm retry; the sub rides only as a detail. This
-      // SKIPS the mint, so a not-ready helper never burns a single-use server credential.
+      // gate-before-mint: verify the sync helper is READY before minting a single-use credential. This SKIPS the
+      // mint on ANY not-ready result, so a not-ready helper never burns a single-use server credential. The reply
+      // is then split by SHAPE (see the precedence note below): a typed answer (a `sub`: wrong version, failed
+      // checksum, can't-prepare) is the non-retrying 'helper-not-ready' fix-the-setup lane; a no-answer transport
+      // failure (no sub) is the calm, retryable 'helper-unavailable' lane — a DOWN helper is never misconfigured.
       // A MISSING io.helperReady is a wiring fault, not a green light: fail CLOSED (treat the helper as not
       // ready) so a gate that was never wired can never mint a credential — the io-contract test guarantees the
       // method is present in production, so this fallback is only reachable in a mis-wired build or a bare test.
       const hr = typeof io.helperReady === 'function' ? await io.helperReady() : { ok: false, sub: 'prepare-failed' };
-      if (!hr || !hr.ok) { this._emit(vaultId, { phase: 'refused', reason: 'helper-not-ready', sub: (hr && hr.sub) || null, installed: (hr && hr.installed) || null }); return; }
+      if (!hr || !hr.ok) {
+        // PRECEDENCE: a reply carrying a `sub` is the helper ANSWERING not-ready (a wrong version / failed
+        // checksum / can't-prepare) — the non-retrying, fix-the-setup lane — even if a `reason` also rides along.
+        // A reply with NO sub is a NO-ANSWER transport failure (the daemon is down, timed out, or exited): the
+        // calm, RETRYABLE 'helper-unavailable' lane, so a crashed-but-fine helper is never mislabelled as
+        // misconfigured, and the single must-act on a crash stays the hub's own 'restart'.
+        if (hr && hr.sub) { this._emit(vaultId, { phase: 'refused', reason: 'helper-not-ready', sub: hr.sub, installed: hr.installed || null }); return; }
+        this._emit(vaultId, { phase: 'paused', reason: 'helper-unavailable' });
+        return;
+      }
 
       // Refresh + re-send the credential before dispatch; a refresh failure fails closed. A readiness/prepare
       // failure that surfaces HERE (past the gate) is likewise the non-retrying 'helper-not-ready' + its sub.

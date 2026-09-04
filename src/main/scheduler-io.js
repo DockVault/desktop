@@ -217,6 +217,13 @@ function conditionForReason(phase, reason) {
     // NOT in RETRYABLE_FAILURE_REASONS, so it surfaces once and stays put rather than looping.
     case 'needs-unlock':     return { state: STATE.NEEDS_DECISION, reason: 'needs-unlock' };
     case 'host-key-unavailable': return { state: STATE.PAUSED, reason: 'cannot-verify-yet' }; // older/unverifiable server — calm, not an alarm
+    // The sync helper did NOT answer — the daemon is down, timed out, or exited (a NO-ANSWER transport failure,
+    // never a typed not-ready). Calm + RETRYABLE (below), NOT the non-retrying 'helper-not-ready' misconfigured
+    // lane: a crashed-but-fine helper self-recovers, and the one must-act on a crash is the hub's own 'restart'.
+    // (On the streak path this is intercepted as a retryable — shown as 'reconnecting' below threshold and
+    // escalated to 'sync-stopped'/restart when it persists; this case gives a direct manual press its own honest,
+    // calm line rather than the generic retry default.)
+    case 'helper-unavailable': return { state: STATE.PAUSED, reason: 'helper-unavailable' };
     // The sync helper (rclone) is not ready — a wrong version, a failed checksum, or it could not start/prepare.
     // ONE non-retrying must-act, decided at the gate; the specific sub rides as a DETAIL, never as the reason,
     // so an unknown/new sub can never fall through to the calm 'retrying' default. NOT in RETRYABLE below.
@@ -239,7 +246,7 @@ function conditionForReason(phase, reason) {
 // 'error', these should read as a calm retry at first but must NOT read that way forever: repeated, they
 // mean the vault simply is not syncing. The reasons that already have their own honest state — sign-in,
 // cannot-verify-yet, a host-key mismatch, a bad folder or an unavailable vault — are deliberately NOT here.
-const RETRYABLE_FAILURE_REASONS = new Set(['mint-failed', 'cred-send-failed', 'cred-refresh-failed', 'vault-list-unavailable']);
+const RETRYABLE_FAILURE_REASONS = new Set(['mint-failed', 'cred-send-failed', 'cred-refresh-failed', 'vault-list-unavailable', 'helper-unavailable']);
 
 function isRetryableFailure(phase, reason) {
   if (phase === 'error') return reason !== 'host-key-mismatch'; // a dispatched run that failed (identity alert excluded)
@@ -271,10 +278,18 @@ class StatusSink {
       const n = (this._errors.get(vaultId) || 0) + 1;
       this._errors.set(vaultId, n);
       // Escalate as a CONDITION, not a stored outcome: a later, more specific reason (a sign-in owed, a bad
-      // folder, an unavailable vault) then REPLACES it, instead of a sticky 'not-syncing' outranking and
-      // masking the real fix. The underlying last outcome is left intact and a completed run clears it.
-      if (n >= this._threshold) this._hub.recordCondition(vaultId, { state: STATE.SYNC_PROBLEM, reason: 'not-syncing' });
-      else this._hub.recordCondition(vaultId, { state: STATE.PAUSED, reason: 'retrying' }); // still just a retry
+      // folder, an unavailable vault) then REPLACES it, instead of a sticky problem outranking and masking the
+      // real fix. The underlying last outcome is left intact and a completed run clears it.
+      //
+      // A DOWN helper (a no-answer transport failure — the daemon wedged, crashed, or exited) has ONE honest
+      // remedy whether it crash-LOOPED or WEDGED: restart it. So a persistent 'helper-unavailable' escalates to
+      // 'sync-stopped'/restart — never 'not-syncing'/"check your connection", which would misattribute the cause
+      // and offer no working fix — and reads 'reconnecting' while it retries. This shares the restart lane with a
+      // crash-loop latch, so a wedged helper (which has no latch) still reaches the same "restart it". Every other
+      // retryable failure keeps the generic 'retrying' -> 'not-syncing'.
+      const down = reason === 'helper-unavailable';
+      if (n >= this._threshold) this._hub.recordCondition(vaultId, { state: STATE.SYNC_PROBLEM, reason: down ? 'sync-stopped' : 'not-syncing' });
+      else this._hub.recordCondition(vaultId, { state: STATE.PAUSED, reason: down ? 'helper-unavailable' : 'retrying' }); // helper-unavailable reads 'reconnecting'
       return;
     }
     applySchedulerEvent(this._hub, vaultId, ev);

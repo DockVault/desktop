@@ -55,12 +55,14 @@ class CredCache {
   /**
    * @param {object} io
    * @param {(vaultId:string)=>Promise<{user:string,password:string,hostKeys:string,expiresAt:string,host?:string,port?:number}>} io.mint  mint a fresh single-use access bundle (mintSftpAccess)
-   * @param {(bundle:object)=>Promise<{ok:boolean,sub?:string}>} io.send  hand the helper the bundle (sendSftpCred). On failure it carries a typed reason enum (`sub`) only — never a raw error string.
+   * @param {(bundle:object, boundEpoch:(number|null))=>Promise<{ok:boolean,sub?:string}>} io.send  hand the helper the bundle (sendSftpCred), bound to the child epoch the cred was minted for. On failure it carries a typed reason enum (`sub`) only — never a raw error string.
+   * @param {()=>number} [io.epoch]  the daemon's current child epoch, sampled at mint time so a restart mid-mint refuses delivery to the replacement child.
    * @param {()=>number} [io.now]
    */
   constructor(io = {}) {
     this._mint = io.mint;
     this._send = io.send;
+    this._epoch = typeof io.epoch === 'function' ? io.epoch : null;
     this._now = io.now || (() => Date.now());
     this._pins = new Map(); // host -> pinnedHostKeys  (SESSION pin: carried unchanged; a restart re-fetches)
   }
@@ -73,6 +75,10 @@ class CredCache {
    * @returns {Promise<{ok:true}|{ok:false,reason:string,sub?:string,installed?:(string|null)}>}
    */
   async ensureSent(vaultId) {
+    // Sample the daemon's child epoch BEFORE the mint. The bundle is bound to it: if a restart replaces the child
+    // during the (network) mint, `send` refuses delivery to the replacement rather than hand it a cred minted for
+    // a child that is gone — the send-direction sibling of dropping a replaced child's events.
+    const epoch = this._epoch ? this._epoch() : null;
     let access;
     try { access = await this._mint(vaultId); }
     catch (e) { return { ok: false, reason: classifyMintError(e) }; }
@@ -81,7 +87,7 @@ class CredCache {
     if (!pin.ok) { this._zeroize(access); return { ok: false, reason: pin.reason }; }
     const bundle = { ...access, hostKeys: pin.hostKeys };
     let ack;
-    try { ack = await this._send(bundle); }
+    try { ack = await this._send(bundle, epoch); }
     catch (e) { this._zeroize(bundle); this._zeroize(access); return { ok: false, reason: (e && e.reason) || 'cred-send-failed' }; }
     // The helper now holds the obscured cred for its single run; drop our plaintext references.
     this._zeroize(bundle); this._zeroize(access);

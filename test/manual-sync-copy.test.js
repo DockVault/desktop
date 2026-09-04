@@ -67,6 +67,15 @@ test('manual completion: an unready helper is a must-act (points at the fix), ne
   }
 });
 
+// A DOWN helper (daemon crash/restart, reason 'helper-unavailable') is DISTINCT from a misconfigured one: it
+// self-recovers, so the manual press earns a calm can't-reach line — NEVER the "how to fix it" setup pointer
+// (which would tell the person to edit env vars for a helper that is actually fine), and never "misconfigured".
+test('manual completion: a down helper (helper-unavailable) is a calm can\'t-reach line, never the how-to-fix setup pointer', () => {
+  const msg = manualCompletionBody({ phase: 'paused', reason: 'helper-unavailable' }, NAME);
+  assert.match(msg.body, /can't reach the sync helper/i, msg.body);
+  assert.doesNotMatch(msg.body, /how to fix|isn't ready|set it up|misconfigured/i, `a down helper is never the misconfigured setup line: ${msg.body}`);
+});
+
 // The defect this replaces: a fingerprint-only / unverifiable server is REACHABLE, so a cannot-verify pause
 // must NOT borrow the offline "can't reach the server" line. It reads as a verification pause, and promises no
 // specific remedy (the state also covers an absent endpoint or a failed fetch, not only a too-old server).

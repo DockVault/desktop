@@ -66,6 +66,25 @@ test('crash-loop latch => sync problem, and it outranks everything', () => {
   assert.strictEqual(r.reason, 'sync-stopped');
 });
 
+// A persistent DOWN helper (wedged or crashed) escalates to 'sync-stopped'/restart — the ONE honest remedy for
+// both shapes — never 'not-syncing'/"check your connection". So a per-vault down-helper escalation shares the
+// restart lane with the GLOBAL crash-loop latch: the glance is a single 'sync-stopped'/restart whether the helper
+// crash-looped (global latch) or WEDGED (per-vault escalation, no latch — the case the kill-and-respawn restart
+// serves). This also collapses the earlier menu residual: the per-vault escalation is now the SAME 'sync-stopped'
+// lane as the latch, not a separate 'not-syncing' beside restart. (Suppressing a stale per-vault item under a
+// latch stays a follow-up.)
+test('a persistent DOWN helper escalates to sync-stopped/restart — a WEDGED helper (no latch) reaches the same restart lane as a crash-loop', () => {
+  // a wedged helper: no global crash-loop latch, but its per-vault streak escalated to 'sync-stopped'
+  const wedged = computeStatus({ ...secure, vaults: [vault({ lastResult: 'ok', condition: { state: STATE.SYNC_PROBLEM, reason: 'sync-stopped' } })] });
+  assert.strictEqual(wedged.state, STATE.SYNC_PROBLEM);
+  assert.strictEqual(wedged.reason, 'sync-stopped', 'a wedged helper reaches restart even without a crash-loop latch');
+  // and with the global latch too, it stays the single restart lane (both are sync-stopped)
+  const r = computeStatus({ ...secure, crashLoopLatched: true,
+    vaults: [vault({ lastResult: 'ok', condition: { state: STATE.SYNC_PROBLEM, reason: 'sync-stopped' } })] });
+  assert.strictEqual(r.state, STATE.SYNC_PROBLEM);
+  assert.strictEqual(r.reason, 'sync-stopped', 'crash-loop + per-vault down-helper = one restart lane');
+});
+
 test('locked => paused (reason locked); offline => paused (waiting to reconnect); restarting => paused (reconnecting)', () => {
   assert.deepStrictEqual([computeStatus({ ...secure, locked: true, vaults: [vault({ lastResult: 'ok' })] }).state,
     computeStatus({ ...secure, locked: true, vaults: [vault({ lastResult: 'ok' })] }).reason], [STATE.PAUSED, 'locked']);

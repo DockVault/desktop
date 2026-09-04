@@ -25,6 +25,7 @@ const { STATE } = require('./sync-status-model');
 const REASON_DETAIL = Object.freeze({
   'waiting-to-reconnect': 'waiting to reconnect',
   'reconnecting': 'reconnecting',
+  'helper-unavailable': 'reconnecting', // a down helper (wedged/crashed) retrying — reads as reconnecting until it escalates to restart
   'cannot-verify-yet': 'cannot verify the server yet',
   'retrying': 'retrying',
   'consent-needed': 'approve syncing to start',
@@ -128,8 +129,11 @@ function itemForVault(v) {
 function mustActItems(model) {
   const items = [];
   if (model.condition != null) return items; // unavailable / not-configured: nothing to act on here
-  // A stuck helper is one global action: restart it deliberately.
-  if (model.state === STATE.SYNC_PROBLEM && model.reason === 'sync-stopped') {
+  // A stuck helper (crash-looped OR a persistent per-vault down-helper escalation) is ONE global restart. Surface
+  // it whenever the aggregate is sync-stopped OR ANY vault escalated to it — NOT only when it wins the aggregate,
+  // or a co-present rank-6 vault (a host-key alert, say) ordered first would steal the glance and DROP the restart
+  // for a wedged helper that blocks all sync. The per-vault loop below suppresses the (subsumed) per-vault items.
+  if (model.reason === 'sync-stopped' || model.vaults.some((v) => v.reason === 'sync-stopped')) {
     items.push({ kind: 'restart', label: 'Restart sync' });
   }
   // The saved state can't be unlocked on this machine. Give the real, NON-destructive next step available
@@ -145,6 +149,7 @@ function mustActItems(model) {
   if (hnr) items.push({ kind: 'setup-helper', label: 'How to fix the sync helper', sub: hnr.sub || null, installed: hnr.installed || null });
   for (const v of model.vaults) {
     if (v.reason === 'helper-not-ready') continue; // handled once, app-scoped, above
+    if (v.reason === 'sync-stopped') continue; // a global down-helper condition — handled once as the restart above
     if (v.state === STATE.NEEDS_DECISION || v.state === STATE.SYNC_PROBLEM) items.push(itemForVault(v));
   }
   return items;

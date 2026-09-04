@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { makeRunEffects, makeVerifyEligible, makeSession, makeSchedulerIo, applySchedulerEvent, StatusSink } = require('../src/main/scheduler-io');
+const { makeRunEffects, makeVerifyEligible, makeSession, makeSchedulerIo, applySchedulerEvent, conditionForReason, StatusSink } = require('../src/main/scheduler-io');
 const { SyncStatusHub } = require('../src/main/sync-status-hub');
 const { STATE } = require('../src/main/sync-status-model');
 
@@ -296,6 +296,32 @@ test('StatusSink: persistent PRE-DISPATCH failures escalate too (a mint outage n
   assert.strictEqual(vaultOf(hub).state, STATE.SYNC_PROBLEM);
   assert.strictEqual(vaultOf(hub).reason, 'not-syncing');
   assert.strictEqual(notes.length, 1, 'one calm "not syncing" notification at escalation');
+});
+
+// The down-helper lane (a daemon crash/wedge) is RETRYABLE: a couple of ticks read calm ('helper-unavailable',
+// shown as reconnecting), but a helper that stays down must NOT read "reconnecting" forever — it escalates to
+// 'sync-stopped'/restart, the ONE honest remedy for a crashed OR wedged helper, never 'not-syncing'/"check your
+// connection" (which misattributes the cause and offers no working fix). It never reaches the env-var dialog.
+test('StatusSink: a persistent DOWN helper (helper-unavailable) reads calm (reconnecting) then escalates to sync-stopped/restart, never not-syncing', () => {
+  const { hub, notes } = hubWithNotify();
+  const sink = new StatusSink(hub);
+  sink.apply('v1', { phase: 'paused', reason: 'helper-unavailable' });
+  sink.apply('v1', { phase: 'paused', reason: 'helper-unavailable' });
+  assert.strictEqual(vaultOf(hub).state, STATE.PAUSED, 'the first couple read calm');
+  assert.strictEqual(vaultOf(hub).reason, 'helper-unavailable', 'reason is helper-unavailable (shown as reconnecting), never helper-not-ready');
+  assert.deepStrictEqual(notes, [], 'no alarm while it is still a calm reconnect');
+  sink.apply('v1', { phase: 'paused', reason: 'helper-unavailable' });
+  assert.strictEqual(vaultOf(hub).state, STATE.SYNC_PROBLEM, 'a persistent down helper escalates');
+  assert.strictEqual(vaultOf(hub).reason, 'sync-stopped', 'to sync-stopped/restart — NOT not-syncing/"check your connection", and never the env-var dialog');
+  assert.strictEqual(notes.length, 1, 'one escalation notification');
+});
+
+// The down lane's classification: a NO-ANSWER transport failure is a CALM, PAUSED, RETRYABLE reason — never the
+// non-retrying helper-not-ready SYNC_PROBLEM that drives the "how to fix the sync helper" env-var dialog.
+test('conditionForReason: helper-unavailable is a calm PAUSED lane, distinct from the helper-not-ready SYNC_PROBLEM', () => {
+  assert.deepStrictEqual(conditionForReason('paused', 'helper-unavailable'), { state: STATE.PAUSED, reason: 'helper-unavailable' });
+  assert.deepStrictEqual(conditionForReason('refused', 'helper-not-ready'), { state: STATE.SYNC_PROBLEM, reason: 'helper-not-ready' });
+  assert.notStrictEqual(conditionForReason('paused', 'helper-unavailable').state, STATE.SYNC_PROBLEM, 'a down helper is never a must-act sync problem');
 });
 
 test('StatusSink: a lock between failures does NOT count toward the streak', () => {

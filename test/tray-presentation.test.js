@@ -116,6 +116,31 @@ test('a stuck helper offers exactly one Restart action', () => {
   assert.deepStrictEqual(items[0], { kind: 'restart', label: 'Restart sync' });
 });
 
+test('a persistent DOWN helper (per-vault sync-stopped, no crash-loop latch) offers exactly one Restart — no per-vault duplicate', () => {
+  // The WEDGED case: no global crash-loop latch, but a vault's down-helper streak escalated to the 'sync-stopped'
+  // restart lane. 'sync-stopped' is a GLOBAL helper condition, so it surfaces once as the restart — never also as a
+  // per-vault "not syncing" item beside it (the subsumed per-vault item is suppressed, matching the notification).
+  const m = computeStatus({ ...secure, vaults: [vault({ vault: 'a', lastResult: 'ok', condition: { state: STATE.SYNC_PROBLEM, reason: 'sync-stopped' } })] });
+  const items = mustActItems(m);
+  assert.strictEqual(items.length, 1, 'one restart, never a per-vault item beside it');
+  assert.deepStrictEqual(items[0], { kind: 'restart', label: 'Restart sync' });
+});
+
+test('a down helper (sync-stopped) whose aggregate is STOLEN by another rank-6 vault still surfaces Restart — never dropped', () => {
+  // V_other (host-key-mismatch, also rank-6) is ordered FIRST and wins the aggregate glance; V_down's shared helper
+  // wedged to 'sync-stopped'. The Restart must STILL surface (it is gated on ANY sync-stopped vault, not only when
+  // it wins the aggregate) — otherwise a wedged helper that blocks all sync would have no reachable recovery. The
+  // other vault keeps its own action; the down vault stays subsumed (no duplicate).
+  const m = computeStatus({ ...secure, vaults: [
+    vault({ vault: 'other', lastResult: 'host-key-mismatch' }),
+    vault({ vault: 'down', lastResult: 'ok', condition: { state: STATE.SYNC_PROBLEM, reason: 'sync-stopped' } }),
+  ] });
+  const items = mustActItems(m);
+  assert.ok(items.some((it) => it.kind === 'restart'), 'Restart is surfaced even though another rank-6 vault won the aggregate');
+  assert.ok(items.some((it) => it.vault === 'other'), "the other vault's own action is still shown");
+  assert.ok(!items.some((it) => it.vault === 'down'), 'the down vault is subsumed by the global restart, never duplicated');
+});
+
 test('every unresolved vault item becomes a reachable tray action of the right kind', () => {
   const m = computeStatus({ ...secure, vaults: [
     vault({ vault: 'a', lastResult: 'conflict-keep-both' }),

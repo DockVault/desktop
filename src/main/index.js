@@ -476,7 +476,7 @@ function buildTrayMenu(items, model) {
 // other must-act (review a conflict, sign in, repair) opens the app to where the person completes it;
 // the specific in-app flows arrive with the components that own them.
 function handleMustAct(item) {
-  if (item && item.kind === 'restart') { if (daemon) daemon.resume(); refreshTray(); return; }
+  if (item && item.kind === 'restart') { if (daemon) daemon.restart(); refreshTray(); return; }
   if (item && item.kind === 'recover-folder' && item.vault) { void recoverSharedFolder(item.vault); return; }
   // The deliberate Repair: the ONLY thing that clears a blocked-after-run latch (a resync owed, or a
   // >50%-delete abort). It enqueues a manual repair run; the dispatch then asks the keep-both confirm
@@ -814,7 +814,10 @@ function startSyncScheduler() {
         vaultPassword = ''; // single-use: drop the plaintext the moment the mint request has been issued
       }
     },
-    send: (bundle) => daemon.sendSftpCred(bundle),
+    // Bind the send to the child epoch sampled at mint time: a restart mid-mint refuses delivery to the
+    // replacement child (a credential minted for a child that is gone is never handed to its successor).
+    send: (bundle, epoch) => daemon.sendSftpCred(bundle, 12000, epoch),
+    epoch: () => daemon.currentEpoch(),
   });
   const sink = new schedulerIo.StatusSink(syncHub);
   const io = schedulerIo.makeSchedulerIo({

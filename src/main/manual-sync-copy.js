@@ -49,6 +49,11 @@ function bodyForConditionReason(reason, name) {
       // that won't start), so NEVER the calm "try again in a moment" that would tell a different story than the
       // tray. Points at the same how-to the tray offers; the per-sub specifics live on the glance/dialog.
       return `${name} can't sync — the sync helper isn't ready. Open DockVault to see how to fix it.`;
+    case 'helper-unavailable':
+      // The sync helper did NOT answer (the daemon is down / restarting) — DISTINCT from 'helper-not-ready'
+      // (a misconfigured helper): this one self-recovers, so it is a calm, retryable line, NEVER the "how to
+      // fix it" setup pointer, and never "misconfigured". (Provisional copy — finalized with the human copy pass.)
+      return `Can't reach the sync helper for ${name} right now — it'll keep trying.`;
     case 'error': return `${name} couldn't sync. Open DockVault to see why.`;
     case 'retrying':
     default: return `${name} couldn't sync just now. Try again in a moment.`;

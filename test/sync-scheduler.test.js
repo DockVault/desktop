@@ -62,6 +62,51 @@ test('gate-before-mint: a READY helper proceeds to mint + run', async () => {
   assert.deepStrictEqual(calls.runSync, ['a']);
 });
 
+test('gate: a NO-ANSWER helper (a reason, NO sub — daemon down/exited) is the calm helper-unavailable lane, never helper-not-ready, and still SKIPS the mint', async () => {
+  for (const reason of ['daemon-exited', 'no-daemon', 'timeout']) {
+    const { sch, calls, log } = harness({ helperReady: async () => ({ ok: false, reason }) });
+    sch.requestSync('a');
+    await settle(sch);
+    const ev = log.find((e) => e.vaultId === 'a' && (e.phase === 'paused' || e.phase === 'refused'));
+    assert.ok(ev, `the gate emitted a not-run event for ${reason}`);
+    assert.strictEqual(ev.phase, 'paused', `a down helper (${reason}) PAUSES (calm), it is not REFUSED as misconfigured`);
+    assert.strictEqual(ev.reason, 'helper-unavailable', `${reason} -> the transport lane, not helper-not-ready`);
+    assert.deepStrictEqual(calls.refreshCred, [], 'still no mint — the gate ran before refreshCred');
+    assert.deepStrictEqual(calls.runSync, [], 'and no run');
+  }
+});
+
+test('gate PRECEDENCE: a reply carrying BOTH a sub and a reason is the helper-not-ready lane — the sub always wins', async () => {
+  const { sch, calls, log } = harness({ helperReady: async () => ({ ok: false, sub: 'checksum-mismatch', reason: 'daemon-exited', installed: '1.60.0' }) });
+  sch.requestSync('a');
+  await settle(sch);
+  const ev = log.find((e) => e.vaultId === 'a' && (e.phase === 'refused' || e.phase === 'paused'));
+  assert.strictEqual(ev.phase, 'refused', 'an answered not-ready is REFUSED (the fix-the-setup lane)');
+  assert.strictEqual(ev.reason, 'helper-not-ready', 'sub present -> helper-not-ready wins over the reason');
+  assert.strictEqual(ev.sub, 'checksum-mismatch', 'the answered sub rides as the detail');
+  assert.deepStrictEqual(calls.refreshCred, [], 'no mint');
+});
+
+// PIN (tamper-critical): a TAMPER sub from the per-spawn re-hash (checksum-mismatch / version-mismatch) is a
+// hard, non-retrying, fail-closed alert — it must NEVER be reclassified into the calm retryable transport lane.
+// A tampered binary is not a "down helper". The split branches on SUB PRESENCE, so a sub is always the hard lane.
+test('gate PIN: a tamper sub (checksum-mismatch / version-mismatch) stays the hard non-retrying helper-not-ready lane, never helper-unavailable', async () => {
+  for (const sub of ['checksum-mismatch', 'version-mismatch']) {
+    const { sch, log } = harness({ helperReady: async () => ({ ok: false, sub }) });
+    sch.requestSync('a');
+    await settle(sch);
+    const ev = log.find((e) => e.vaultId === 'a' && (e.phase === 'refused' || e.phase === 'paused'));
+    assert.strictEqual(ev.phase, 'refused', `${sub}: a tampered binary is REFUSED (hard), never paused-retryable`);
+    assert.strictEqual(ev.reason, 'helper-not-ready', `${sub}: the pin alert survives as helper-not-ready`);
+    assert.notStrictEqual(ev.reason, 'helper-unavailable', `${sub}: NEVER the calm transport lane`);
+  }
+  // The contrast the pin protects: a no-sub transport failure IS the calm retryable transport lane.
+  const t = harness({ helperReady: async () => ({ ok: false, reason: 'daemon-exited' }) });
+  t.sch.requestSync('a'); await settle(t.sch);
+  const tev = t.log.find((e) => e.vaultId === 'a' && (e.phase === 'paused' || e.phase === 'refused'));
+  assert.strictEqual(tev.reason, 'helper-unavailable', 'a no-sub transport failure is the retryable lane');
+});
+
 test('gate-before-mint fails CLOSED: an io with NO helperReady refuses (never mints) — a mis-wired gate cannot fall open', async () => {
   const log = [];
   const calls = { refreshCred: [], runSync: [] };
@@ -265,13 +310,37 @@ test('a dep that THROWS surfaces as a terminal error, never a stuck "running"', 
   assert.strictEqual(sch._busy, false, 'the mutex is released after the throw');
 });
 
-test('a run that could not execute ({ok:false}) is reported as error, not done', async () => {
-  const { sch, log } = harness({ runSync: async () => ({ ok: false, ran: false, error: 'no-daemon' }) });
+// A runSync backstop TIMEOUT means the bisync WEDGED while the daemon is still alive — it did NOT exit, so the
+// supervisor's crash-loop/restart never fires and syncStatus can still answer green. It must ESCALATE (an error
+// that feeds the failure streak), NEVER collapse into the calm keep-last-state skip that the daemon-GONE reasons
+// take — otherwise a wedged run would read "up to date" indefinitely. So a wedged timeout stays on the error lane.
+test('a runSync backstop TIMEOUT (wedged-but-alive daemon) ESCALATES as an error — never a false-green skip', async () => {
+  const { sch, log } = harness({ runSync: async () => ({ ok: false, ran: false, error: 'timeout' }) });
   sch.requestSync('a');
   await settle(sch);
   const p = phases(log, 'a');
-  assert.strictEqual(p.includes('error'), true, 'an un-run outcome is an error');
+  assert.strictEqual(p.includes('error'), true, 'a wedged run escalates (error), so the streak can surface "not syncing"');
+  assert.strictEqual(p.includes('skipped'), false, 'NEVER the calm skip that would keep a stale green state');
   assert.strictEqual(p.includes('done'), false, 'ok:false is never done');
+});
+
+test('a daemon-GONE MID-RUN ({ok:false, ran:false, reason}) is the calm typed SKIP — never an error, never a re-mint', async () => {
+  // daemon-exited / no-daemon / send-failed all mean the daemon is GONE: the supervisor restarts it and the next
+  // tick's gate re-checks, so a calm keep-last-state skip is safe (contrast the wedged-alive TIMEOUT above).
+  for (const reason of ['daemon-exited', 'no-daemon', 'send-failed']) {
+    const calls = { refreshCred: [] };
+    const { sch, log } = harness({
+      refreshCred: async (v) => { calls.refreshCred.push(v); return { ok: true }; },
+      runSync: async () => ({ ok: false, ran: false, reason }),
+    });
+    sch.requestSync('a');
+    await settle(sch);
+    const p = phases(log, 'a');
+    assert.strictEqual(p.includes('skipped'), true, `${reason}: a ran:false daemon-gone failure is a calm skip`);
+    assert.strictEqual(p.includes('error'), false, `${reason}: not an error — a gone daemon keeps the last state`);
+    assert.deepStrictEqual(calls.refreshCred, ['a'], 'the ONE mint happened before the run; the skip does NOT re-mint');
+    assert.strictEqual(sch._busy, false, `${reason}: the run resolved so the scheduler SLOT CLEARED (never a hung run holding the mutex)`);
+  }
 });
 
 test('a Repair pressed while that vault is mid-run is NOT dropped — it queues and runs after', async () => {

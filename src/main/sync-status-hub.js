@@ -185,11 +185,16 @@ class SyncStatusHub {
     const nowActive = new Map(); // key -> notification payload
     if (m.condition == null) {
       for (const v of m.vaults) {
-        if (MUST_ACT.has(v.state)) nowActive.set(`${v.vault}:${v.state}:${v.reason || ''}`, { scope: 'vault', vault: v.vault, state: v.state, reason: v.reason || null });
+        // 'sync-stopped' is a GLOBAL helper condition (the shared daemon is down/wedged), not a per-vault one — a
+        // persistent down helper escalates every vault to it. It is surfaced ONCE as the daemon item below, so it
+        // must NOT also fire a per-vault must-act, or one down helper would raise a notification per vault.
+        if (MUST_ACT.has(v.state) && v.reason !== 'sync-stopped') nowActive.set(`${v.vault}:${v.state}:${v.reason || ''}`, { scope: 'vault', vault: v.vault, state: v.state, reason: v.reason || null });
       }
-      // A stuck helper is one global must-act item.
-      if (m.state === model.STATE.SYNC_PROBLEM && m.reason === 'sync-stopped') {
-        nowActive.set('daemon:sync-stopped', { scope: 'daemon', state: m.state, reason: 'sync-stopped' });
+      // A stuck helper is one global must-act item (crash-looped OR a persistent per-vault down-helper escalation).
+      // Fire it whenever the aggregate is sync-stopped OR ANY vault escalated to it — never only when it wins the
+      // aggregate, or a co-present rank-6 vault ordered first would steal the glance and drop the daemon alert.
+      if (m.reason === 'sync-stopped' || m.vaults.some((v) => v.reason === 'sync-stopped')) {
+        nowActive.set('daemon:sync-stopped', { scope: 'daemon', state: model.STATE.SYNC_PROBLEM, reason: 'sync-stopped' });
       }
     }
     for (const [key, payload] of nowActive) {

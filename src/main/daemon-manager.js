@@ -44,7 +44,11 @@ class DaemonManager {
     this._maxRestarts = opts.maxRestarts || MAX_RESTARTS;
     this._crashWindowMs = opts.crashWindowMs || CRASH_WINDOW_MS;
     this._restartTimes = [];
-    this.crashLoopLatched = false; // true once the ceiling is hit; cleared only by a deliberate resume()
+    this.crashLoopLatched = false; // true once the ceiling is hit; cleared only by a deliberate restart()
+    // A monotonic CHILD epoch, bumped on every spawn. A credential is minted while one child is current; if a
+    // restart replaces that child before the mint is delivered, the send is refused (bound to the mint-time
+    // epoch) so a credential minted for the OLD child is never handed to a NEW one.
+    this._epoch = 0;
     this._pingSeq = 0;
     this._pending = new Map(); // ping id -> resolve
     this._lockSeq = 0;
@@ -78,8 +82,14 @@ class DaemonManager {
     this.status = 'starting';
     const child = utilityProcess.fork(DAEMON_ENTRY, [], { serviceName: 'dockvault-sync' });
     this.child = child;
-    child.on('message', (m) => this._onMessage(m || {}));
-    child.on('exit', (code) => this._onExit(code));
+    this._epoch += 1; // a fresh child: any credential minted for a prior epoch must not be delivered to this one
+    // CLOSE OVER this child and drop any event from a REPLACED one (`this.child !== child`). Without this, a
+    // restart's kill-old/spawn-new lets the old child's late 'exit' respawn a SECOND daemon and its late
+    // 'message' (an ack, a status, or a 'need-sftp-cred') route into the new child's pending maps — a phantom
+    // resolve, or a phantom mint on the old child's behalf. A genuine event from the CURRENT child still runs
+    // (its handle IS this.child).
+    child.on('message', (m) => { if (this.child !== child) return; this._onMessage(m || {}); });
+    child.on('exit', (code) => { if (this.child !== child) return; this._onExit(code); });
   }
 
   _onMessage(m) {
@@ -165,29 +175,29 @@ class DaemonManager {
     }
   }
 
-  _onExit(code) {
-    this.child = null;
+  // Resolve every in-flight request as if the daemon is gone: a ping as false; a zk-lock ack as confirmed-clean
+  // (a dead process holds no key); status/cred/run as the bounded 'daemon-exited' reason; a run-state query as a
+  // FAILURE (ok:false, distinct from an empty snapshot, so the caller fails closed). Never hang a caller on a
+  // dead/replaced child. Called on an exit AND by restart() BEFORE it kills the old child (so the scheduler slot
+  // clears immediately, and a late reply from the replaced child finds nothing left to resolve).
+  _drainPending() {
     for (const r of this._pending.values()) r(false);
     this._pending.clear();
-    // A daemon that has exited holds no key in memory — its process is gone. Resolve any in-flight
-    // zk-lock ack as confirmed-clean so a crash mid-purge does not hang the lock (fail-closed still
-    // holds: the caller only reports "locked" once this resolves, and a dead process has no key).
     for (const e of this._lockPending.values()) { clearTimeout(e.timer); e.resolve(true); }
     this._lockPending.clear();
-    // A dead daemon can't answer a status request — resolve any in-flight one as not-ok, never hang.
     for (const e of this._statusPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, version: null, reason: 'daemon-exited' }); }
     this._statusPending.clear();
     for (const e of this._credPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, reason: 'daemon-exited' }); }
     this._credPending.clear();
-    // A dead daemon can't finish a bisync — resolve any in-flight run as not-ok (never hang). It stays
-    // fail-closed: the caller sees a failed run and the resync block (if any) is untouched on disk.
     for (const e of this._syncPending.values()) { clearTimeout(e.timer); e.resolve({ ok: false, ran: false, reason: 'daemon-exited' }); }
     this._syncPending.clear();
-    // A dead daemon can't answer a run-state query — resolve any in-flight one as a FAILURE (ok:false),
-    // distinct from a successful-but-empty snapshot, so the caller fails closed (never reads it as
-    // "every vault never-run") and never hangs.
     for (const e of this._runStatePending.values()) { clearTimeout(e.timer); e.resolve({ ok: false }); }
     this._runStatePending.clear();
+  }
+
+  _onExit(code) {
+    this.child = null;
+    this._drainPending();
     if (this.stopping) { this.status = 'stopped'; return; }
     // Record this exit and keep only those inside the window. Once too many land in the window the
     // ceiling is hit: stop restarting, latch the stuck state, and surface it — never a silent storm.
@@ -198,7 +208,7 @@ class DaemonManager {
       this.crashLoopLatched = true;
       this.status = 'crash-looped';
       this._emit('crash-loop', { code, restarts: this._restartTimes.length });
-      return; // no restart scheduled: a deliberate resume() is required to try again
+      return; // no restart scheduled: a deliberate restart() is required to try again
     }
     this.status = 'crashed';
     const backoff = Math.min(MAX_BACKOFF_MS, 500 * 2 ** this.restarts);
@@ -209,18 +219,31 @@ class DaemonManager {
   }
 
   /**
-   * The deliberate "restart sync" action after the crash-loop ceiling was hit. Clears the latch and
-   * the recent-exit history and starts the helper again. A no-op (returns false) when not latched, so
-   * it can only ever RESUME from the stuck state, never force a second concurrent helper.
+   * The deliberate "Restart sync" action. Recovers the helper in BOTH stuck shapes: a crash-LOOPED helper
+   * (the ceiling was hit — latched, no live child) AND a WEDGED helper (a live child that stopped responding
+   * but never exited, so there is NO latch — the case a persistent 'helper-unavailable' escalates to). It
+   * clears any latch, backoff, and pending respawn, then: if a child is alive it KILLS it so the supervisor's
+   * exit handler respawns exactly ONE fresh helper (never a second concurrent one); if none is alive it spawns
+   * directly. It never no-ops on a wedge — otherwise "Restart sync" would be a phantom for the likelier stuck
+   * shape (a wedged process has no latch, so the old latched-only resume did nothing for it).
    */
-  resume() {
-    if (!this.crashLoopLatched) return false;
+  restart() {
+    const old = this.child;
+    // Resolve every in-flight request as 'daemon-exited' BEFORE the kill, so the scheduler's slot/mutex clears
+    // immediately (never waits on the async exit) and a late reply from the old child finds nothing to resolve.
+    // stopping guards a synchronous exit during kill() (it would be a no-op stop); the handle guard in _spawn
+    // makes the old child's LATER exit/message a no-op regardless, so replacing the child cannot spawn a second
+    // daemon or route a stray 'need-sftp-cred' into the new one.
+    this.stopping = true;
+    this._drainPending();
+    if (old) { try { old.kill(); } catch { /* ignore */ } }
+    this.stopping = false;
     this.crashLoopLatched = false;
     this.restarts = 0;
     this._restartTimes = [];
-    this.stopping = false;
+    if (this._restartTimer) { clearTimeout(this._restartTimer); this._restartTimer = null; }
     this._emit('resume', {});
-    this._spawn();
+    this._spawn(); // exactly one fresh helper — its handle becomes this.child, so the old one's late events drop
     return true;
   }
 
@@ -258,36 +281,50 @@ class DaemonManager {
 
   /**
    * Ask the daemon to verify + report the standard-vault sync runner (pinned rclone binary + version)
-   * and round-trip its version. Resolves { ok, version, error }: ok=false when rclone is unconfigured,
-   * the daemon is dead, verification fails closed, or the request times out.
+   * and round-trip its version. Resolves { ok, version, sub?, reason? }: ok=false when rclone is unconfigured,
+   * the daemon is dead, verification fails closed, or the request times out. A helper-answered not-ready carries
+   * a typed `sub`; a no-answer transport failure carries a bounded `reason` (no-daemon / timeout / send-failed) —
+   * never a free-text error.
    */
   syncStatus(timeoutMs = 12000) {
     return new Promise((resolve) => {
-      if (!this.child) return resolve({ ok: false, version: null, error: 'no daemon' });
+      if (!this.child) return resolve({ ok: false, version: null, reason: 'no-daemon' });
       const id = ++this._statusSeq;
-      const timer = setTimeout(() => { if (this._statusPending.delete(id)) resolve({ ok: false, version: null, error: 'timeout' }); }, timeoutMs);
+      const timer = setTimeout(() => { if (this._statusPending.delete(id)) resolve({ ok: false, version: null, reason: 'timeout' }); }, timeoutMs);
       if (timer.unref) timer.unref();
       this._statusPending.set(id, { resolve, timer });
       try { this.child.postMessage({ type: 'sync-status', id }); }
-      catch { this._statusPending.delete(id); clearTimeout(timer); return resolve({ ok: false, version: null, error: 'send failed' }); }
+      catch { this._statusPending.delete(id); clearTimeout(timer); return resolve({ ok: false, version: null, reason: 'send-failed' }); }
     });
   }
+
+  /** The current child epoch — bumped on every spawn; a credential is bound to the epoch it was minted for. */
+  currentEpoch() { return this._epoch; }
 
   /**
    * Hand the daemon a per-run scoped SFTP credential bundle over the PRIVATE parent<->child channel
    * (in-memory, like the DB key) — never disk, argv, or environment. The daemon obscures the password
    * just-in-time and holds only the prepared config; the ack reports readiness, never the credential.
-   * Resolves { ok, error } — ok=false when unconfigured, dead, prepare failed, or the request timed out.
+   * Resolves { ok, sub?, reason? } — ok=false when unconfigured, dead, prepare failed, the request timed out, or
+   * the child was replaced since the credential was minted for it (boundEpoch mismatch -> 'daemon-exited'). A
+   * helper-answered prepare failure carries a typed `sub`; a transport/binding failure carries a bounded `reason`.
    */
-  sendSftpCred(bundle, timeoutMs = 12000) {
+  sendSftpCred(bundle, timeoutMs = 12000, boundEpoch = null) {
     return new Promise((resolve) => {
-      if (!this.child) return resolve({ ok: false, error: 'no daemon' });
+      // A credential is bound to the child epoch it was minted for. If a restart replaced that child (this._epoch
+      // moved on) before we could deliver, DO NOT hand the NEW child a credential minted for the OLD one: zeroize
+      // the bundle's plaintext and resolve 'daemon-exited', never a misdelivered/phantom credential.
+      if (boundEpoch != null && boundEpoch !== this._epoch) {
+        if (bundle && typeof bundle.password === 'string') bundle.password = '';
+        return resolve({ ok: false, reason: 'daemon-exited' });
+      }
+      if (!this.child) return resolve({ ok: false, reason: 'no-daemon' });
       const id = ++this._credSeq;
-      const timer = setTimeout(() => { if (this._credPending.delete(id)) resolve({ ok: false, error: 'timeout' }); }, timeoutMs);
+      const timer = setTimeout(() => { if (this._credPending.delete(id)) resolve({ ok: false, reason: 'timeout' }); }, timeoutMs);
       if (timer.unref) timer.unref();
       this._credPending.set(id, { resolve, timer });
       try { this.child.postMessage({ type: 'sftp-cred', id, bundle }); }
-      catch { this._credPending.delete(id); clearTimeout(timer); return resolve({ ok: false, error: 'send failed' }); }
+      catch { this._credPending.delete(id); clearTimeout(timer); return resolve({ ok: false, reason: 'send-failed' }); }
     });
   }
 
@@ -300,11 +337,11 @@ class DaemonManager {
     return new Promise((resolve) => {
       if (!this.child) return resolve({ ok: true }); // no daemon => nothing is held; the clear is vacuously done
       const id = ++this._credSeq;
-      const timer = setTimeout(() => { if (this._credPending.delete(id)) resolve({ ok: false, error: 'timeout' }); }, timeoutMs);
+      const timer = setTimeout(() => { if (this._credPending.delete(id)) resolve({ ok: false, reason: 'timeout' }); }, timeoutMs);
       if (timer.unref) timer.unref();
       this._credPending.set(id, { resolve, timer });
       try { this.child.postMessage({ type: 'sftp-cred-clear', id }); }
-      catch { this._credPending.delete(id); clearTimeout(timer); return resolve({ ok: false, error: 'send failed' }); }
+      catch { this._credPending.delete(id); clearTimeout(timer); return resolve({ ok: false, reason: 'send-failed' }); }
     });
   }
 
@@ -320,14 +357,18 @@ class DaemonManager {
    */
   runSync(spec, timeoutMs = 6 * 60 * 60 * 1000 + 10 * 60 * 1000) {
     return new Promise((resolve) => {
-      if (!this.child) return resolve({ ok: false, ran: false, error: 'no daemon' });
+      if (!this.child) return resolve({ ok: false, ran: false, reason: 'no-daemon' });
       this._credRequestsThisRun = 0; // a fresh per-run budget for this run's per-step credential requests
       const id = ++this._syncSeq;
+      // A runSync backstop timeout means the bisync WEDGED while the daemon is still alive (it did NOT exit, so
+      // the supervisor's crash-loop/restart never fires and syncStatus may still answer green). It must ESCALATE,
+      // never collapse into the calm keep-last-state skip — so it stays on the error lane (an `error`, not a
+      // transport `reason`). The daemon-GONE cases (no-daemon / daemon-exited / send-failed) self-recover and skip.
       const timer = setTimeout(() => { if (this._syncPending.delete(id)) resolve({ ok: false, ran: false, error: 'timeout' }); }, timeoutMs);
       if (timer.unref) timer.unref();
       this._syncPending.set(id, { resolve, timer });
       try { this.child.postMessage({ type: 'sync-run', id, spec }); }
-      catch { this._syncPending.delete(id); clearTimeout(timer); return resolve({ ok: false, ran: false, error: 'send failed' }); }
+      catch { this._syncPending.delete(id); clearTimeout(timer); return resolve({ ok: false, ran: false, reason: 'send-failed' }); }
     });
   }
 
@@ -337,9 +378,12 @@ class DaemonManager {
   // account before it mints. The reply carries NO credential — only { ok, reason }; the credential itself
   // travels on the existing sftp-cred -> sftp-cred-ack path, which the helper confirms arrived before it uses it.
   async _onNeedSftpCred(m) {
+    const epoch = this._epoch; // the REQUESTING child's epoch — the result (and the minted cred) are bound to it
     const id = m && m.id;
     const vault = m && typeof m.vault === 'string' && m.vault ? m.vault : null;
-    const done = (ok, reason) => { try { if (this.child) this.child.postMessage({ type: 'need-sftp-cred-result', id, ok: !!ok, reason: reason || null }); } catch { /* child gone */ } };
+    // Post the result ONLY while the requesting child is still current. After a restart the request belongs to a
+    // child that is gone (its run was drained), so a late result must not reach the fresh child in its place.
+    const done = (ok, reason) => { if (this._epoch !== epoch) return; try { if (this.child) this.child.postMessage({ type: 'need-sftp-cred-result', id, ok: !!ok, reason: reason || null }); } catch { /* child gone */ } };
     if (id == null || !vault) return done(false, 'bad-request');
     this._credRequestsThisRun += 1;
     if (this._credRequestsThisRun > MAX_CRED_REQUESTS_PER_RUN) return done(false, 'cap-exceeded');

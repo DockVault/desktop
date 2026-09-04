@@ -201,3 +201,41 @@ test('an unverifiable host key is classified as host-key-unavailable (a calm can
   const cc = new CredCache({ mint: async () => { const e = new Error('host key unavailable'); e.reason = 'host-key-unverified'; throw e; }, send: async () => ({ ok: true }), now: () => NOW });
   assert.deepStrictEqual(await cc.ensureSent('v1'), { ok: false, reason: 'host-key-unavailable' });
 });
+
+// Credential-to-child binding: a temp credential is minted for the child that is current at mint time. If a
+// RESTART replaces that child during the (network) mint, the send must REFUSE — never hand the fresh child a
+// credential minted for a child that is gone (a misdelivery / phantom-cred hazard). The epoch is sampled BEFORE
+// the mint and passed to send; a mismatch zeroizes the bundle and returns without delivering.
+test('ensureSent binds the cred to the mint-time child epoch: a restart mid-mint refuses delivery, zeroized, never sent to the replacement', async () => {
+  let epoch = 5;
+  let delivered = null; let attempted = null;
+  const cc = new CredCache({
+    mint: async () => ({ user: 'u', password: 'topsecret', hostKeys: 'k', host: HOST, expiresAt: FRESH }),
+    epoch: () => epoch,
+    send: async (bundle, boundEpoch) => {
+      attempted = bundle;
+      if (boundEpoch != null && boundEpoch !== epoch) { if (bundle && typeof bundle.password === 'string') bundle.password = ''; return { ok: false, reason: 'daemon-exited' }; }
+      delivered = { ...bundle }; return { ok: true };
+    },
+    now: () => NOW,
+  });
+  // A restart happens DURING the mint: the child epoch moves on after the sample but before the send.
+  const realMint = cc._mint;
+  cc._mint = async (v) => { const r = await realMint(v); epoch = 6; return r; };
+  const res = await cc.ensureSent('v1');
+  assert.strictEqual(res.ok, false, 'the send was refused — no cred delivered to the replacement child');
+  assert.strictEqual(delivered, null, 'the credential was NOT delivered');
+  assert.strictEqual(attempted.password, '', 'the undelivered credential was zeroized');
+});
+
+test('ensureSent with a STABLE epoch (no restart) delivers normally — the binding never causes a false refusal', async () => {
+  let delivered = null;
+  const cc = new CredCache({
+    mint: async () => ({ user: 'u', password: 'p', hostKeys: 'k', host: HOST, expiresAt: FRESH }),
+    epoch: () => 9,
+    send: async (bundle, boundEpoch) => { if (boundEpoch != null && boundEpoch !== 9) return { ok: false, reason: 'daemon-exited' }; delivered = { ...bundle }; return { ok: true }; },
+    now: () => NOW,
+  });
+  assert.deepStrictEqual(await cc.ensureSent('v1'), { ok: true });
+  assert.ok(delivered && delivered.user === 'u', 'a stable epoch delivers the credential');
+});

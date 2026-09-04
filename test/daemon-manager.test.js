@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
+const { EventEmitter } = require('node:events');
 const { DaemonManager } = require('../src/main/daemon-manager');
 
 // These exercise the zk-lock request->ack contract in isolation with a fake child; the full forked
@@ -136,9 +137,56 @@ test('runSync() carries the keep-both preservation count back when a resync repo
 test('runSync() resolves not-ok when there is no daemon, or the send fails', async () => {
   const mgr = new DaemonManager('/nonexistent');
   mgr.child = null;
-  assert.deepStrictEqual(await mgr.runSync({ vault: 'v', local: 'l', remotePath: 'p' }, 20), { ok: false, ran: false, error: 'no daemon' });
+  // No child: a NO-ANSWER transport failure carries a bounded typed `reason` (no free-text `error` key) — the
+  // gate reads a reason-with-no-sub as the calm 'helper-unavailable' lane, never the misconfigured lane.
+  assert.deepStrictEqual(await mgr.runSync({ vault: 'v', local: 'l', remotePath: 'p' }, 20), { ok: false, ran: false, reason: 'no-daemon' });
+  // A broken channel (postMessage threw) means the daemon is GONE — a bounded typed transport reason, no error key.
   mgr.child = { postMessage: () => { throw new Error('channel gone'); } };
-  assert.deepStrictEqual(await mgr.runSync({ vault: 'v', local: 'l', remotePath: 'p' }, 20), { ok: false, ran: false, error: 'send failed' });
+  assert.deepStrictEqual(await mgr.runSync({ vault: 'v', local: 'l', remotePath: 'p' }, 20), { ok: false, ran: false, reason: 'send-failed' });
+});
+
+test('syncStatus() + sendSftpCred() resolve reason-only (no error key, no sub) when there is no daemon — the gate reads this as the transport lane, not misconfigured', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  mgr.child = null;
+  // status: a reason with NO sub -> the gate maps it to the calm 'helper-unavailable' lane, never helper-not-ready.
+  assert.deepStrictEqual(await mgr.syncStatus(20), { ok: false, version: null, reason: 'no-daemon' });
+  // cred: reason-only, and the deepStrictEqual proves the bundle (password) is never echoed on the failure.
+  assert.deepStrictEqual(await mgr.sendSftpCred({ host: 'h', port: 22, user: 'u', password: 'topsecret', hostKeys: 'k' }, 20), { ok: false, reason: 'no-daemon' });
+});
+
+// Credential-to-child binding: a credential is minted while one child is current; if a restart replaced that
+// child before delivery (this._epoch moved past the bound epoch), the send MUST refuse — zeroize the bundle and
+// resolve 'daemon-exited', never post a credential minted for the OLD child to a NEW one (a misdelivery/phantom).
+test('sendSftpCred(): a STALE boundEpoch (child replaced since mint) is refused — zeroized, daemon-exited, NEVER posted', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  let posted = false;
+  mgr.child = { postMessage: () => { posted = true; } }; // a live NEW child
+  mgr._epoch = 7;                                          // ...but the current epoch moved past the mint's epoch
+  const bundle = { user: 'u', password: 'topsecret', hostKeys: 'k' };
+  assert.deepStrictEqual(await mgr.sendSftpCred(bundle, 20, 6), { ok: false, reason: 'daemon-exited' }, 'a stale-epoch send resolves daemon-exited');
+  assert.strictEqual(posted, false, 'the credential is NEVER posted to the replacement child');
+  assert.strictEqual(bundle.password, '', 'the undelivered credential is zeroized');
+});
+
+test('sendSftpCred(): a MATCHING boundEpoch delivers normally — the binding never causes a false refusal', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  let sent = null;
+  mgr.child = { postMessage: (m) => { sent = m; } };
+  mgr._epoch = 7;
+  const p = mgr.sendSftpCred({ user: 'u', password: 'p', hostKeys: 'k' }, 5000, 7); // bound epoch === current
+  mgr._onMessage({ type: 'sftp-cred-ack', id: mgr._credSeq, ok: true }); // the daemon acks readiness
+  assert.deepStrictEqual(await p, { ok: true, sub: null, installed: null, pinned: null });
+  assert.ok(sent && sent.type === 'sftp-cred', 'a matching epoch posts the credential');
+});
+
+test('_spawn bumps the child epoch: a restart advances it, invalidating any in-flight mint bound to the old child', () => {
+  const mgr = new DaemonManager('/nonexistent', null, { now: () => 0 });
+  mgr._spawn = function () { this._epoch += 1; this.child = { kill: () => {} }; }; // mirror the real bump, no fork
+  assert.strictEqual(mgr.currentEpoch(), 0, 'starts at epoch 0');
+  mgr._spawn();                                  // first child -> epoch 1
+  assert.strictEqual(mgr.currentEpoch(), 1);
+  mgr.restart();                                 // drain + kill + spawn a fresh child -> epoch 2
+  assert.strictEqual(mgr.currentEpoch(), 2, 'a restart advances the epoch');
 });
 
 test('a daemon exit mid-run resolves the pending bisync as not-ok with a typed reason (never hangs)', async () => {
@@ -202,18 +250,90 @@ test('crash-loop ceiling: exits spread beyond the window never latch (window is 
   assert.strictEqual(mgr._restartTimes.length, 1);
 });
 
-test('resume() only ever restarts FROM the latched state, never forces a second helper', () => {
+test('restart() recovers a crash-LOOPED helper (clears the latch, respawns exactly one)', () => {
   const { mgr, events } = laddered({ maxRestarts: 2, crashWindowMs: 1000 });
-  assert.strictEqual(mgr.resume(), false, 'a no-op when not latched');
-  assert.strictEqual(mgr._spawned || 0, 0);
-  mgr._onExit(1); mgr._onExit(1); // latch
+  mgr._onExit(1); mgr._onExit(1); // latch (a crash-looped helper has no live child)
   assert.strictEqual(mgr.crashLoopLatched, true);
-  assert.strictEqual(mgr.resume(), true);
-  assert.strictEqual(mgr.crashLoopLatched, false);
+  assert.strictEqual(mgr.restart(), true);
+  assert.strictEqual(mgr.crashLoopLatched, false, 'the latch is cleared');
   assert.strictEqual(mgr.restarts, 0);
   assert.strictEqual(mgr._restartTimes.length, 0);
-  assert.strictEqual(mgr._spawned, 1, 'exactly one respawn');
+  assert.strictEqual(mgr._spawned, 1, 'no child to kill -> spawns directly, exactly one');
   assert.ok(events.some((e) => e[0] === 'resume'));
+});
+
+// The wedged-restart PHANTOM fix: a WEDGED-but-alive daemon (a live child that stopped responding but never
+// exited) has NO crash-loop latch, so the old latched-only resume() was a no-op — "Restart sync" did nothing
+// for the likelier stuck shape. restart() must ACT: kill the wedged child and immediately respawn exactly one
+// fresh helper (the replaced child's late events are dropped at the handle guard — see the no-leak test below).
+test('restart() recovers a WEDGED (live, UNlatched) helper: kills it once and IMMEDIATELY respawns exactly one — never a no-op', () => {
+  const { mgr } = laddered({ maxRestarts: 2, crashWindowMs: 1000 });
+  let killed = 0;
+  mgr.child = { kill: () => { killed += 1; } }; // a live, wedged child: it never exited, so there is NO latch
+  assert.strictEqual(mgr.crashLoopLatched, false, 'a wedged daemon has no crash-loop latch');
+  assert.strictEqual(mgr.restart(), true, 'restart ACTS on a wedge (the old resume() was a phantom no-op here)');
+  assert.strictEqual(killed, 1, 'the wedged child is killed exactly once');
+  assert.strictEqual(mgr._spawned, 1, 'and exactly one fresh helper is spawned immediately — never two, never zero');
+});
+
+// A wedged helper is likely wedged BECAUSE a run hung: restart() must resolve that IN-FLIGHT run BEFORE the kill
+// (via the drain), so the scheduler's per-vault slot/mutex clears immediately — never waiting on the async exit,
+// and a late reply from the replaced child would find nothing to resolve. Otherwise "Restart sync" would revive
+// the daemon while the scheduler stayed stuck on a dead run.
+test('restart() on a WEDGED helper mid-run: the drain RESOLVES the in-flight run BEFORE the kill (slot clears immediately), then respawns one', async () => {
+  const { mgr } = laddered({ maxRestarts: 2, crashWindowMs: 1000 });
+  let killed = 0;
+  mgr.child = { postMessage: () => {}, kill: () => { killed += 1; } }; // a live, wedged child holding a real in-flight run
+  const inflight = mgr.runSync({ vault: 'v', local: 'l', remotePath: 'p' }, 999999); // pending — the wedged run
+  assert.strictEqual(mgr.restart(), true);
+  assert.strictEqual(killed, 1, 'the wedged child is killed exactly once');
+  assert.strictEqual(mgr._spawned, 1, 'exactly one fresh helper is spawned');
+  assert.deepStrictEqual(await inflight, { ok: false, ran: false, reason: 'daemon-exited' }, 'the in-flight run resolved (never hangs) — the scheduler slot clears immediately');
+});
+
+// A DaemonManager whose _spawn creates a real mock child WITH the production handle-guarded handlers, so the
+// replaced-child no-leak invariant can be exercised: only the CURRENT child's events run.
+function spawnableMgr() {
+  const mgr = new DaemonManager('/nonexistent', null, { now: () => 0 });
+  const spawned = [];
+  mgr._spawn = function () {
+    const child = new EventEmitter();
+    child.kill = () => { child._killed = true; };
+    child.postMessage = () => {};
+    this.child = child;
+    child.on('message', (m) => { if (this.child !== child) return; this._onMessage(m || {}); }); // mirror the real guard
+    child.on('exit', (code) => { if (this.child !== child) return; this._onExit(code); });
+    spawned.push(child);
+    this.status = 'starting';
+  };
+  return { mgr, spawned };
+}
+
+// Concurrency: restart() kills the old child and spawns a new one. The REPLACED child's late events must
+// NOT leak: its late 'exit' must not spawn a SECOND daemon, and its late 'message' (ack / status / need-sftp-cred)
+// must resolve nothing and — critically — MINT nothing (a phantom credential on a dead child's behalf). The
+// handle guard drops both; the pendings were already resolved 'daemon-exited' before the kill.
+test('restart(): a REPLACED child cannot leak — its late exit/message is a no-op (no 2nd daemon, no phantom mint)', async () => {
+  const { mgr, spawned } = spawnableMgr();
+  mgr._spawn(); // child0 — the soon-to-be-wedged helper
+  const child0 = mgr.child;
+  let mints = 0;
+  mgr._onNeedSftpCred = async () => { mints += 1; }; // spy on the per-step mint path
+  const inflight = mgr.runSync({ vault: 'v', local: 'l', remotePath: 'p' }, 999999); // pending on child0
+  mgr.restart();
+  const child1 = mgr.child;
+  assert.notStrictEqual(child1, child0, 'restart replaced the child');
+  assert.strictEqual(spawned.length, 2, 'exactly one new child spawned');
+  assert.strictEqual(child0._killed, true, 'the old child was killed');
+  assert.deepStrictEqual(await inflight, { ok: false, ran: false, reason: 'daemon-exited' }, 'the in-flight run resolved daemon-exited BEFORE the kill (pendings drained)');
+  // the OLD child's LATE exit — a no-op at the handle guard: no second daemon, current child unchanged
+  child0.emit('exit', 0);
+  assert.strictEqual(mgr.child, child1, "the replaced child's late exit did not null/replace the current child");
+  assert.strictEqual(spawned.length, 2, 'and did not spawn a second daemon');
+  // the OLD child's LATE messages — dropped at the guard: no phantom resolve, no phantom mint
+  child0.emit('message', { type: 'sync-status', id: 'zzz' });
+  child0.emit('message', { type: 'need-sftp-cred', id: 'zzz' });
+  assert.strictEqual(mints, 0, 'a late need-sftp-cred from the replaced child mints nothing');
 });
 
 test('a clean ready breaks the loop history (counters + latch reset)', () => {
