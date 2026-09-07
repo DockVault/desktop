@@ -58,9 +58,14 @@ test('the Computers surface hands over a kind and two ids, nothing that names a 
   assert.match(actCall, /kind/); assert.match(actCall, /deviceId/); assert.match(actCall, /vaultId/);
   const answerCall = CODE.match(/dockvault:wizard\.answer['"].*/)[0];
   assert.ok(!/url|path|folder|file/i.test(answerCall), `wizard.answer passes only an id and a value: ${answerCall}`);
-  // The only sync-controlling channels are the two gated pages' own; nothing generic.
+  // The Troubleshoot surface names a check by id only: no address, host, or port ever travels from the page.
+  for (const call of [CODE.match(/dockvault:troubleshoot\.describe['"].*/)[0], CODE.match(/dockvault:troubleshoot\.probe['"].*/)[0]]) {
+    assert.ok(!/url|host|port|address|path|folder|file/i.test(call), `troubleshoot passes only a check id: ${call}`);
+    assert.match(call, /id: String\(id\)/);
+  }
+  // The only sync-controlling channels are the gated pages' own; nothing generic.
   const channels = [...CODE.matchAll(/ipcRenderer\.invoke\(\s*['"](dockvault:[a-z.-]+)['"]/g)].map((m) => m[1]);
-  for (const ch of channels) assert.match(ch, /^dockvault:(app|server|sync|wizard|manage)\./, ch);
+  for (const ch of channels) assert.match(ch, /^dockvault:(app|server|sync|wizard|manage|troubleshoot)\./, ch);
   assert.ok(!channels.includes('dockvault:sync.setup') && !channels.includes('dockvault:sync.list'));
 });
 

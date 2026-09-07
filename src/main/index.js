@@ -70,6 +70,8 @@ const { resumePendingGrants, markerActionForRunReason, runSetupAgainGrants } = r
 const { decideMigration } = require('./device-migrate');
 const { createSyncWizard } = require('./sync-wizard');
 const { createManageView } = require('./manage-view');
+const { createTroubleshoot } = require('./troubleshoot');
+const { verifySetup } = require('./setup-verify');
 const { deviceRemotePath } = require('./mint-path');
 const { probeSftp } = require('./sftp-probe');
 const { mintDeviceSftpAccess } = require('./device-mint');
@@ -90,6 +92,7 @@ const FAIL_PAGE = 'selftest-fail.html';
 const SETUP_PAGE = 'server-setup.html'; // the first thing an installed app shows
 const WIZARD_PAGE = 'sync-wizard.html'; // the in-app "Set up sync" window
 const MANAGE_PAGE = 'manage.html';      // the in-app "Computers" window
+const TROUBLESHOOT_PAGE = 'troubleshoot.html'; // the in-app Troubleshoot window
 // Forgetting this computer on the OLD server when the person switches servers (revoke the device by id under
 // the old session when reachable, then drop the device secret). The device registration lives in its own
 // modules, which wire this hook; until then it is a documented no-op and the rest of the forget path runs.
@@ -404,6 +407,17 @@ function registerIpc() {
   ipcMain.handle('dockvault:manage.act', (e, args) => (fromManagePage(e) ? manageAct(args) : { ok: false, reason: 'refused' }));
   ipcMain.handle('dockvault:manage.open-setup', (e) => { if (fromManagePage(e)) void openSyncWizard(); return null; });
   ipcMain.handle('dockvault:manage.close', (e) => { if (fromManagePage(e)) closeManageView(); return null; });
+  // The Troubleshoot view's intents, gated to its own window and page. A probe reaches only the saved server
+  // setting (main reads it; the page names a check, never an address), and nothing here writes.
+  const fromTroubleshootPage = (e) => serverSetupMod.isTrustedSetupSender(e, {
+    webContents: (troubleshootWindow && !troubleshootWindow.isDestroyed()) ? troubleshootWindow.webContents : null,
+    appOrigin: APP_ORIGIN, pagePath: schemeMod.SHELL_PATH + TROUBLESHOOT_PAGE,
+  });
+  ipcMain.handle('dockvault:troubleshoot.checks', (e) => (fromTroubleshootPage(e) && troubleshootInstance ? troubleshootInstance.checks() : []));
+  ipcMain.handle('dockvault:troubleshoot.describe', (e, args) => (fromTroubleshootPage(e) && troubleshootInstance ? troubleshootInstance.describe(args && args.id) : null));
+  ipcMain.handle('dockvault:troubleshoot.probe', (e, args) => (fromTroubleshootPage(e) && troubleshootInstance ? troubleshootInstance.probe(args && args.id) : null));
+  ipcMain.handle('dockvault:troubleshoot.open-server-setup', (e) => { if (fromTroubleshootPage(e)) void openServerSetupFromTroubleshoot(); return null; });
+  ipcMain.handle('dockvault:troubleshoot.close', (e) => { if (fromTroubleshootPage(e)) closeTroubleshoot(); return null; });
   ipcMain.handle('dockvault:sync.status', () => (syncHub
     ? syncHub.current()
     : { state: 'unavailable', label: 'Sync unavailable', reason: 'no-secure-store', vaults: [], condition: 'unavailable' }));
@@ -674,6 +688,8 @@ function buildTrayMenu(items, model, migration = null) {
     else if (it.kind === 'setup-server') template.push({ label: it.label, click: () => { void showOrCreateWindow(); } });
     else template.push({ label: it.label, enabled: false });
   }
+  // Checks a person can run themselves when something does not connect; it works without signing in.
+  template.push({ label: 'Troubleshoot…', click: () => { void openTroubleshoot(); } });
   template.push({ label: 'Open DockVault', click: () => { void showOrCreateWindow(); } });
   // When the account tier is paused by a lock, offer an explicit way back rather than a "Lock now" that is
   // already in effect. An IDLE lock reverses on its own when input returns; a SLEEP or OS-screen lock (and a
@@ -1983,6 +1999,58 @@ async function openManageView() {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The Troubleshoot view: a window of checks a person runs from this computer (troubleshoot.js owns the checks
+// and their words); this is the window and the io over the saved server setting and the real network.
+let troubleshootWindow = null;
+let troubleshootInstance = null;
+
+function closeTroubleshoot() {
+  const win = troubleshootWindow;
+  if (win && !win.isDestroyed()) { try { win.close(); } catch { /* gone */ } }
+}
+
+async function openTroubleshoot() {
+  const existing = troubleshootWindow;
+  if (existing && !existing.isDestroyed()) { try { existing.show(); existing.focus(); } catch { /* gone */ } return; }
+  let win = null;
+  try {
+    win = new BrowserWindow({
+      width: 860, height: 680, minWidth: 640, minHeight: 480, show: false,
+      title: 'DockVault — Troubleshoot', icon: APP_ICON, backgroundColor: '#0a0f18', autoHideMenuBar: true,
+      webPreferences: {
+        partition: UI_PARTITION, preload: PRELOAD, contextIsolation: true, sandbox: true, nodeIntegration: false,
+        nodeIntegrationInWorker: false, webSecurity: true, allowRunningInsecureContent: false, spellcheck: false,
+      },
+    });
+    troubleshootWindow = win;
+    troubleshootInstance = createTroubleshoot({
+      serverState: () => serverConfigState(),
+      // The same verify the setup screen runs, over main's request helper and the real SSH probe; it reads the
+      // saved addresses main itself passed in and contacts nothing else.
+      verify: (fields) => verifySetup(fields, { httpJson: mainHttpJson }),
+    });
+    win.setMenuBarVisibility(false);
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    win.webContents.on('will-navigate', (e) => e.preventDefault());
+    win.on('closed', () => { if (troubleshootWindow === win) { troubleshootWindow = null; troubleshootInstance = null; } });
+    await win.loadURL(schemeMod.shellPageUrl(APP_ORIGIN, TROUBLESHOOT_PAGE));
+    win.show();
+  } catch {
+    try { if (win && !win.isDestroyed()) win.close(); } catch { /* best-effort */ }
+  }
+}
+
+// The one fix the view offers: reach the server setup — the change-server flow when a server is in force,
+// the setup screen itself when none is. The view closes only once the setup is really taking over: a consent
+// declined leaves the person exactly where they were, with the checks still in front of them.
+async function openServerSetupFromTroubleshoot() {
+  const s = serverConfigState();
+  if (s.origin && s.status !== 'env') { await changeServer({ onConsent: closeTroubleshoot }); return; }
+  closeTroubleshoot();
+  await showOrCreateWindow();
+}
+
 function buildManageIo() {
   const dir = app.getPath('userData');
   const origin = () => serverConfig.readServerOrigin(dir);
@@ -2499,6 +2567,7 @@ async function finishTraySelftestIfNeeded() {
       const PENDING = (pendingItems[0] && pendingItems[0].label) || '<<no pending item produced>>';
       const DOOR_PHRASE = 'Set up sync…';
       record('render-sync-door', labels.some((l) => l === DOOR_PHRASE));
+      record('render-troubleshoot-door', labels.includes('Troubleshoot…'));
       record('render-pending-setup', labels.includes(PENDING));
       record('render-reset-offer', labels.includes(RESET));
       // tooltip lock-reason path: a paused-locked model + a 'sleep' reason reads the sleep glance. The tooltip's
@@ -2543,7 +2612,7 @@ async function finishTraySelftestIfNeeded() {
   app.exit(ok ? 0 : 1);
 }
 
-module.exports = { __private: { readState, writeState, openSyncWizard, openManageView } }; // exposed only for tests
+module.exports = { __private: { readState, writeState, openSyncWizard, openManageView, openTroubleshoot } }; // exposed only for tests
 
 // ---------------------------------------------------------------------------------------------
 // Start at login. One honest fact, read from the platform every time (login-item.js); the person's
@@ -2638,7 +2707,10 @@ async function openSignInAfterSetup() {
 // Switching servers is a relationship end: the session, the sync credential, the sync setup and this
 // computer's registration all belong to the old server, so they are forgotten BEFORE the new address is
 // asked for. Every step is best-effort — a person who chose to leave is never left stuck on the old server.
-async function changeServer() {
+// Resolves true once the person consented (the switch is then under way), false when they did not.
+// `onConsent` runs right after the consent, before the old relationship is forgotten — for a caller with a
+// window of its own to take down.
+async function changeServer({ onConsent = null } = {}) {
   const s = serverConfigState();
   const consent = trayPresentation.changeServerConsent(s.origin ? serverProbe.hostOf(s.origin) : '');
   let res;
@@ -2647,8 +2719,9 @@ async function changeServer() {
       type: 'question', title: consent.title, noLink: true, message: consent.message,
       buttons: consent.buttons, defaultId: 0, cancelId: 0,
     });
-  } catch { return; }
-  if (!res || res.response !== 1) return;
+  } catch { return false; }
+  if (!res || res.response !== 1) return false;
+  if (onConsent) { try { onConsent(); } catch { /* the caller's window is not load-bearing */ } }
   changeHost = s.origin ? serverProbe.hostOf(s.origin) : null;
   changeSftp = s.sftp ? sftpEndpoint.formatSftpEndpoint(s.sftp) : null;
   await forgetServerRelationship(s.origin);
@@ -2656,9 +2729,10 @@ async function changeServer() {
   refreshTray();
   const win = mainWindow;
   if (win && !win.isDestroyed()) {
-    try { await win.loadURL(schemeMod.shellPageUrl(APP_ORIGIN, SETUP_PAGE)); win.show(); win.focus(); return; } catch { /* recreate below */ }
+    try { await win.loadURL(schemeMod.shellPageUrl(APP_ORIGIN, SETUP_PAGE)); win.show(); win.focus(); return true; } catch { /* recreate below */ }
   }
   await showOrCreateWindow();
+  return true;
 }
 
 async function forgetServerRelationship(origin) {

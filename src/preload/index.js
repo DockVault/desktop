@@ -115,6 +115,22 @@ const api = Object.freeze({
     // Something the view shows changed (a sync ran, a set-up finished): reload. Returns an unsubscribe fn.
     onChanged: (cb) => subscribe('manage', cb),
   }),
+  troubleshoot: Object.freeze({
+    // The Troubleshoot view. Main owns the list of checks and everything each one does; the page only names a
+    // check by the id main gave it and renders what comes back. Nothing here writes, and nothing takes an
+    // address from the page: a probe reaches the SAVED server setting and nothing else.
+    // The checks on offer: [{ id, title }].
+    checks: () => ipcRenderer.invoke('dockvault:troubleshoot.checks'),
+    // What is set up, for one check: { id, title, intro, facts: [{ label, value, mono }], legs: [{ id, label }],
+    // canProbe, note, action } — the saved server host and ports, never a credential or a local path.
+    describe: (id) => ipcRenderer.invoke('dockvault:troubleshoot.describe', { id: String(id) }),
+    // Run the check's live probe from this computer now. Resolves { id, ran, legs: [{ id, label, state, text,
+    // detail }], notes, verdict: { state, text } } — kinds and sentences, a public host-key fingerprint at most.
+    probe: (id) => ipcRenderer.invoke('dockvault:troubleshoot.probe', { id: String(id) }),
+    // Open the server setup (the same screen the app opens with, or the change-server flow with its consent).
+    openServerSetup: () => ipcRenderer.invoke('dockvault:troubleshoot.open-server-setup'),
+    close: () => ipcRenderer.invoke('dockvault:troubleshoot.close'),
+  }),
 });
 
 contextBridge.exposeInMainWorld('dockvault', api);

@@ -91,6 +91,13 @@ whole computer; each asks first, and each takes effect on the server before anyt
 A vault whose permission was taken away, or a computer that was removed, is said so plainly there,
 never shown as still syncing.
 
+"Troubleshoot…" in the tray opens a window of checks you can run yourself, without signing in. The
+first, "Cannot connect to the server", shows the server and file transfer addresses this computer is
+set up with and tries both of them: each door lights green or red, with a sentence on what that means
+and what to do next, and one verdict on the whole. It runs the same verification the setup screen
+does, against the saved addresses (following a redirect the way the app itself would), and changes
+nothing; from it you can go straight to changing the server.
+
 ## Building installers
 
 Installers are produced by [electron-builder](https://www.electron.build/), pinned in

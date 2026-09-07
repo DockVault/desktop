@@ -13,7 +13,7 @@ const { resolveShellFile, shellPageUrl, SHELL_PATH } = require('../src/main/sche
 const root = path.resolve(__dirname, '..', 'src', 'renderer');
 
 test('the shell pages and their scripts resolve to real files under src/renderer', () => {
-  for (const name of ['server-setup.html', 'server-setup.js', 'sync-wizard.html', 'sync-wizard.js', 'manage.html', 'manage.js', 'selftest-fail.html']) {
+  for (const name of ['server-setup.html', 'server-setup.js', 'sync-wizard.html', 'sync-wizard.js', 'manage.html', 'manage.js', 'troubleshoot.html', 'troubleshoot.js', 'selftest-fail.html']) {
     const file = resolveShellFile(`${SHELL_PATH}${name}`);
     assert.equal(file, path.join(root, name));
     assert.ok(fs.existsSync(file), `${name} exists`);
@@ -36,8 +36,8 @@ test('the setup page refers to its script by the bare name the route serves', ()
   assert.match(html, /connect-src 'none'/, 'the page itself may not fetch anything');
 });
 
-test('the wizard and Computers pages refer to their scripts by the bare names the route serves, may fetch nothing, and build no markup from data', () => {
-  for (const [page, script] of [['sync-wizard.html', 'sync-wizard.js'], ['manage.html', 'manage.js']]) {
+test('the wizard, Computers, and Troubleshoot pages refer to their scripts by the bare names the route serves, may fetch nothing, and build no markup from data', () => {
+  for (const [page, script] of [['sync-wizard.html', 'sync-wizard.js'], ['manage.html', 'manage.js'], ['troubleshoot.html', 'troubleshoot.js']]) {
     const html = fs.readFileSync(path.join(root, page), 'utf8');
     assert.ok(html.includes(`<script src="${script}"></script>`), page);
     assert.match(html, /script-src 'self'/);

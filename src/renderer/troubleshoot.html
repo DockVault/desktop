@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- Shell-owned screen: the Troubleshoot view, in its own window. Its script talks only to the typed preload
+       surface (window.dockvault.troubleshoot): it lists the checks main offers, renders the picture main built
+       for the chosen one, and asks main to run that check's live probe. It fetches nothing and names nothing
+       to probe — main reads the saved setting itself. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'">
+  <title>DockVault — Troubleshoot</title>
+  <style>
+    :root { color-scheme: light dark; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #0a0f18; color: #e6edf6;
+      display: flex; flex-direction: column; box-sizing: border-box; min-height: 100%;
+    }
+    header { padding: 1.25rem 2rem .5rem; display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+    h1 { font-size: 1.35rem; margin: 0; }
+    .sub { color: #8aa0bd; font-size: .9rem; }
+    .split { flex: 1; display: grid; grid-template-columns: minmax(12rem, 16rem) 1fr; min-height: 0; }
+    nav { border-right: 1px solid #1a2538; padding: .5rem 0 1rem; overflow: auto; }
+    nav .group { color: #6f849f; font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; padding: .5rem 2rem .25rem; }
+    nav button {
+      display: block; width: 100%; text-align: left; font: inherit; color: #b9c4d4; background: transparent; border: 0;
+      border-left: 3px solid transparent; padding: .55rem 2rem .55rem calc(2rem - 3px); cursor: pointer;
+    }
+    nav button:hover { background: #0e1626; }
+    nav button[aria-current="true"] { color: #e6edf6; background: #0e1626; border-left-color: #2f6fed; font-weight: 600; }
+    nav button:focus-visible { outline: 2px solid #4c8dff; outline-offset: -2px; }
+    main { padding: .5rem 2rem 1.5rem; overflow: auto; min-width: 0; }
+    h2 { font-size: 1.15rem; margin: .5rem 0 .5rem; }
+    p { margin: 0 0 .9rem; color: #b9c4d4; }
+    .facts { display: grid; grid-template-columns: max-content 1fr; gap: .3rem 1rem; margin: 0 0 1rem; font-size: .92rem; }
+    .facts .k { color: #6f849f; }
+    .facts .v { color: #e6edf6; word-break: break-all; }
+    .facts .v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88rem; }
+    .toolbar { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; margin: 0 0 .75rem; }
+    .toolbar .ran { color: #6f849f; font-size: .85rem; }
+    .lights { margin: 0 0 .75rem; padding: .75rem .9rem; border: 1px solid #22304a; border-radius: 10px; background: #0e1626; }
+    .light { display: grid; grid-template-columns: 1.1rem 1fr; gap: .6rem; align-items: start; padding: .4rem 0; }
+    .light + .light { border-top: 1px solid #1a2538; }
+    .light .dot { width: .7rem; height: .7rem; border-radius: 50%; background: #3a4a63; margin-top: .45rem; }
+    .light[data-state="checking"] .dot { background: #d9b24a; animation: pulse 1s ease-in-out infinite; }
+    .light[data-state="ok"] .dot { background: #3ecf7a; }
+    .light[data-state="bad"] .dot { background: #ef6a5e; }
+    .light[data-state="off"] .dot { background: #3a4a63; }
+    .light[data-state="warn"] .dot { background: #d9b24a; }
+    .light[data-state="skip"] .dot { background: #5a6b85; }
+    @keyframes pulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+    .light .name { font-weight: 600; }
+    .light .what { color: #b9c4d4; font-size: .93rem; margin: 0; }
+    .light[data-state="bad"] .what { color: #ffb4a8; }
+    .light[data-state="ok"] .what { color: #9be0b2; }
+    .light[data-state="warn"] .what { color: #f0d9a3; }
+    .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+    .light .detail { color: #6f849f; font-size: .82rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: .15rem 0 0; word-break: break-all; }
+    .note { color: #b9c4d4; font-size: .93rem; }
+    .verdict { margin: 0 0 .75rem; padding: .85rem 1rem; border: 1px solid #22304a; border-radius: 10px; background: #0e1626; }
+    .verdict p { margin: 0; color: #e6edf6; }
+    .verdict[data-state="ok"] { border-color: #1f4d33; background: #0c1a12; } .verdict[data-state="ok"] p { color: #9be0b2; }
+    .verdict[data-state="bad"] { border-color: #6b2d27; background: #1b0f0e; } .verdict[data-state="bad"] p { color: #ffb4a8; }
+    .verdict[data-state="partial"] { border-color: #5a4a1e; background: #1a1708; } .verdict[data-state="partial"] p { color: #f0d9a3; }
+    .verdict[data-state="checking"] p { color: #8aa0bd; }
+    .box { margin: .75rem 0; padding: .85rem 1rem; border: 1px solid #5a4a1e; border-radius: 10px; background: #1a1708; }
+    .box p { color: #f0d9a3; } .box p:last-child { margin-bottom: 0; }
+    .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .5rem; }
+    .btn {
+      font: inherit; font-weight: 600; border: 1px solid #2b3a52; border-radius: 8px; padding: .4rem .8rem; font-size: .9rem;
+      color: #e6edf6; background: #14203a; cursor: pointer;
+    }
+    .btn.primary { background: #2f6fed; border-color: #2f6fed; }
+    .btn:disabled { opacity: .55; cursor: default; }
+    .btn:focus-visible { outline: 2px solid #4c8dff; outline-offset: 2px; }
+    footer { padding: .9rem 2rem 1.25rem; display: flex; gap: .6rem; justify-content: flex-end; border-top: 1px solid #1a2538; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="title">Troubleshoot</h1>
+    <span class="sub" id="sub">Each check runs from this computer.</span>
+  </header>
+  <div class="split">
+    <nav id="nav" aria-label="Checks"><div class="group">Checks</div><div id="checks"></div></nav>
+    <main id="main"><div id="pane"><p>Loading…</p></div></main>
+  </div>
+  <footer>
+    <button class="btn primary" id="close" type="button">Close</button>
+  </footer>
+  <script src="troubleshoot.js"></script>
+</body>
+</html>
