@@ -95,6 +95,11 @@ module.exports = {
   mac: {
     category: 'public.app-category.utilities',
     target: [{ target: 'dmg', arch: ['arm64', 'x64'] }],
+    // Force a clean UNSIGNED build when no certificate is provided: identity:null makes
+    // electron-builder skip mac signing (and notarization) before it tries to import a
+    // certificate, so an empty CSC_LINK can't crash it. With a cert present (CSC_LINK set),
+    // identity:undefined restores normal auto-discovery signing.
+    identity: process.env.CSC_LINK ? undefined : null,
     hardenedRuntime: true,
     gatekeeperAssess: false,
     entitlements: 'build/entitlements.mac.plist',

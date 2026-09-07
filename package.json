@@ -19,9 +19,9 @@
     "fetch-rclone": "node scripts/fetch-rclone.js",
     "pack": "npm run fetch-rclone && electron-builder --dir",
     "dist": "npm run fetch-rclone && electron-builder",
-    "dist:win": "npm run fetch-rclone -- win32-x64 && electron-builder --win --x64",
-    "dist:mac": "npm run fetch-rclone -- darwin-arm64 darwin-x64 && electron-builder --mac --arm64 --x64",
-    "dist:linux": "npm run fetch-rclone -- linux-x64 && electron-builder --linux --x64"
+    "dist:win": "node scripts/fetch-rclone.js win32-x64 && electron-builder --win --x64 --publish never",
+    "dist:mac": "node scripts/fetch-rclone.js darwin-arm64 darwin-x64 && electron-builder --mac --arm64 --x64 --publish never",
+    "dist:linux": "node scripts/fetch-rclone.js linux-x64 && electron-builder --linux --x64 --publish never"
   },
   "devDependencies": {
     "electron": "^44.1.0",

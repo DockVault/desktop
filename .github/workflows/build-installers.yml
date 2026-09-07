@@ -136,6 +136,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           ls -l installers
+          publish=true
           records=0
           for f in installers/signing-*.txt; do
             [ -e "$f" ] || continue
@@ -144,12 +145,15 @@ jobs:
             echo "$f: $state"
             case "$state" in
               signed|not-applicable) ;;
-              *) echo "::error::$f reports '$state'; only signed builds are published. Configure the signing secrets and re-run."; exit 1 ;;
+              *) publish=false ;;
             esac
           done
           if [ "$records" -ne 3 ]; then
-            echo "::error::expected signing records from all three legs, found $records; refusing to publish."
-            exit 1
+            publish=false
+          fi
+          if [ "$publish" != "true" ]; then
+            echo "::notice::Unsigned or incomplete installers; skipping release attach (the installers remain downloadable as workflow artifacts). Configure the signing secrets to publish a release."
+            exit 0
           fi
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --title "$TAG" --notes ""
           gh release upload "$TAG" installers/*.exe installers/*.dmg installers/*.AppImage installers/*.deb --clobber
