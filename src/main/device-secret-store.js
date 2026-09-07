@@ -376,4 +376,4 @@ function zeroizeSecret(secret) {
   if (Buffer.isBuffer(secret)) secret.fill(0);
 }
 
-module.exports = { storeDeviceSecret, readDeviceSecret, readIdentityMeta, hasRotatingMarker, readDeviceIdHint, writeDeviceIdHint, clearDeviceSecret, markDeviceSecretStale, markDeviceSecretRotating, clearDeviceSecretRotating, zeroizeSecret, canonicalOrigin, sameOrigin };
+module.exports = { storeDeviceSecret, readDeviceSecret, readIdentityMeta, hasRotatingMarker, isMarkedStale, readDeviceIdHint, writeDeviceIdHint, clearDeviceSecret, markDeviceSecretStale, markDeviceSecretRotating, clearDeviceSecretRotating, zeroizeSecret, canonicalOrigin, sameOrigin };

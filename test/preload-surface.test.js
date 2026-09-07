@@ -42,13 +42,26 @@ test('no generic fetch/request passthrough is exposed', () => {
 test('the sync surface is OBSERVE-ONLY: status query + status event, and NO initiator/list/control', () => {
   assert.match(CODE, /EVENT_CHANNELS\s*=\s*Object\.freeze\(\[[^\]]*['"]syncstatus['"]/, 'syncstatus is an allowlisted event channel');
   assert.match(CODE, /ipcRenderer\.invoke\(\s*['"]dockvault:sync\.status['"]\s*\)/, 'a cred-free status query is exposed');
-  // Enabling/stopping/listing sync is driven from the tray in main; the renderer has NO such method,
-  // so a compromised page cannot start the native flow or supply a folder/config.
+  // The plain sync surface has NO start/stop/list method. Setting sync up and ending it exist only on the two
+  // shell-owned pages (the wizard and the Computers view), each behind a sender gate bound to its own window,
+  // and neither lets a page name a folder or a config (asserted below).
   assert.ok(!/dockvault:sync\.setup/.test(CODE), 'no renderer sync.setup initiator');
   assert.ok(!/dockvault:sync\.list/.test(CODE), 'no renderer sync.list capability');
   for (const verb of [/\bstartSync\b/, /\bstopSync\b/, /\brunSync\b/, /\bconfigureSync\b/, /\bsync\.run\b/, /\bsync\.start\b/, /\bsync\.setup\b/, /\bsync\.list\b/]) {
     assert.ok(!verb.test(CODE), `no renderer sync-control verb: ${verb}`);
   }
+});
+
+test('the Computers surface hands over a kind and two ids, nothing that names a URL, a path, or a folder; the wizard surface an id and a choice', () => {
+  const actCall = CODE.match(/dockvault:manage\.act['"].*/)[0];
+  assert.ok(!/url|path|folder|file|method|header/i.test(actCall), `manage.act passes only kind + ids: ${actCall}`);
+  assert.match(actCall, /kind/); assert.match(actCall, /deviceId/); assert.match(actCall, /vaultId/);
+  const answerCall = CODE.match(/dockvault:wizard\.answer['"].*/)[0];
+  assert.ok(!/url|path|folder|file/i.test(answerCall), `wizard.answer passes only an id and a value: ${answerCall}`);
+  // The only sync-controlling channels are the two gated pages' own; nothing generic.
+  const channels = [...CODE.matchAll(/ipcRenderer\.invoke\(\s*['"](dockvault:[a-z.-]+)['"]/g)].map((m) => m[1]);
+  for (const ch of channels) assert.match(ch, /^dockvault:(app|server|sync|wizard|manage)\./, ch);
+  assert.ok(!channels.includes('dockvault:sync.setup') && !channels.includes('dockvault:sync.list'));
 });
 
 test('IPC is invoke/on only — no send/sendSync, event channels are allowlisted', () => {

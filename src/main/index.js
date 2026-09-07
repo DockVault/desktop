@@ -69,6 +69,8 @@ const { runDeviceSetup } = require('./device-enable');
 const { resumePendingGrants, markerActionForRunReason, runSetupAgainGrants } = require('./device-grant-resume');
 const { decideMigration } = require('./device-migrate');
 const { createSyncWizard } = require('./sync-wizard');
+const { createManageView } = require('./manage-view');
+const { deviceRemotePath } = require('./mint-path');
 const { probeSftp } = require('./sftp-probe');
 const { mintDeviceSftpAccess } = require('./device-mint');
 const sftpEndpoint = require('./sftp-endpoint');
@@ -87,6 +89,7 @@ const PRELOAD = path.join(__dirname, '..', 'preload', 'index.js');
 const FAIL_PAGE = 'selftest-fail.html';
 const SETUP_PAGE = 'server-setup.html'; // the first thing an installed app shows
 const WIZARD_PAGE = 'sync-wizard.html'; // the in-app "Set up sync" window
+const MANAGE_PAGE = 'manage.html';      // the in-app "Computers" window
 // Forgetting this computer on the OLD server when the person switches servers (revoke the device by id under
 // the old session when reachable, then drop the device secret). The device registration lives in its own
 // modules, which wire this hook; until then it is a documented no-op and the rest of the forget path runs.
@@ -392,6 +395,15 @@ function registerIpc() {
   ipcMain.handle('dockvault:wizard.answer', (e, args) => (fromWizardPage(e) ? wizardAnswer(args) : false));
   ipcMain.handle('dockvault:wizard.close', (e) => { if (fromWizardPage(e)) closeSyncWizard(); return null; });
   ipcMain.handle('dockvault:wizard.open-app', (e) => { if (fromWizardPage(e)) void showOrCreateWindow(); return null; });
+  // The Computers view's intents, gated to its own window and page the same way.
+  const fromManagePage = (e) => serverSetupMod.isTrustedSetupSender(e, {
+    webContents: (manageWindow && !manageWindow.isDestroyed()) ? manageWindow.webContents : null,
+    appOrigin: APP_ORIGIN, pagePath: schemeMod.SHELL_PATH + MANAGE_PAGE,
+  });
+  ipcMain.handle('dockvault:manage.model', (e) => (fromManagePage(e) ? manageModel() : null));
+  ipcMain.handle('dockvault:manage.act', (e, args) => (fromManagePage(e) ? manageAct(args) : { ok: false, reason: 'refused' }));
+  ipcMain.handle('dockvault:manage.open-setup', (e) => { if (fromManagePage(e)) void openSyncWizard(); return null; });
+  ipcMain.handle('dockvault:manage.close', (e) => { if (fromManagePage(e)) closeManageView(); return null; });
   ipcMain.handle('dockvault:sync.status', () => (syncHub
     ? syncHub.current()
     : { state: 'unavailable', label: 'Sync unavailable', reason: 'no-secure-store', vaults: [], condition: 'unavailable' }));
@@ -650,23 +662,9 @@ function buildTrayMenu(items, model, migration = null) {
   if (syncHub) {
     if (migration && migration.tooOldNote) template.push({ label: "This server doesn't support syncing folders from this computer", enabled: false });
     else template.push({ label: 'Set up sync…', click: () => { void openSyncWizard(); } });
-    let configured = [];
-    try { configured = storedConfig(); } catch { /* none */ }
-    if (configured.length) {
-      // The honest per-vault submenu content (Sync-now/Syncing… + the last-synced line, matched to live
-      // status by id) is composed by the pure, tested trayPresentation.vaultRows; here it is only mapped
-      // to menu items and bound to clicks.
-      const folderRows = trayPresentation.vaultRows(configured, model && model.vaults, Date.now()).map((r) => ({
-        label: r.vaultName,
-        submenu: [
-          { label: r.lastSynced, enabled: false },
-          { type: 'separator' },
-          { label: r.syncLabel, enabled: r.syncEnabled, click: () => syncVaultNow(r.vaultId) },
-          { label: `Stop syncing ${r.vaultName}`, click: () => { void stopSyncing(r.vaultId, r.vaultName); } },
-        ],
-      }));
-      template.push({ label: 'Synced folders', submenu: folderRows });
-    }
+    // Everything that is set up — this computer's synced folders, the other computers, and the actions that
+    // end a sync — lives in the Computers window; the tray only opens it.
+    template.push({ label: 'Computers & synced folders…', click: () => { void openManageView(); } });
     template.push({ type: 'separator' });
   }
   // Which server is in force, honestly: a note when the environment overrides a saved setting, a way to
@@ -927,9 +925,11 @@ function notifyManualComplete(vaultId, ev) {
 // Push the computed status to the live renderer (main -> renderer). Cred-free by construction (it is
 // the same model the tray renders); the renderer observes it read-only.
 function pushSyncStatus(model) {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    try { mainWindow.webContents.send('dockvault:evt:syncstatus', model); }
-    catch { /* window gone mid-send */ }
+  for (const win of [mainWindow, manageWindow]) {
+    if (win && !win.isDestroyed()) {
+      try { win.webContents.send('dockvault:evt:syncstatus', model); }
+      catch { /* window gone mid-send */ }
+    }
   }
 }
 
@@ -1872,11 +1872,6 @@ function wizardAnswer(args) {
   if (!wizardInstance || !args || typeof args.id !== 'number') return false;
   return wizardInstance.answer(args.id, args.value);
 }
-// The busy flow may be the wizard sitting at a question: bring it forward so a refused tray action is not a mystery.
-function focusSyncWizardIfOpen() {
-  const win = wizardWindow;
-  if (win && !win.isDestroyed()) { try { win.show(); win.focus(); } catch { /* gone */ } }
-}
 function closeSyncWizard() {
   if (wizardInstance) wizardInstance.cancel();
   const win = wizardWindow;
@@ -1931,6 +1926,166 @@ async function openSyncWizard() {
   } finally {
     syncFlowBusy = false;
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Computers view: an in-app window listing the account's registered computers and this computer's synced
+// vaults, with the actions that end a sync. The model and the action rules are manage-view.js; this is the
+// window, the io over the real stores and routes, and the refresh push.
+let manageWindow = null;
+let manageInstance = null;
+
+function closeManageView() {
+  const win = manageWindow;
+  if (win && !win.isDestroyed()) { try { win.close(); } catch { /* gone */ } }
+}
+function manageModel() { return manageInstance ? manageInstance.model() : null; }
+async function manageAct(args) {
+  if (!manageInstance) return { ok: false, reason: 'refused' };
+  const kind = args && args.kind;
+  const touchesIdentity = kind === 'revoke-grant' || kind === 'revoke-computer' || kind === 'remove-computer' || kind === 'stop-sync';
+  if (!touchesIdentity) return manageInstance.act(args);
+  // The same single-flight the wizard and the other sync flows share: a revoke never runs while a set-up is
+  // between registering and recording, and vice versa.
+  if (syncFlowBusy) return { ok: false, reason: 'busy' };
+  syncFlowBusy = true;
+  try { return await manageInstance.act(args); } finally { syncFlowBusy = false; }
+}
+// Tell an open Computers window that what it shows may have changed (a sync ran, a set-up finished).
+function notifyManageChanged() {
+  const win = manageWindow;
+  if (win && !win.isDestroyed()) { try { win.webContents.send('dockvault:evt:manage', { at: Date.now() }); } catch { /* gone */ } }
+}
+
+async function openManageView() {
+  const existing = manageWindow;
+  if (existing && !existing.isDestroyed()) { try { existing.show(); existing.focus(); } catch { /* gone */ } return; }
+  let win = null;
+  try {
+    win = new BrowserWindow({
+      width: 760, height: 720, minWidth: 560, minHeight: 480, show: false,
+      title: 'DockVault — Computers & synced folders', icon: APP_ICON, backgroundColor: '#0a0f18', autoHideMenuBar: true,
+      webPreferences: {
+        partition: UI_PARTITION, preload: PRELOAD, contextIsolation: true, sandbox: true, nodeIntegration: false,
+        nodeIntegrationInWorker: false, webSecurity: true, allowRunningInsecureContent: false, spellcheck: false,
+      },
+    });
+    manageWindow = win;
+    manageInstance = createManageView(buildManageIo());
+    win.setMenuBarVisibility(false);
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    win.webContents.on('will-navigate', (e) => e.preventDefault());
+    win.on('closed', () => { if (manageWindow === win) { manageWindow = null; manageInstance = null; } });
+    await win.loadURL(schemeMod.shellPageUrl(APP_ORIGIN, MANAGE_PAGE));
+    win.show();
+  } catch {
+    try { if (win && !win.isDestroyed()) win.close(); } catch { /* best-effort */ }
+  }
+}
+
+function buildManageIo() {
+  const dir = app.getPath('userData');
+  const origin = () => serverConfig.readServerOrigin(dir);
+  const metaDeviceId = () => { try { const m = deviceSecretStore.readIdentityMeta(safeStorage, dir); return m && typeof m.deviceId === 'string' ? m.deviceId : null; } catch { return null; } };
+  const hasIdentityBlob = () => { try { return !!deviceSecretStore.readDeviceIdHint(dir); } catch { return false; } }; // the advisory sidecar survives an undecryptable blob
+  const accountCall = async (method, pathname) => {
+    const o = origin();
+    const token = await resolveAccountToken();
+    if (!o || !token) return { ok: false, reason: 'no-session' };
+    let res;
+    try { res = await mainHttpJson(`${o}${pathname}`, deviceRegister.accountInit(token, method)); } catch { return { ok: false, reason: 'network' }; }
+    const s = (res && res.status) || 0;
+    if (s === 200) {
+      // Only a 200 carrying the route's JSON object confirms the change: a front that answers 200 with a page for
+      // a route it does not know must never be read as "revoked" (the same rule the capability probe applies).
+      let body = null;
+      try { body = await res.json(); } catch { body = null; }
+      return body && typeof body === 'object' && !Array.isArray(body) ? { ok: true } : { ok: false, reason: 'indeterminate' };
+    }
+    if (s >= 200 && s < 300) return { ok: false, reason: 'indeterminate' };
+    return { ok: false, reason: s === 404 ? 'not-found' : (s === 401 || s === 403 ? 'auth' : 'refused') };
+  };
+  const dropLocalVault = (vaultId) => {
+    // The local pointer: the sync entry (may throw CONFIG_UNREADABLE rather than clobber), the grant record,
+    // and any pending marker. The folder and its files are left alone.
+    syncConfigStore.saveConfig(safeStorage, dir, syncConfig.removeEntry(storedConfig(), vaultId));
+    try { deviceGrantStore.removeGrantMeta(safeStorage, dir, vaultId); } catch { /* best-effort */ }
+    try { devicePending.clearPending(safeStorage, dir, vaultId); } catch { /* best-effort */ }
+    try { if (credCache) credCache.clear(); } catch { /* best-effort */ }
+  };
+  return {
+    signedIn: () => { try { return !!(origin() && ((sessionBundle && sessionBundle.authToken) || (tokenStore.loadSession(safeStorage, dir) || {}).authToken)); } catch { return false; } },
+    listDevices: async () => {
+      const o = origin();
+      const token = await resolveAccountToken();
+      if (!o || !token) return { ok: false, reason: 'auth' };
+      const r = await deviceRegister.checkDeviceSyncSupported({ serverOrigin: o, accountToken: token }, mainHttpJson);
+      if (!r.supported) return { ok: false, reason: r.reason };
+      deviceMigrateSupport = { origin: o, reason: 'ok' };
+      return { ok: true, devices: r.devices };
+    },
+    // The identity's status and id from the NON-SECRET read (the meta decrypts nothing the menu path would not),
+    // so building the view never materialises the device secret; only myGrants presents it, briefly.
+    myIdentity: () => {
+      const o = origin();
+      if (!o) return { status: 'absent', deviceId: null };
+      try {
+        if (deviceSecretStore.hasRotatingMarker(dir)) return { status: 'rechecking', deviceId: metaDeviceId() };
+        if (deviceSecretStore.isMarkedStale(dir) || deviceIdentityStale) return { status: 'stale', deviceId: metaDeviceId() };
+        const meta = deviceSecretStore.readIdentityMeta(safeStorage, dir);
+        if (!meta) return { status: hasIdentityBlob() ? 'unreadable' : 'absent', deviceId: null };
+        if (!deviceSecretStore.sameOrigin(meta.serverOrigin, o)) return { status: 'absent-for-this-server', deviceId: null };
+        return { status: 'ok', deviceId: typeof meta.deviceId === 'string' ? meta.deviceId : null };
+      } catch { return { status: 'unreadable', deviceId: null }; }
+    },
+    grantRecord: () => {
+      const gm = deviceGrantStore.readGrantMeta(safeStorage, dir);
+      if (deviceGrantStore.isUnreadable(gm.status)) return { status: 'unreadable', has: () => false };
+      const meta = (gm && gm.meta) || {};
+      return { status: gm.status === 'absent' ? 'absent' : 'ok', has: (id) => Object.prototype.hasOwnProperty.call(meta, id) };
+    },
+    reasonText: (live, name) => {
+      const detail = trayPresentation.REASON_DETAIL[live.reason];
+      if (detail) return detail.charAt(0).toUpperCase() + detail.slice(1) + '.';
+      if (live.state === 'needs-decision' || live.state === 'sync-problem') return trayPresentation.itemForVault({ vault: live.vault, reason: live.reason }, name ? { [live.vault]: name } : {}).label;
+      return null;
+    },
+    myGrants: async () => {
+      if (deviceIdentityStale) return { ok: false, reason: 'device-secret-stale' };
+      let id;
+      try { id = deviceSecretStore.readDeviceSecret(safeStorage, dir, origin()); } catch { return { ok: false, reason: 'device-secret-unreadable' }; }
+      if (!id || id.status !== 'ok') { if (id && id.secret) { try { deviceSecretStore.zeroizeSecret(id.secret); } catch { /* best-effort */ } id.secret = null; } return { ok: false, reason: 'device-identity-missing' }; }
+      try { return await deviceGrant.listMyGrants({ serverOrigin: origin(), deviceSecret: id.secret, dir, safeStorage }, { fetchFn: mainHttpJson }); }
+      finally { try { deviceSecretStore.zeroizeSecret(id.secret); } catch { /* best-effort */ } id.secret = null; }
+    },
+    configured: () => storedConfig().map((e) => ({ vaultId: e.vaultId, vaultName: e.vaultName, localFolder: e.localFolder, enabled: e.enabled !== false })),
+    liveStatus: () => (syncHub ? syncHub.current() : { vaults: [] }),
+    endpoint: () => ({ serverHost: origin() ? serverProbe.hostOf(origin()) : '', sftp: serverConfig.readSftpEndpoint(dir) }),
+    remotePathFor: (vaultId, via, vaultName) => (via === 'device' ? deviceRemotePath(vaultId) : (vaultName ? syncConfig.remotePathForVault(vaultName) : null)),
+    revokeGrant: (deviceId, vaultId) => accountCall('POST', `/devices/${encodeURIComponent(deviceId)}/grants/${encodeURIComponent(vaultId)}/revoke`),
+    revokeDevice: (deviceId) => accountCall('POST', `/devices/${encodeURIComponent(deviceId)}/revoke`),
+    deleteDevice: (deviceId) => accountCall('DELETE', `/devices/${encodeURIComponent(deviceId)}`),
+    dropLocalVault,
+    dropLocalIdentity: () => {
+      // This computer's identity ended on the server: it can never be presented again, so clear it here along with
+      // the records that belong to it. The sync entries stay (the honest "removed — set it up again" state), the
+      // synced files are untouched.
+      try { deviceSecretStore.clearDeviceSecret(dir); } catch { /* best-effort */ }
+      try { devicePending.clearAllPending(safeStorage, dir); } catch { /* best-effort */ }
+      try { if (credCache) credCache.clear(); } catch { /* best-effort */ }
+      deviceIdentityStale = false;
+      deviceUnreadableStreak = 0;
+      if (syncScheduler) syncScheduler.releaseHolds(); // a hold from an earlier device reason must not outlive the identity
+    },
+    syncNow: (vaultId) => syncVaultNow(vaultId),
+    afterChange: () => {
+      try { if (syncHub) syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* config unreadable */ }
+      try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ }
+      invalidateMigrationView();
+      refreshTray();
+      void tickSync();
+    },
+  };
 }
 
 // Every side effect the wizard's conversation needs, over the same pieces the tray flows used: the enable io's
@@ -2037,40 +2192,13 @@ function buildWizardIo(win) {
     afterSave: () => {
       try { if (syncHub) syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* config unreadable */ }
       refreshTray();
+      notifyManageChanged();
       // Kick the first sync right away instead of leaving the freshly-enabled vault at "set up - not running yet"
       // until the next routine tick. Via tickSync so the run-state snapshot is refreshed with the new id list first.
       void tickSync();
     },
-    onIdentityChanged: reflect,
+    onIdentityChanged: () => { reflect(); notifyManageChanged(); },
   };
-}
-
-async function stopSyncing(vaultId, vaultName) {
-  if (syncFlowBusy) { focusSyncWizardIfOpen(); return; } // single-flight: don't race a setup or another stop — but show why
-  syncFlowBusy = true;
-  try {
-    const res = await dialog.showMessageBox(mainWindow, {
-      type: 'question', title: 'Stop syncing', noLink: true,
-      message: `Stop syncing ${vaultName}?`,
-      detail: 'DockVault will stop syncing this vault. The files already copied to your folder are left as they are.',
-      buttons: ['Cancel', 'Stop syncing'], defaultId: 0, cancelId: 0,
-    });
-    if (res.response !== 1) return;
-    const dir = app.getPath('userData');
-    try {
-      syncConfigStore.saveConfig(safeStorage, dir, syncConfig.removeEntry(storedConfig(), vaultId));
-    } catch {
-      try { await dialog.showMessageBox(mainWindow, { type: 'error', title: 'Stop syncing', noLink: true, message: 'Your sync settings could not be updated', detail: 'DockVault could not read your current sync settings, so it did not change them. Try again after unlocking your login keychain and reopening DockVault.', buttons: ['OK'] }); } catch { /* best-effort */ }
-      return;
-    }
-    try { if (syncHub) syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* none */ }
-    // Drop any pending device-grant marker for the vault the person just stopped syncing, so the resume sweep
-    // never tries to finish a setup they abandoned (the sweep also drops an unconfigured vault; this is prompt).
-    try { devicePending.clearPending(safeStorage, dir, vaultId); } catch { /* best-effort; the sweep drops it anyway */ }
-    refreshTray();
-  } finally {
-    syncFlowBusy = false;
-  }
 }
 
 // A one-time, non-blocking nudge that sync exists — shown once, on the first unlock, and ONLY when
@@ -2415,7 +2543,7 @@ async function finishTraySelftestIfNeeded() {
   app.exit(ok ? 0 : 1);
 }
 
-module.exports = { __private: { readState, writeState, openSyncWizard } }; // exposed only for tests
+module.exports = { __private: { readState, writeState, openSyncWizard, openManageView } }; // exposed only for tests
 
 // ---------------------------------------------------------------------------------------------
 // Start at login. One honest fact, read from the platform every time (login-item.js); the person's

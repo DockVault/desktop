@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { tooltip, mustActItems, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, vaultRows, HANDLED_ACTION_KINDS } = require('../src/main/tray-presentation');
+const { tooltip, mustActItems, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, HANDLED_ACTION_KINDS } = require('../src/main/tray-presentation');
 const { computeStatus, STATE } = require('../src/main/sync-status-model');
 
 const secure = { hasSecureStore: true, online: true, daemon: 'ready' };
@@ -269,41 +269,6 @@ test('"Sync now" is offered when idle, but a running vault shows the run in prog
   assert.strictEqual(running.kind, 'syncing');
   assert.strictEqual(running.enabled, false, 'a run in flight is not clickable as a fresh "Sync now"');
   assert.doesNotMatch(running.label, /Sync a now/);
-});
-
-test('vaultRows matches each configured vault to its live status, honestly, with a safe fallback', () => {
-  const now = 10 * 24 * 60 * 60 * 1000;
-  const configured = [
-    { vaultId: 'v1', vaultName: 'Marketing' },
-    { vaultId: 'v2', vaultName: 'Finance' },
-    { vaultId: 'v3', vaultName: 'Design' },
-  ];
-  const modelVaults = [
-    { vault: 'v1', running: true, lastSyncedAt: now - 5 * 60 * 1000 },   // a run in flight
-    { vault: 'v2', running: false, lastSyncedAt: now - 60 * 1000 },      // idle, synced a minute ago
-    // v3 has no computed status entry yet
-  ];
-  const rows = vaultRows(configured, modelVaults, now);
-  assert.strictEqual(rows.length, 3);
-  // v1: in flight -> shows the run, the "Sync now" is not offered as a fresh start
-  assert.strictEqual(rows[0].syncLabel, 'Syncing…');
-  assert.strictEqual(rows[0].syncEnabled, false);
-  assert.match(rows[0].lastSynced, /Last synced/);
-  // v2: idle -> "Sync now" offered (enqueues), and a real last-synced time
-  assert.strictEqual(rows[1].syncLabel, 'Sync now');
-  assert.strictEqual(rows[1].syncEnabled, true);
-  assert.strictEqual(rows[1].lastSynced, 'Last synced 1 min ago');
-  // v3: no status yet -> safe fallback (not running, never synced), never a stale/false view
-  assert.strictEqual(rows[2].syncLabel, 'Sync now');
-  assert.strictEqual(rows[2].syncEnabled, true);
-  assert.strictEqual(rows[2].lastSynced, 'Not synced yet');
-  assert.strictEqual(rows[2].vaultId, 'v3');
-  assert.strictEqual(rows[2].vaultName, 'Design');
-});
-
-test('vaultRows is empty when nothing is configured, regardless of stray status entries', () => {
-  assert.deepStrictEqual(vaultRows([], [{ vault: 'ghost', running: true }], 0), []);
-  assert.deepStrictEqual(vaultRows(undefined, undefined, 0), []);
 });
 
 test('"Last synced" reads from the last-success time only, never fabricating one', () => {

@@ -321,30 +321,6 @@ function lastSyncedLabel(lastSyncedAt, now) {
   return `Last synced ${Math.floor(age / DAY_MS)} d ago`;
 }
 
-// Compose the per-vault tray rows, ready for the menu. Each configured vault (its stored id + display
-// name) is matched by id to its LIVE per-vault status; a vault with no computed status yet falls back to
-// a not-running, never-synced view — never a stale or fabricated one. Pure, so the exact menu content —
-// the honest "Sync now"/"Syncing…" affordance and the "Last synced" line per vault — is unit-tested
-// without a tray. The Electron layer maps each row to menu items and binds the clicks. The per-item
-// label omits the vault name (the row is nested under a menu labelled with the name).
-function vaultRows(configured, modelVaults, now) {
-  const byId = new Map((Array.isArray(modelVaults) ? modelVaults : []).map((v) => [v.vault, v]));
-  return (Array.isArray(configured) ? configured : []).map((e) => {
-    const v = byId.get(e.vaultId) || { vault: e.vaultId, running: false, lastSyncedAt: null };
-    const item = syncNowItem({ vault: e.vaultId, running: !!v.running });
-    const inFlight = item.kind === 'syncing';
-    return {
-      vaultId: e.vaultId,
-      vaultName: e.vaultName,
-      lastSynced: lastSyncedLabel(v.lastSyncedAt, now),
-      running: inFlight,
-      syncLabel: inFlight ? 'Syncing…' : 'Sync now',
-      syncEnabled: item.enabled,
-      // The honest transfer detail, shown only while this vault is actually syncing (numbers only, no path).
-      syncingDetail: v.state === STATE.SYNCING ? progressDetail(v.progress) : null,
-    };
-  });
-}
 
 // The one notification an installed app shows on its first launch: it is BOTH the "something happened"
 // after a silent one-click install and the disclosure that a login item now exists, with where to turn
@@ -394,4 +370,4 @@ function changeServerConsent(host) {
   };
 }
 
-module.exports = { tooltip, lockedGlance, mustActItems, itemForVault, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, vaultRows, formatBytes, progressDetail, helperDetail, REASON_DETAIL, HANDLED_ACTION_KINDS, helperRemedy, setPackaged, installedNotification, loginItemMenu, serverMenuItems, changeServerConsent };
+module.exports = { tooltip, lockedGlance, mustActItems, itemForVault, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, formatBytes, progressDetail, helperDetail, REASON_DETAIL, HANDLED_ACTION_KINDS, helperRemedy, setPackaged, installedNotification, loginItemMenu, serverMenuItems, changeServerConsent };

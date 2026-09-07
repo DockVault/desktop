@@ -81,6 +81,16 @@ nothing is saved until you confirm. A server that does not support syncing from 
 there instead of failing later. Connecting to a server never sets up sync by itself, and browsing a
 vault never requires it.
 
+"Computers & synced folders…" in the tray opens the account's list of computers set up to sync. This
+computer is marked, and it is the only one whose vault cards show the local side: the folder, the
+live sync state, when it last synced, and which identity it runs under. Other computers show when
+they were added and last seen; the vaults they sync, and their folders, are managed on those
+computers, and folder paths never leave the computer they belong to. From here you can sync a vault
+now, stop syncing it on this computer, revoke a computer's permission for one vault, or revoke a
+whole computer; each asks first, and each takes effect on the server before anything changes locally.
+A vault whose permission was taken away, or a computer that was removed, is said so plainly there,
+never shown as still syncing.
+
 ## Building installers
 
 Installers are produced by [electron-builder](https://www.electron.build/), pinned in

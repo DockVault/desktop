@@ -31,7 +31,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 // Enumerated event channels the renderer may subscribe to (main -> renderer). No wildcard.
-const EVENT_CHANNELS = Object.freeze(['deeplink', 'lockstate', 'syncstatus', 'wizard']);
+const EVENT_CHANNELS = Object.freeze(['deeplink', 'lockstate', 'syncstatus', 'wizard', 'manage']);
 
 function subscribe(channel, cb) {
   if (!EVENT_CHANNELS.includes(channel)) throw new Error('unknown event channel');
@@ -99,6 +99,21 @@ const api = Object.freeze({
     openApp: () => ipcRenderer.invoke('dockvault:wizard.open-app'),
     // Each new question (main -> renderer). Returns an unsubscribe fn.
     onQuestion: (cb) => subscribe('wizard', cb),
+  }),
+  manage: Object.freeze({
+    // The Computers view's model, built by main (manage-view.js): the account's registered computers, this
+    // computer's vault cards (with their local folder — shown here, never sent anywhere), the others' metadata.
+    // Names, ids, dates, states, and the folder paths main itself holds; never a credential or a raw error.
+    model: () => ipcRenderer.invoke('dockvault:manage.model'),
+    // Carry out an action the person confirmed on the page: { kind, deviceId?, vaultId? } with kind one of
+    // revoke-grant | revoke-computer | remove-computer | stop-sync | sync-now. Main checks the ids' shape and
+    // decides; the server is the authority. Resolves { ok, reason? }.
+    act: (action) => ipcRenderer.invoke('dockvault:manage.act', { kind: String(action && action.kind), deviceId: action && action.deviceId != null ? String(action.deviceId) : undefined, vaultId: action && action.vaultId != null ? String(action.vaultId) : undefined }),
+    // Open the sync setup wizard (the app's own window), and close this one.
+    openSetup: () => ipcRenderer.invoke('dockvault:manage.open-setup'),
+    close: () => ipcRenderer.invoke('dockvault:manage.close'),
+    // Something the view shows changed (a sync ran, a set-up finished): reload. Returns an unsubscribe fn.
+    onChanged: (cb) => subscribe('manage', cb),
   }),
 });
 

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- Shell-owned screen: the "Computers" view, in its own window. Its script talks only to the typed preload
+       surface (window.dockvault.manage): it renders the model the main process built and asks main to carry
+       out an action the person confirmed. It fetches nothing and holds no state beyond what is on screen. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'">
+  <title>DockVault — Computers & synced folders</title>
+  <style>
+    :root { color-scheme: light dark; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #0a0f18; color: #e6edf6;
+      display: flex; flex-direction: column; box-sizing: border-box; min-height: 100%;
+    }
+    header { padding: 1.25rem 2rem .5rem; display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+    h1 { font-size: 1.35rem; margin: 0; }
+    .sub { color: #8aa0bd; font-size: .9rem; }
+    main { flex: 1; padding: .5rem 2rem 1.5rem; overflow: auto; }
+    p { margin: 0 0 .9rem; color: #b9c4d4; }
+    .computer { border: 1px solid #22304a; border-radius: 12px; background: #0e1626; margin: 0 0 1rem; }
+    .computer > .head { display: grid; grid-template-columns: 1fr auto; gap: .25rem .75rem; padding: .85rem 1rem; align-items: start; }
+    .computer > .head .names { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+    .computer > .head .name { font-weight: 700; font-size: 1.05rem; }
+    .computer > .head .meta { grid-column: 1 / -1; }
+    .computer > .head .head-actions { grid-column: 2; grid-row: 1; }
+    .computer.revoked > .head .name { color: #8aa0bd; text-decoration: line-through; }
+    .meta { color: #8aa0bd; font-size: .88rem; }
+    .badge { font-size: .78rem; color: #b9c4d4; border: 1px solid #2b3a52; border-radius: 999px; padding: .1rem .55rem; }
+    .badge.this { color: #9be0b2; border-color: #1f4d33; background: #0c1a12; }
+    .badge.off, .badge.bad { color: #ffb4a8; border-color: #6b2d27; }
+    .badge.warn { color: #f0d9a3; border-color: #5a4a1e; }
+    .standing { color: #f0d9a3; font-size: .9rem; margin: 0; }
+    .reason { color: #b9c4d4; font-size: .9rem; margin: 0; }
+    .spacer { flex: 1; }
+    .cards { padding: 0 1rem 1rem; display: grid; gap: .6rem; }
+    .card { border: 1px solid #1a2538; border-radius: 10px; background: #101a2c; padding: .75rem .9rem; display: grid; gap: .35rem; }
+    .card .title { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+    .card .title .vault { font-weight: 600; }
+    .row { display: grid; grid-template-columns: 6.5rem 1fr; gap: .5rem; font-size: .9rem; }
+    .row .k { color: #6f849f; }
+    .row .v { color: #b9c4d4; word-break: break-all; }
+    .row .v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; }
+    .state { display: inline-flex; align-items: center; gap: .4rem; }
+    .dot { width: .55rem; height: .55rem; border-radius: 50%; background: #3a4a63; display: inline-block; }
+    .dot.ok { background: #3ecf7a; } .dot.warn { background: #d9b24a; } .dot.bad { background: #ef6a5e; } .dot.run { background: #4c8dff; }
+    .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .25rem; }
+    .note { padding: .6rem 1rem 1rem; color: #8aa0bd; font-size: .9rem; }
+    .btn {
+      font: inherit; font-weight: 600; border: 1px solid #2b3a52; border-radius: 8px; padding: .4rem .8rem; font-size: .9rem;
+      color: #e6edf6; background: #14203a; cursor: pointer;
+    }
+    .btn.primary { background: #2f6fed; border-color: #2f6fed; }
+    .btn.danger { color: #ffb4a8; border-color: #6b2d27; background: #1b0f0e; }
+    .btn.quiet { background: transparent; }
+    .btn.quiet.danger { border-color: #3a2320; }
+    .btn:disabled { opacity: .55; cursor: default; }
+    .btn:focus-visible, .btn.quiet:focus-visible { outline: 2px solid #4c8dff; outline-offset: 2px; }
+    .confirm { border: 1px solid #5a4a1e; border-radius: 10px; background: #1a1708; padding: .85rem 1rem; margin-top: .5rem; }
+    .confirm p { color: #f0d9a3; margin-bottom: .6rem; }
+    .confirm p.mono { color: #b9c4d4; }
+    .confirm.danger { border-color: #6b2d27; background: #1b0f0e; }
+    .confirm.danger p { color: #ffb4a8; }
+    .confirm.danger p.mono { color: #b9c4d4; }
+    .box { margin: .75rem 0; padding: .85rem 1rem; border: 1px solid #22304a; border-radius: 10px; background: #0e1626; }
+    .box.bad { border-color: #6b2d27; background: #1b0f0e; } .box.bad p { color: #ffb4a8; }
+    .box p:last-child { margin-bottom: 0; }
+    footer { padding: .9rem 2rem 1.25rem; display: flex; gap: .6rem; justify-content: flex-end; border-top: 1px solid #1a2538; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="title">Computers & synced folders</h1>
+    <span class="sub" id="sub"></span>
+  </header>
+  <main id="main">
+    <div id="body"><p>Loading…</p></div>
+  </main>
+  <footer>
+    <button class="btn" id="refresh" type="button">Refresh</button>
+    <button class="btn" id="setup" type="button">Set up sync…</button>
+    <button class="btn primary" id="close" type="button">Close</button>
+  </footer>
+  <script src="manage.js"></script>
+</body>
+</html>

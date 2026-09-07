@@ -65,13 +65,3 @@ test('tray formatBytes / progressDetail: counts only, singular/plural, omit what
   assert.strictEqual(tray.progressDetail(null), null);
 });
 
-test('tray vaultRows: the transfer detail rides only on the actually-syncing vault', () => {
-  const configured = [{ vaultId: 'v1', vaultName: 'Photos' }, { vaultId: 'v2', vaultName: 'Docs' }];
-  const modelVaults = [
-    { vault: 'v1', state: STATE.SYNCING, running: true, progress: { files: 2, bytes: 3145728 }, lastSyncedAt: null },
-    { vault: 'v2', state: STATE.UP_TO_DATE, running: false, progress: null, lastSyncedAt: 1000 },
-  ];
-  const rows = tray.vaultRows(configured, modelVaults, 2000);
-  assert.strictEqual(rows[0].syncingDetail, '2 files · 3 MB', 'the syncing vault shows the detail');
-  assert.strictEqual(rows[1].syncingDetail, null, 'a non-syncing vault has no transfer detail');
-});
