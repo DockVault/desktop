@@ -87,7 +87,17 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npx electron-builder ${{ matrix.eb }} --publish never
+        # Invoke electron-builder's node entry point directly rather than through `npx`. On the
+        # Windows runner under git-bash, `npx electron-builder` exited 0 in under two seconds with
+        # NO output and produced no dist/ — npx never actually ran the binary there (the macOS and
+        # Linux legs, running the identical command, built normally). `node scripts/fetch-rclone.js`
+        # runs fine in that same shell, so the node entry does too; this matches the working pattern
+        # and removes npx from the path on every OS. The post-build check turns a silent no-output
+        # build into a loud, correctly-attributed failure instead of a missing-file error two steps
+        # later.
+        run: |
+          node node_modules/electron-builder/cli.js ${{ matrix.eb }} --publish never
+          ls -la dist/ || { echo "::error::electron-builder produced no dist/ output"; exit 1; }
 
       # Each leg records whether its installers are signed, so the release job can refuse to publish
       # unsigned ones. Linux has no code signing in this pipeline, so its record is "not-applicable".
