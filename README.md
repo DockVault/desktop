@@ -73,6 +73,14 @@ From then on the saved server is used; the tray's "Change server…" signs you o
 first. For development, `DOCKVAULT_SERVER` overrides the saved setting, and the tray says so when it
 does.
 
+Syncing a vault to a folder is set up from the tray's "Set up sync…", which opens a short in-app
+walk-through: set this computer up to sync (it gets its own identity in your account, so it keeps
+syncing even while DockVault or the screen is locked; shown only the first time), pick a vault, choose
+a folder, and confirm. Every check the folder has to pass, and every decision, is shown in that window;
+nothing is saved until you confirm. A server that does not support syncing from a computer says so
+there instead of failing later. Connecting to a server never sets up sync by itself, and browsing a
+vault never requires it.
+
 ## Building installers
 
 Installers are produced by [electron-builder](https://www.electron.build/), pinned in

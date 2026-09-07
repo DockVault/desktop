@@ -12,8 +12,8 @@ const { resolveShellFile, shellPageUrl, SHELL_PATH } = require('../src/main/sche
 
 const root = path.resolve(__dirname, '..', 'src', 'renderer');
 
-test('the two shell pages and the setup script resolve to real files under src/renderer', () => {
-  for (const name of ['server-setup.html', 'server-setup.js', 'selftest-fail.html']) {
+test('the shell pages and their scripts resolve to real files under src/renderer', () => {
+  for (const name of ['server-setup.html', 'server-setup.js', 'sync-wizard.html', 'sync-wizard.js', 'selftest-fail.html']) {
     const file = resolveShellFile(`${SHELL_PATH}${name}`);
     assert.equal(file, path.join(root, name));
     assert.ok(fs.existsSync(file), `${name} exists`);
@@ -34,4 +34,14 @@ test('the setup page refers to its script by the bare name the route serves', ()
   assert.match(html, /<script src="server-setup\.js"><\/script>/);
   assert.match(html, /script-src 'self'/);
   assert.match(html, /connect-src 'none'/, 'the page itself may not fetch anything');
+});
+
+test('the wizard page refers to its script by the bare name the route serves, and may fetch nothing itself', () => {
+  const html = fs.readFileSync(path.join(root, 'sync-wizard.html'), 'utf8');
+  assert.match(html, /<script src="sync-wizard\.js"><\/script>/);
+  assert.match(html, /script-src 'self'/);
+  assert.match(html, /connect-src 'none'/);
+  // The page builds every element with textContent: no innerHTML anywhere in its script.
+  const js = fs.readFileSync(path.join(root, 'sync-wizard.js'), 'utf8');
+  assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(js), 'no markup from data');
 });

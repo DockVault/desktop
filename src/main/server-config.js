@@ -124,9 +124,24 @@ function writeServerOrigin(userDataDir, input, sftp = null) {
   return origin;
 }
 
+/**
+ * Add (or replace) the SFTP endpoint on the SAVED server setting, keeping its origin — for a setting saved
+ * before the endpoint was asked for. Refuses when nothing readable is saved: the endpoint belongs to a
+ * server, never to an empty or unreadable file (which must not be overwritten from here). When the caller
+ * names the origin it verified the endpoint against (`forOrigin`), a saved setting for a DIFFERENT server is
+ * refused too — the development environment override can put another server in force than the file holds.
+ */
+function writeSftpEndpoint(userDataDir, sftp, forOrigin = null) {
+  const saved = readSavedServer(userDataDir);
+  if (saved.status !== 'ok') throw new Error('no readable server setting to add the SFTP endpoint to');
+  if (forOrigin != null && saved.origin !== normalizeServer(forOrigin).origin) throw new Error('the SFTP endpoint was verified against a different server than the saved one');
+  if (!isSftpEndpoint(sftp)) throw new Error('the SFTP endpoint must be a host and a port');
+  return writeServerOrigin(userDataDir, saved.origin, sftp);
+}
+
 /** Forget the saved server (a server switch): a missing file is already the wanted state. */
 function removeServerOrigin(userDataDir) {
   try { fs.unlinkSync(configFile(userDataDir)); } catch (e) { if (!e || e.code !== 'ENOENT') throw e; }
 }
 
-module.exports = { normalizeServer, readSavedServer, readServerConfigState, readServerOrigin, readSftpEndpoint, writeServerOrigin, removeServerOrigin, setEnvOverrideAllowed, configFile };
+module.exports = { normalizeServer, readSavedServer, readServerConfigState, readServerOrigin, readSftpEndpoint, writeServerOrigin, writeSftpEndpoint, removeServerOrigin, setEnvOverrideAllowed, configFile };

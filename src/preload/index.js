@@ -20,12 +20,18 @@
  * already renders to the tray (states, labels, symbolic reasons) and never a credential, host key,
  * token, or raw helper output. It exposes no way to start, stop, or configure sync from the renderer
  * — those remain main-driven so the lock, latch, and refresh gates can never be bypassed from a page.
+ *
+ * The sync setup wizard is the one place a page takes part in setting sync up, and it is a conversation
+ * main leads: main poses a typed question (which vault, whether to choose a folder, whether to consent)
+ * and the page hands back a choice among what was offered. The page never names a folder (main opens the
+ * OS picker), never supplies a config, and never picks outside the server's list; main checks every
+ * answer. Only the shell's own wizard page, in its own window, passes the sender gate for these channels.
  */
 
 const { contextBridge, ipcRenderer } = require('electron');
 
 // Enumerated event channels the renderer may subscribe to (main -> renderer). No wildcard.
-const EVENT_CHANNELS = Object.freeze(['deeplink', 'lockstate', 'syncstatus']);
+const EVENT_CHANNELS = Object.freeze(['deeplink', 'lockstate', 'syncstatus', 'wizard']);
 
 function subscribe(channel, cb) {
   if (!EVENT_CHANNELS.includes(channel)) throw new Error('unknown event channel');
@@ -78,6 +84,21 @@ const api = Object.freeze({
     // Observe-only by design: there is deliberately NO renderer method to start, configure, or list
     // sync. Enabling/stopping is driven from the tray in the main process, so a compromised page can
     // neither initiate the native flow nor supply a folder or config.
+  }),
+  wizard: Object.freeze({
+    // The question the wizard is currently posing ({ id, kind, ...facts } or null) — for the page's first
+    // paint and after a reload. Facts are names, hosts, ports, a folder path main itself picked, and flags.
+    state: () => ipcRenderer.invoke('dockvault:wizard.state'),
+    // Answer the question with this id. The value is a choice among what the question offered (a vault id
+    // from its list, a boolean, a fixed word, or a typed address for the file-transfer question); an answer
+    // to any other id is ignored. Resolves true when it was taken.
+    answer: (id, value) => ipcRenderer.invoke('dockvault:wizard.answer', { id: Number(id), value }),
+    // End the wizard where it stands and close its window. Nothing is written after this.
+    close: () => ipcRenderer.invoke('dockvault:wizard.close'),
+    // Bring the main DockVault window forward (to sign in, or to open a vault) — the app's own window, nothing else.
+    openApp: () => ipcRenderer.invoke('dockvault:wizard.open-app'),
+    // Each new question (main -> renderer). Returns an unsubscribe fn.
+    onQuestion: (cb) => subscribe('wizard', cb),
   }),
 });
 

@@ -74,11 +74,16 @@ test('deviceOutcomeCopy: a granted-but-unrecorded setup is honest (not silent), 
   assert.doesNotMatch(message, /fail(ed|ure)/i, 'no blame: the grant succeeded, only the local save did not');
 });
 
-test('deviceOutcomeCopy: the device path reads as success and states the password was not saved', () => {
-  const { tone, message } = deviceOutcomeCopy({ via: 'device', outcome: 'granted' }, { vaultName: 'Payroll' });
+test("deviceOutcomeCopy: the device path reads as success; the password reassurance appears only for a password vault, and never as something not saved", () => {
+  const { tone, message } = deviceOutcomeCopy({ via: 'device', outcome: 'granted' }, { vaultName: 'Payroll', hasPassword: true });
   assert.strictEqual(tone, 'ok');
   assert.match(message, /Payroll/);
-  assert.match(message, /password wasn't saved/i);
+  assert.match(message, /password stays with you/i);
+  assert.doesNotMatch(message, /wasn't saved|not saved|fail/i, 'a success line never sounds like a failure');
+  const plain = deviceOutcomeCopy({ via: 'device', outcome: 'granted' }, { vaultName: 'Photos', hasPassword: false });
+  assert.doesNotMatch(plain.message, /password/i, 'a vault without a password gets no password sentence');
+  assert.match(plain.message, /set up to sync on this computer/);
+  assert.match(plain.message, /first sync starts now/, 'success does not claim a sync already happened');
 });
 
 test("deviceOutcomeCopy: 'sign-in' is the calm held wait, not an alarm", () => {
@@ -123,7 +128,7 @@ test('deviceOutcomeCopy: each account-only reason has its own honest line, all r
 });
 
 test('deviceOutcomeCopy: reads cleanly with no context, and fails closed on an unmapped outcome', () => {
-  assert.match(deviceOutcomeCopy({ outcome: 'granted' }).message, /^This vault is now set up/i, 'generic vault noun, capitalized at the sentence start');
+  assert.match(deviceOutcomeCopy({ outcome: 'granted' }).message, /^This vault is set up to sync on this computer/i, 'generic vault noun, capitalized at the sentence start');
   const unknown = deviceOutcomeCopy({ outcome: 'no-such-outcome' });
   assert.strictEqual(unknown.tone, 'info');
   assert.ok(unknown.message.length > 0, 'never blank');

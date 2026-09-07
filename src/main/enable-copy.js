@@ -68,7 +68,7 @@ const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
  * ctx.vaultName and ctx.otherServer fill in when the caller knows them; the copy reads cleanly without either.
  *
  * @param {{via:string, outcome:string, reason?:string, switched?:boolean}} result
- * @param {{vaultName?:string, otherServer?:string}} [ctx]
+ * @param {{vaultName?:string, otherServer?:string, hasPassword?:boolean}} [ctx]
  * @returns {{tone:'ok'|'info'|'todo'|'sign-in', message:string}}
  */
 function deviceOutcomeCopy(result, ctx = {}) {
@@ -77,8 +77,13 @@ function deviceOutcomeCopy(result, ctx = {}) {
   const trailing = `It ${SYNCS_ON}.`; // a self-contained sentence; "it" = the vault, so no name is required
 
   switch (r.outcome) {
-    case 'granted':
-      return { tone: 'ok', message: `${cap(vault)} is now set up to sync on this computer. Your vault password wasn't saved.` };
+    case 'granted': {
+      // Success says what happens now. The privacy fact — the vault's password was proven once and is not kept
+      // anywhere — is worth a sentence only for a vault that HAS a password, and it is phrased as the reassurance
+      // it is, never as something that "wasn't saved" (which reads like a failure under a green light).
+      const pw = ctx && ctx.hasPassword ? ' Its password stays with you: DockVault used it once to set this up and does not keep it.' : '';
+      return { tone: 'ok', message: `${cap(vault)} is set up to sync on this computer — on its own, even while DockVault or the screen is locked. The first sync starts now; the tray shows its status.${pw}` };
+    }
 
     case 'granted-not-recorded':
       // The server grant SUCCEEDED (the vault is set up on this computer), but the local record write did not —

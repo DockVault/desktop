@@ -147,3 +147,22 @@ test('the SFTP endpoint verified at setup is saved beside the origin, read back 
     assert.deepEqual(serverConfig.readServerConfigState(dir, { DOCKVAULT_SERVER: 'https://vault.example.com' }).sftp, { host: 'files.example.com', port: 2200 });
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('an SFTP endpoint can be added to a saved setting later, keeping its origin; never onto nothing or onto an unreadable file', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dv-server-config-'));
+  try {
+    assert.throws(() => serverConfig.writeSftpEndpoint(dir, { host: 'files.example.com', port: 2200 }), /no readable server/);
+    assert.deepEqual(serverConfig.readSavedServer(dir), { status: 'absent' });
+    serverConfig.writeServerOrigin(dir, 'https://vault.example.com');
+    serverConfig.writeSftpEndpoint(dir, { host: 'files.example.com', port: 2200 });
+    assert.deepEqual(serverConfig.readSavedServer(dir), { status: 'ok', origin: 'https://vault.example.com', sftp: { host: 'files.example.com', port: 2200 } });
+    assert.throws(() => serverConfig.writeSftpEndpoint(dir, { host: 'x', port: 0 }));
+    // Verified against another server than the saved one (an environment override in force): refused.
+    assert.throws(() => serverConfig.writeSftpEndpoint(dir, { host: 'other.example.com', port: 22 }, 'https://other.example.com'), /different server/);
+    serverConfig.writeSftpEndpoint(dir, { host: 'files.example.com', port: 2201 }, 'https://vault.example.com/');
+    assert.equal(serverConfig.readSavedServer(dir).sftp.port, 2201);
+    fs.writeFileSync(serverConfig.configFile(dir), '{"origin": "https://old.exa');
+    assert.throws(() => serverConfig.writeSftpEndpoint(dir, { host: 'files.example.com', port: 2200 }), /no readable server/);
+    assert.equal(serverConfig.readSavedServer(dir).status, 'unreadable', 'left as it was');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

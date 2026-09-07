@@ -67,7 +67,9 @@ const deviceGrantStore = require('./device-grant-store');
 const devicePending = require('./device-pending-grant');
 const { runDeviceSetup } = require('./device-enable');
 const { resumePendingGrants, markerActionForRunReason, runSetupAgainGrants } = require('./device-grant-resume');
-const { decideMigration, groupMigrationOutcomes } = require('./device-migrate');
+const { decideMigration } = require('./device-migrate');
+const { createSyncWizard } = require('./sync-wizard');
+const { probeSftp } = require('./sftp-probe');
 const { mintDeviceSftpAccess } = require('./device-mint');
 const sftpEndpoint = require('./sftp-endpoint');
 const { MintPathSelector, identityEndedBy } = require('./mint-path');
@@ -84,6 +86,7 @@ const PRELOAD = path.join(__dirname, '..', 'preload', 'index.js');
 // which the file protocol cannot read). Names under src/renderer; see scheme.js SHELL_PATH.
 const FAIL_PAGE = 'selftest-fail.html';
 const SETUP_PAGE = 'server-setup.html'; // the first thing an installed app shows
+const WIZARD_PAGE = 'sync-wizard.html'; // the in-app "Set up sync" window
 // Forgetting this computer on the OLD server when the person switches servers (revoke the device by id under
 // the old session when reachable, then drop the device secret). The device registration lives in its own
 // modules, which wire this hook; until then it is a documented no-op and the rest of the forget path runs.
@@ -378,6 +381,17 @@ function registerIpc() {
   ipcMain.handle('dockvault:server.state', (e) => (fromSetupPage(e) ? serverScreenState() : null));
   ipcMain.handle('dockvault:server.check', (e, args) => (fromSetupPage(e) ? checkServer(args) : null));
   ipcMain.handle('dockvault:server.connect', (e, args) => (fromSetupPage(e) ? connectServer(args) : { kind: 'refused' }));
+  // The sync setup wizard's intents: the current question, an answer to it, and a close. Only the shell's own
+  // wizard page, in its own window, may ask — the same three-leg sender check, bound to that window. The page
+  // never names a folder or a config: it answers questions main posed (sync-wizard.js).
+  const fromWizardPage = (e) => serverSetupMod.isTrustedSetupSender(e, {
+    webContents: (wizardWindow && !wizardWindow.isDestroyed()) ? wizardWindow.webContents : null,
+    appOrigin: APP_ORIGIN, pagePath: schemeMod.SHELL_PATH + WIZARD_PAGE,
+  });
+  ipcMain.handle('dockvault:wizard.state', (e) => (fromWizardPage(e) ? wizardState() : null));
+  ipcMain.handle('dockvault:wizard.answer', (e, args) => (fromWizardPage(e) ? wizardAnswer(args) : false));
+  ipcMain.handle('dockvault:wizard.close', (e) => { if (fromWizardPage(e)) closeSyncWizard(); return null; });
+  ipcMain.handle('dockvault:wizard.open-app', (e) => { if (fromWizardPage(e)) void showOrCreateWindow(); return null; });
   ipcMain.handle('dockvault:sync.status', () => (syncHub
     ? syncHub.current()
     : { state: 'unavailable', label: 'Sync unavailable', reason: 'no-secure-store', vaults: [], condition: 'unavailable' }));
@@ -630,20 +644,12 @@ function buildTrayMenu(items, model, migration = null) {
   const template = [];
   for (const it of items) template.push({ label: it.label, click: () => handleMustAct(it) });
   if (items.length) template.push({ type: 'separator' });
-  // The always-available, non-blocking offer (and the reversible list of what is already set up).
-  // Sync is offered, never imposed: browsing a vault never requires setting this up.
+  // The one door to setting up sync: it opens the in-app wizard, which handles this computer's identity, the
+  // vault and the folder itself. Sync is offered, never imposed: browsing a vault never requires setting this up.
+  // A server known not to support syncing from a computer gets no door at all (the fact was stated at setup).
   if (syncHub) {
-    template.push({ label: 'Set up sync…', click: () => { void setupSyncForVault(); } });
-    // Existing-setup migration: a standing DOOR (never a status item, so the glance keeps reading up-to-date) to
-    // move account-path vaults onto this computer's own identity; or, when this computer is set up with a
-    // DIFFERENT server, an honest hand-off to the switch flow instead of a silent account path. Both open the
-    // same migration flow, which decides register / grant-only / switch on its own. The copy never says "device
-    // sync" and always states the meanwhile-truth (the vaults keep syncing through the sign-in until then).
-    if (migration && migration.doorShow) {
-      template.push({ label: 'Set up this computer to sync on its own — until then your vaults sync through your sign-in', click: () => { void runDeviceMigration(); } });
-    } else if (migration && migration.otherServerNote) {
-      template.push({ label: 'This computer is set up with a different server — switch it to keep syncing here on its own', click: () => { void runDeviceMigration(); } });
-    }
+    if (migration && migration.tooOldNote) template.push({ label: "This server doesn't support syncing folders from this computer", enabled: false });
+    else template.push({ label: 'Set up sync…', click: () => { void openSyncWizard(); } });
     let configured = [];
     try { configured = storedConfig(); } catch { /* none */ }
     if (configured.length) {
@@ -659,13 +665,7 @@ function buildTrayMenu(items, model, migration = null) {
           { label: `Stop syncing ${r.vaultName}`, click: () => { void stopSyncing(r.vaultId, r.vaultName); } },
         ],
       }));
-      // A server too old for the device model: a calm, non-actionable note at the top of the folder list (no
-      // menu item, no notification) — there is nothing to fix from here, and the vaults keep syncing on the
-      // account session. Only shown when the migration view says so (support 'too-old').
-      const submenu = (migration && migration.tooOldNote)
-        ? [{ label: "This server doesn't support syncing individual computers yet — syncing continues through your sign-in", enabled: false }, { type: 'separator' }, ...folderRows]
-        : folderRows;
-      template.push({ label: 'Synced folders', submenu });
+      template.push({ label: 'Synced folders', submenu: folderRows });
     }
     template.push({ type: 'separator' });
   }
@@ -820,74 +820,6 @@ async function runDeviceSetupAgain() {
     void tickSync();
     await info('This computer is set up to sync again. Your vaults sync on it now; a password-protected vault finishes the moment you next open it.');
   } finally { syncFlowBusy = false; }
-}
-
-// Move a desktop that already syncs on the ACCOUNT path onto this computer's own device identity — the
-// existing-setup migration. It reuses the enable machinery (runDeviceSetup over buildDeviceEnableIo): the FIRST
-// un-recorded vault drives the ONE identity step — register on a genuinely-absent slot, grant-only on a live
-// identity for this server, or the CONSENTED switch on an identity bound to another server — and each further
-// vault is grant-only (the identity now reads 'ok'), so the register/switch consent is shown once, never per
-// vault. A no-password vault is granted here; a password vault defers to a pending marker + "open it once" that
-// the resume sweep completes. grantAndRecord writes each vault's record, which is exactly what makes a later
-// revoke terminal (no account fallback). It NEVER forgets a live identity for THIS server. Fail-soft: any vault
-// short of a device grant simply keeps syncing on the account session. Un-recorded is read as the store's own
-// three-state ('first-setup' only) so an unreadable record is left for later, never re-granted on a locked store.
-async function runDeviceMigration() {
-  if (syncFlowBusy) return;
-  syncFlowBusy = true;
-  try {
-    const dir = app.getPath('userData');
-    let unrecorded = [];
-    try {
-      unrecorded = storedConfig()
-        .filter((e) => e && typeof e.vaultId === 'string' && e.vaultId && deviceGrantHistory(dir, e.vaultId) === 'first-setup')
-        .map((e) => ({ vaultId: e.vaultId, vaultName: e.vaultName || e.vaultId, hasPassword: vaultRequiresPassword(e.vaultId) }));
-    } catch { unrecorded = []; }
-    if (!unrecorded.length) { refreshTray(); return; } // nothing to move (already migrated, or records unreadable) — the door re-derives
-    const io = buildDeviceEnableIo(unrecorded[0]); // ONE shared identity step, then grant each vault through the same io
-    const outcomes = [];
-    for (const v of unrecorded) {
-      let outcome;
-      try { outcome = await runDeviceSetup(io, v); }
-      catch { outcome = { via: 'account', outcome: 'grant-failed', reason: 'device-step-error' }; } // fail-soft: the vault still syncs on the account session
-      if (outcome && outcome.outcome === 'grant-deferred') {
-        try { devicePending.addPending(safeStorage, dir, v.vaultId); } catch { /* an unreadable pending store is non-fatal; the account path still syncs */ }
-      }
-      outcomes.push({ vault: v, outcome });
-      // The identity step (register / switch / sign-in) is shared: if it did not land it will not land for the
-      // rest either, so stop rather than re-prompt per vault. A per-vault grant defer/failure keeps the loop going.
-      const o = outcome && outcome.outcome;
-      if (o === 'register-cancelled' || o === 'switch-declined' || o === 'register-failed' || o === 'account-only' || o === 'sign-in') break;
-    }
-    try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ }
-    invalidateMigrationView(); // records changed (grants written / pending) → the door must re-derive now, not from cache
-    void tickSync();      // reflect the resulting path (device vs account) in the tray
-    refreshTray();        // the door re-derives from records now — a fully-migrated set makes it vanish
-    await showMigrationOutcomes(outcomes);
-  } finally { syncFlowBusy = false; }
-}
-
-// ONE grouped result for a migration pass — never a dialog per vault. Success and the person's own declines are
-// quiet (the tray already reflects them); everything else is shown as honest deviceOutcomeCopy lines in a SINGLE
-// dialog, so a person sees what still needs a step and that nothing was lost (each vault keeps syncing on the
-// account session meanwhile). The grouping is pure + tested (groupMigrationOutcomes): an identity-level outcome
-// (decided once for the whole pass) is one line naming the vaults collectively; a per-vault outcome is one line
-// per vault, so the singular copy always reads correctly.
-async function showMigrationOutcomes(outcomes) {
-  const groups = groupMigrationOutcomes(outcomes);
-  if (!groups.length) return; // all granted / all declined → quiet
-  const lines = [];
-  for (const g of groups) {
-    const sample = { outcome: g.outcome, reason: g.reason || undefined, switched: g.switched };
-    if (g.idLevel) lines.push(enableCopy.deviceOutcomeCopy(sample, { vaultName: 'your vaults' }).message);
-    else for (const name of g.names) lines.push(enableCopy.deviceOutcomeCopy(sample, { vaultName: name }).message);
-  }
-  try {
-    await dialog.showMessageBox(mainWindow, {
-      type: 'info', title: 'Set up this computer', noLink: true,
-      message: 'Set up this computer for sync', detail: lines.join('\n\n'), buttons: ['OK'],
-    });
-  } catch { /* best-effort */ }
 }
 
 // A native how-to dialog for an unready sync helper: the specific reason, then the remedy that fits it. Leak-safe —
@@ -1825,7 +1757,7 @@ async function showDeviceOutcome(outcome, vault) {
   // sign-in, account-only), where they need to know the vault fell back to the account session.
   if (outcome.via === 'device' && outcome.outcome === 'granted') return;
   if (outcome.outcome === 'register-cancelled' || outcome.outcome === 'switch-declined') return;
-  const { message } = enableCopy.deviceOutcomeCopy(outcome, { vaultName: vault.vaultName });
+  const { message } = enableCopy.deviceOutcomeCopy(outcome, { vaultName: vault.vaultName, hasPassword: !!vault.hasPassword });
   try {
     await dialog.showMessageBox(mainWindow, {
       type: 'info', title: 'Sync setup', noLink: true,
@@ -1927,81 +1859,194 @@ async function maybeResumeDeviceGrants() {
   } finally { deviceGrantResumeBusy = false; }
 }
 
-async function setupSyncForVault() {
-  if (!syncHub) return { enabled: false, reason: 'unavailable' };
-  // Single-flight: never open a second enable/stop flow while one is in progress (the overlap check is
-  // read-then-write, so two concurrent flows could both pass it and the second save drop the first).
-  if (syncFlowBusy) return { enabled: false, reason: 'busy' };
-  // Claim the single-flight guard BEFORE anything that opens a dialog (including the unreadable-config
-  // pre-check below), so a second trigger arriving during that dialog is suppressed as busy, not stacked.
+// ---------------------------------------------------------------------------------------------
+// The sync setup wizard: an in-app window that walks through setting this computer up to sync (its own identity
+// on the server), picking a vault, and choosing a folder — replacing the tray-driven dialogs. The flow itself is
+// sync-wizard.js (a conversation of typed questions and answers); this is the window, the wiring of every side
+// effect, and the single-flight guard shared with the other sync flows.
+let wizardWindow = null;
+let wizardInstance = null;
+
+function wizardState() { return wizardInstance ? wizardInstance.currentQuestion() : null; }
+function wizardAnswer(args) {
+  if (!wizardInstance || !args || typeof args.id !== 'number') return false;
+  return wizardInstance.answer(args.id, args.value);
+}
+// The busy flow may be the wizard sitting at a question: bring it forward so a refused tray action is not a mystery.
+function focusSyncWizardIfOpen() {
+  const win = wizardWindow;
+  if (win && !win.isDestroyed()) { try { win.show(); win.focus(); } catch { /* gone */ } }
+}
+function closeSyncWizard() {
+  if (wizardInstance) wizardInstance.cancel();
+  const win = wizardWindow;
+  if (win && !win.isDestroyed()) { try { win.close(); } catch { /* already gone */ } }
+}
+
+async function openSyncWizard() {
+  const existing = wizardWindow;
+  if (existing && !existing.isDestroyed()) {
+    // A wizard still asking: bring it forward. One that has finished (its last screen left open) is closed so
+    // this click starts a fresh set-up rather than refocusing a stale statement.
+    if (!(wizardInstance && wizardInstance.isFinished())) { try { existing.show(); existing.focus(); } catch { /* gone */ } return; }
+    try { existing.close(); } catch { /* gone */ }
+    wizardWindow = null; wizardInstance = null;
+  }
+  if (!syncHub) return;
+  if (syncFlowBusy) return; // single-flight with the other sync flows: never two set-ups at once
   syncFlowBusy = true;
+  let win = null;
   try {
-    // Never drag the person through the pickers over an unreadable config — a save would refuse anyway.
-    const cfgState = syncConfigStore.readConfigState(safeStorage, app.getPath('userData'));
-    if (syncConfigStore.isUnreadable(cfgState.status)) {
-      try {
-        await dialog.showMessageBox(mainWindow, {
-          type: 'error', title: 'Set up sync', noLink: true,
-          message: 'Your sync settings could not be read',
-          detail: 'DockVault will not overwrite them. This usually clears up after unlocking your login keychain and reopening DockVault.',
-          buttons: ['OK'],
-        });
-      } catch { /* best-effort */ }
-      return { enabled: false, reason: 'config-unreadable' };
-    }
-    const r = await syncEnable.runEnableFlow(buildEnableIo());
-    if (r && r.enabled) {
-      try { syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* config unreadable */ }
-      refreshTray();
-      // Kick the first sync right away instead of leaving the freshly-enabled vault at "set up - not running
-      // yet" until the next routine tick. Via tickSync so the run-state snapshot is REFRESHED with the new id
-      // list FIRST — otherwise the just-enabled id is uncovered and would read never-run, auto-resyncing a
-      // re-enabled but still-latched vault instead of blocking it. The dispatch stays gated as usual.
-      void tickSync();
-      // Then the device step, fail-soft on top of the saved config: try to move this vault onto this
-      // computer's own device identity. The config is already saved and syncing on the account session, so
-      // any device-step outcome short of a grant simply leaves it there — this never blocks or undoes setup.
-      await runDeviceStepForVault(r.entry);
-    } else if (r && r.reason === 'no-standard-vaults') {
-      try {
-        await dialog.showMessageBox(mainWindow, {
-          type: 'info', title: 'Set up sync', noLink: true,
-          message: 'No vaults can be synced to this computer yet',
-          detail: 'Syncing to a folder is available for standard vaults. Open DockVault to create one.',
-          buttons: ['OK'],
-        });
-      } catch { /* best-effort */ }
-    } else if (r && r.reason === 'bad-vault-name') {
-      try {
-        await dialog.showMessageBox(mainWindow, {
-          type: 'warning', title: 'Set up sync', noLink: true,
-          message: "That vault can't be synced to a folder",
-          detail: "Its name contains characters that can't be used as a folder name. Rename the vault, then try again.",
-          buttons: ['OK'],
-        });
-      } catch { /* best-effort */ }
-    }
-    return r;
-  } catch (e) {
-    const noSession = !!(e && e.reason === 'no-session');
-    try {
-      await dialog.showMessageBox(mainWindow, {
-        type: noSession ? 'info' : 'error', title: 'Set up sync', noLink: true,
-        message: noSession ? 'Sign in first' : 'Could not set up sync',
-        detail: noSession
-          ? 'Open DockVault and sign in to your account, then set up sync from the tray.'
-          : 'DockVault could not reach the server. Check your connection and try again.',
-        buttons: ['OK'],
-      });
-    } catch { /* best-effort */ }
-    return { enabled: false, reason: noSession ? 'no-session' : 'error' };
+    // Deliberately NOT a child of the main window: closing the app window "to the tray" destroys the main window,
+    // and a child would go with it mid-set-up. The wizard stands on its own; the OS folder picker is parented to it.
+    win = new BrowserWindow({
+      width: 640, height: 760, minWidth: 520, minHeight: 560, show: false,
+      title: 'DockVault — Set up sync', icon: APP_ICON, backgroundColor: '#0a0f18', autoHideMenuBar: true,
+      webPreferences: {
+        partition: UI_PARTITION, preload: PRELOAD, contextIsolation: true, sandbox: true, nodeIntegration: false,
+        nodeIntegrationInWorker: false, webSecurity: true, allowRunningInsecureContent: false, spellcheck: false,
+      },
+    });
+    wizardWindow = win;
+    win.setMenuBarVisibility(false);
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    win.webContents.on('will-navigate', (e) => e.preventDefault()); // the wizard page never navigates anywhere
+    const wizard = createSyncWizard(buildWizardIo(win), (q) => {
+      try { if (!win.isDestroyed()) win.webContents.send('dockvault:evt:wizard', q); } catch { /* window gone */ }
+    });
+    wizardInstance = wizard;
+    win.on('closed', () => {
+      wizard.cancel(); // closing the window ends the flow wherever it stands; nothing is written after this
+      if (wizardWindow === win) wizardWindow = null;
+      if (wizardInstance === wizard) wizardInstance = null;
+    });
+    await win.loadURL(schemeMod.shellPageUrl(APP_ORIGIN, WIZARD_PAGE));
+    win.show();
+    // Resolves at the terminal statement — the window stays so the person can read it — or at a cancel, which
+    // closes the window: a "Not now" or "Cancel" means "take me out of here", not a blank screen.
+    const result = await wizard.run();
+    if (result && result.kind === 'cancelled') { try { if (!win.isDestroyed()) win.close(); } catch { /* gone */ } }
+  } catch {
+    try { if (win && !win.isDestroyed()) win.close(); } catch { /* best-effort */ }
   } finally {
     syncFlowBusy = false;
   }
 }
 
+// Every side effect the wizard's conversation needs, over the same pieces the tray flows used: the enable io's
+// checks and save, the device io's register and grant (ONE instance, so a fresh registration's id serves the
+// grants that follow), the setup screen's SFTP verify, and the app's own reactions.
+function buildWizardIo(win) {
+  const dir = app.getPath('userData');
+  const home = app.getPath('home');
+  const caseInsensitive = process.platform === 'win32' || process.platform === 'darwin';
+  const base = buildEnableIo();
+  const dev = buildDeviceEnableIo(null);
+  let existingLabels = [];
+  const reflect = () => {
+    try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ }
+    invalidateMigrationView();
+    refreshTray();
+    void tickSync();
+  };
+  return {
+    gather: async () => {
+      const origin = serverConfig.readServerOrigin(dir);
+      const token = await resolveAccountToken();
+      const signedIn = !!(origin && token);
+      let support = 'indeterminate';
+      if (signedIn) {
+        try {
+          const r = await deviceRegister.checkDeviceSyncSupported({ serverOrigin: origin, accountToken: token }, mainHttpJson);
+          support = r.reason;
+          if (Array.isArray(r.devices)) existingLabels = r.devices.map((d) => d && d.label).filter((l) => typeof l === 'string');
+          deviceMigrateSupport = { origin, reason: r.reason }; // the tray's door reads this too
+          invalidateMigrationView();
+        } catch { support = 'indeterminate'; }
+      }
+      let deviceStatus = 'unreadable';
+      let otherServerHost = null;
+      try {
+        const read = deviceSecretStore.readDeviceSecret(safeStorage, dir, origin);
+        deviceStatus = (read && read.status) || 'absent';
+        if (read && read.status === 'absent-for-this-server' && read.otherOrigin) otherServerHost = serverProbe.hostOf(read.otherOrigin);
+        if (read && read.secret) { try { deviceSecretStore.zeroizeSecret(read.secret); } catch { /* best-effort */ } read.secret = null; }
+      } catch { deviceStatus = 'unreadable'; }
+      if (deviceStatus === 'stale' && !deviceIdentityStale) { try { if (deviceSecretStore.hasRotatingMarker(dir)) deviceStatus = 'rechecking'; } catch { /* keep stale */ } }
+      let configUnreadable = false;
+      try { configUnreadable = syncConfigStore.isUnreadable(syncConfigStore.readConfigState(safeStorage, dir).status); } catch { configUnreadable = true; }
+      const sftp = origin ? serverConfig.readSftpEndpoint(dir) : null;
+      const suggestion = origin ? sftpEndpoint.suggestSftpEndpoint(origin) : null;
+      let existing = [];
+      try {
+        existing = storedConfig()
+          .filter((e) => e && typeof e.vaultId === 'string' && e.vaultId && deviceGrantHistory(dir, e.vaultId) === 'first-setup')
+          .map((e) => ({ vaultId: e.vaultId, vaultName: e.vaultName || e.vaultId, hasPassword: vaultRequiresPassword(e.vaultId) }));
+      } catch { existing = []; }
+      return {
+        signedIn, support, deviceStatus, otherServerHost,
+        sftpSaved: !!sftp, sftpSuggestion: suggestion ? sftpEndpoint.formatSftpEndpoint(suggestion) : '',
+        configUnreadable, label: deviceRegister.suggestDeviceLabel(existingLabels), existing,
+      };
+    },
+    verifySftp: async (text) => {
+      const parsed = sftpEndpoint.parseSftpEndpoint(text);
+      if (parsed.kind !== 'ok') return { kind: parsed.kind, host: '', port: 0 };
+      let r;
+      try { r = await probeSftp({ host: parsed.host, port: parsed.port }); } catch { r = { kind: 'unreachable', host: parsed.host, port: parsed.port }; }
+      const out = { kind: r.kind, host: r.host, port: r.port };
+      if (r.kind === 'ok') out.fingerprint = r.fingerprint; // never the key line: the pin comes from the vault's answer
+      return out;
+    },
+    saveSftp: (ep) => serverConfig.writeSftpEndpoint(dir, ep, serverConfig.readServerOrigin(dir)),
+    registration: { probe: dev.probe, readStatus: dev.readStatus, forget: dev.forget, register: dev.register },
+    grantVault: dev.grantVault,
+    addPending: (vaultId) => devicePending.addPending(safeStorage, dir, vaultId),
+    enable: {
+      listVaults: base.listVaults,
+      someExcluded: () => lastSomeExcluded,
+      configuredFolder: (vaultId) => { try { const e = storedConfig().find((x) => x.vaultId === vaultId); return (e && e.localFolder) || null; } catch { return null; } },
+      vaultHasPassword: (vaultId) => vaultRequiresPassword(vaultId),
+      resolveReal: base.resolveReal,
+      classifyCtx: base.classifyCtx,
+      inspectFolderSharing: base.inspectFolderSharing,
+      makePrivate: base.makePrivate,
+      isNonEmptyDir: base.isNonEmptyDir,
+      ensureFolder: base.ensureFolder,
+      save: base.save,
+    },
+    pickFolderNative: async () => {
+      const res = await dialog.showOpenDialog(win, { title: 'Choose a folder to sync into', properties: ['openDirectory', 'createDirectory'] });
+      return (res.canceled || !res.filePaths || !res.filePaths[0]) ? null : res.filePaths[0];
+    },
+    consentNotes: ({ vaultId, folder }) => {
+      let priorFolder = null;
+      try { const prior = storedConfig().find((e) => e.vaultId === vaultId); if (prior && prior.localFolder && prior.localFolder !== folder) priorFolder = prior.localFolder; } catch { priorFolder = null; }
+      // Windows does not enforce owner-only folder permissions, so a folder outside the user profile can be readable
+      // by other local accounts; the consent says so for such a target.
+      const outsideProfile = process.platform === 'win32' && !syncConfig.isWithin(folder, home, caseInsensitive);
+      return { priorFolder, outsideProfile };
+    },
+    cloudServiceName: (folder) => enableCopy.cloudServiceName(folder),
+    copy: {
+      refuse: (reason) => enableCopy.refuseMessage(reason),
+      cloud: (service) => enableCopy.cloudWarnMessage(service),
+      consent: (vaultName, folder, o) => enableCopy.consentMessage(vaultName, folder, o),
+      deviceOutcome: (r, ctx) => enableCopy.deviceOutcomeCopy(r, ctx).message,
+    },
+    afterSave: () => {
+      try { if (syncHub) syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* config unreadable */ }
+      refreshTray();
+      // Kick the first sync right away instead of leaving the freshly-enabled vault at "set up - not running yet"
+      // until the next routine tick. Via tickSync so the run-state snapshot is refreshed with the new id list first.
+      void tickSync();
+    },
+    onIdentityChanged: reflect,
+  };
+}
+
 async function stopSyncing(vaultId, vaultName) {
-  if (syncFlowBusy) return; // single-flight: don't race a setup or another stop
+  if (syncFlowBusy) { focusSyncWizardIfOpen(); return; } // single-flight: don't race a setup or another stop — but show why
   syncFlowBusy = true;
   try {
     const res = await dialog.showMessageBox(mainWindow, {
@@ -2050,7 +2095,7 @@ async function maybeOfferSyncSetup() {
   if (eligible < 1) return; // nothing to sync — don't nudge; the tray entry still offers it if that changes
   try {
     const n = new Notification({ title: 'DockVault', body: 'You can sync a vault to a folder on this computer — set it up any time from the tray menu.' });
-    n.on('click', () => { void setupSyncForVault(); });
+    n.on('click', () => { void openSyncWizard(); });
     n.show();
   } catch { /* best-effort */ }
 }
@@ -2079,7 +2124,7 @@ async function maybeOfferDeviceMigration() {
   if (!Notification || !Notification.isSupported || !Notification.isSupported()) return; // can't notify; the door still stands
   try {
     const n = new Notification({ title: 'DockVault', body: 'This computer can now sync on its own, even while the screen is locked — set it up any time from the tray menu.' });
-    n.on('click', () => { void runDeviceMigration(); });
+    n.on('click', () => { void openSyncWizard(); });
     n.show();
     writeState({ deviceMigrationOfferOrigin: origin }); // shown once for this origin: a decline won't re-nudge; a server switch will
   } catch { /* best-effort; the standing door still carries the offer */ }
@@ -2255,7 +2300,7 @@ async function finishSmokeIfNeeded() {
 //   (a) RENDER — a refreshTray that draws the menu WITHOUT the device assembly (the failure a two-argument
 //       buildTrayMenu call produces: migration is null, so the migration door, the pending "finish setting up"
 //       reminder and the escape-hatch reset offer silently never appear);
-//   (b) CLICK  — a drawn menu whose click handlers reference a function the merge deleted (runDeviceMigration,
+//   (b) CLICK  — a drawn menu whose click handlers reference a function the merge deleted (openSyncWizard,
 //       resetDeviceIdentity, runDeviceSetupAgain), so the menu draws and the click throws ReferenceError.
 // Neither mode lives in Electron's Tray/Menu layer; both live in this module's JavaScript, so an in-module
 // check proves them and an OS click adds nothing. State is forced through the EXISTING module seams (the config
@@ -2318,14 +2363,14 @@ async function finishTraySelftestIfNeeded() {
       const items = (menu && Array.isArray(menu.items)) ? menu.items : [];
       const labels = items.map((it) => (it && typeof it.label === 'string') ? it.label : '');
       // The reset + pending EXPECTED strings come from their OWN presentation functions — immune to wording
-      // drift, and present in the drawn menu only if refreshTray actually ran the device assembly. The door is
-      // inline in buildTrayMenu, matched by its stable, unambiguous leading phrase (the switch-line and too-old
-      // note begin differently). A two-argument buildTrayMenu (migration null, empty items) draws NONE of these.
+      // drift, and present in the drawn menu only if refreshTray actually ran the device assembly (mode (a)). The
+      // sync door is drawn whenever the hub is up, so its RENDER row only proves the entry exists; its CLICK row
+      // below is what catches a deleted openSyncWizard (mode (b)).
       const RESET = trayPresentation.deviceResetItem().label;
       const pendingItems = trayPresentation.pendingSetupItems([VAULT.vaultId], { nameById: { [VAULT.vaultId]: VAULT.vaultName }, wasGranted: () => false, alreadyShown: () => false });
       const PENDING = (pendingItems[0] && pendingItems[0].label) || '<<no pending item produced>>';
-      const DOOR_PHRASE = 'Set up this computer to sync on its own';
-      record('render-migration-door', labels.some((l) => l.startsWith(DOOR_PHRASE)));
+      const DOOR_PHRASE = 'Set up sync…';
+      record('render-sync-door', labels.some((l) => l === DOOR_PHRASE));
       record('render-pending-setup', labels.includes(PENDING));
       record('render-reset-offer', labels.includes(RESET));
       // tooltip lock-reason path: a paused-locked model + a 'sleep' reason reads the sleep glance. The tooltip's
@@ -2345,9 +2390,9 @@ async function finishTraySelftestIfNeeded() {
       // (b) CLICK — the door + reset (and set-up-again) handlers resolve without a dropped-function throw.
       try { dialog.showMessageBox = () => Promise.resolve({ response: 0 }); } catch { /* belt-and-suspenders; syncFlowBusy short-circuits before any dialog anyway */ }
       syncFlowBusy = true; // the module's own single-flight guard: every device flow returns at its first line
-      const door = items.find((it) => it && typeof it.label === 'string' && it.label.startsWith(DOOR_PHRASE));
+      const door = items.find((it) => it && it.label === DOOR_PHRASE);
       const reset = items.find((it) => it && it.label === RESET);
-      await settlesNoThrow('click-migration-door', door && door.click, record);
+      await settlesNoThrow('click-sync-door', door && door.click, record);
       await settlesNoThrow('click-reset-offer', reset && reset.click, record);
       await settlesNoThrow('click-set-up-again', () => handleMustAct({ kind: 'set-up-again' }), record);
     }
@@ -2370,7 +2415,7 @@ async function finishTraySelftestIfNeeded() {
   app.exit(ok ? 0 : 1);
 }
 
-module.exports = { __private: { readState, writeState } }; // exposed only for tests
+module.exports = { __private: { readState, writeState, openSyncWizard } }; // exposed only for tests
 
 // ---------------------------------------------------------------------------------------------
 // Start at login. One honest fact, read from the platform every time (login-item.js); the person's

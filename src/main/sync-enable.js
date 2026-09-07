@@ -35,7 +35,8 @@ const { remotePathForVault, makeConfigEntry, classifyLocalTarget } = require('./
  *   the folder-privacy consent gate, shown ONLY when the folder is shared; its explicit "make-private" is the sole trigger
  *   to strip access — declining never strips
  * @param {(folder:string) => Promise<{ok:boolean,reason?:string}>} [io.makePrivate]  make the folder owner-only AFTER consent
- * @param {(vaultName:string, folder:string) => Promise<boolean>} io.confirmConsent  the readable-copies consent
+ * @param {(o:{vaultId:string,vaultName:string,folder:string,nonEmpty:boolean}) => Promise<boolean|'choose-different'>} io.confirmConsent
+ *   the readable-copies consent; 'choose-different' sends the person back to the folder pick, false leaves
  * @param {(folder:string) => void} io.ensureFolder  create the folder not-world-accessible (idempotent)
  * @param {(reason:string) => (void|Promise<void>)} io.onRefuse  surface why a folder was refused
  * @param {(entry:object) => (void|Promise<void>)} io.save  persist the accepted entry
@@ -94,7 +95,8 @@ async function runEnableFlow(io) {
     // contents into the server-readable vault, so the consent must know whether the folder is non-empty.
     const nonEmpty = typeof io.isNonEmptyDir === 'function' ? !!io.isNonEmptyDir(resolved) : false;
     const consented = await io.confirmConsent({ vaultId: vault.vaultId, vaultName: vault.vaultName, folder: resolved, nonEmpty });
-    if (!consented) return { enabled: false, cancelled: true };
+    if (consented === 'choose-different') continue; // back to the folder pick, nothing written
+    if (consented !== true) return { enabled: false, cancelled: true };
 
     // The remote is ALWAYS the value derived from the chosen vault above — never a picker/renderer value.
     io.ensureFolder(resolved);

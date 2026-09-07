@@ -42,14 +42,29 @@ const { decideEnableDeviceStep } = require('./device-register');
  * @returns {Promise<{via:'device'|'account', outcome:string, reason?:string}>}
  */
 async function runDeviceSetup(io, vault) {
+  const reg = await runDeviceRegistration(io);
+  if (!reg.ok) return reg.outcome;
+  return runDeviceGrant(io, vault);
+}
+
+/**
+ * The IDENTITY half on its own: probe, decide, and register this computer (or switch it here with consent) —
+ * everything up to but not including a vault grant. Resolves { ok: true, action } when this computer holds a
+ * live identity for this server afterwards (action: 'registered' | 'switched' | 'already'), or
+ * { ok: false, outcome } with the same typed account-path outcome runDeviceSetup would have returned, so a
+ * caller that separates "set this computer up" from "grant a vault" (the setup wizard) reads the same truths.
+ * @param {object} io  the probe / readStatus / confirmSwitchServer / forget / promptLabel / register members
+ */
+async function runDeviceRegistration(io) {
   let probeReason;
   try { probeReason = (await io.probe()).reason; } catch { probeReason = 'indeterminate'; } // could not verify -> account path, honest
   let secretStatus;
   try { secretStatus = io.readStatus(); } catch { secretStatus = 'unreadable'; }
 
   const decision = decideEnableDeviceStep({ probeReason, secretStatus });
-  if (decision.action === 'sign-in') return { via: 'account', outcome: 'sign-in', reason: decision.reason };
-  if (decision.action === 'account-only') return { via: 'account', outcome: 'account-only', reason: decision.reason };
+  if (decision.action === 'sign-in') return { ok: false, outcome: { via: 'account', outcome: 'sign-in', reason: decision.reason } };
+  if (decision.action === 'account-only') return { ok: false, outcome: { via: 'account', outcome: 'account-only', reason: decision.reason } };
+  if (decision.action === 'grant-only') return { ok: true, action: 'already' };
 
   // An identity bound to ANOTHER server: never a clobber, and never a strand. Both answers that CAN be taken back
   // — the consent to switch and the label — are collected before the one step that cannot: forget (local clear +
@@ -59,32 +74,37 @@ async function runDeviceSetup(io, vault) {
   if (isSwitch) {
     let proceed = false;
     try { proceed = await io.confirmSwitchServer(); } catch { proceed = false; }
-    if (!proceed) return { via: 'account', outcome: 'switch-declined', reason: 'registered-elsewhere' };
+    if (!proceed) return { ok: false, outcome: { via: 'account', outcome: 'switch-declined', reason: 'registered-elsewhere' } };
   }
 
   // register (absent) or the register half of a switch: name this computer FIRST (reversible), then — only for a
   // switch — run the irreversible forget, then create the server row + store the secret. Ordering the forget after
   // the label is why a cancelled label forgets nothing.
-  if (decision.action === 'register' || isSwitch) {
-    const label = await io.promptLabel();
-    if (label === null) return { via: 'account', outcome: 'register-cancelled' }; // nothing forgotten; the config still syncs on the account session
-    if (isSwitch) {
-      try { await io.forget(); } catch { /* forget never throws; a failed revoke keeps the id nameable, the clear still runs */ }
-    }
-    const reg = await io.register(label);
-    if (!reg || !reg.ok) {
-      // A switch that fails AFTER the forget has already removed this computer from the other server carries
-      // `switched`, so the caller's copy can be honest ("no longer set up with the other server"), not just
-      // "didn't finish". A plain absent-slot register-failed removed nothing, so it carries no flag.
-      const failed = { via: 'account', outcome: 'register-failed', reason: (reg && reg.reason) || 'register-refused' };
-      if (isSwitch) failed.switched = true;
-      return failed;
-    }
+  const label = await io.promptLabel();
+  if (label === null) return { ok: false, outcome: { via: 'account', outcome: 'register-cancelled' } }; // nothing forgotten; the config still syncs on the account session
+  if (isSwitch) {
+    try { await io.forget(); } catch { /* forget never throws; a failed revoke keeps the id nameable, the clear still runs */ }
   }
+  const reg = await io.register(label);
+  if (!reg || !reg.ok) {
+    // A switch that fails AFTER the forget has already removed this computer from the other server carries
+    // `switched`, so the caller's copy can be honest ("no longer set up with the other server"), not just
+    // "didn't finish". A plain absent-slot register-failed removed nothing, so it carries no flag.
+    const failed = { via: 'account', outcome: 'register-failed', reason: (reg && reg.reason) || 'register-refused' };
+    if (isSwitch) failed.switched = true;
+    return { ok: false, outcome: failed };
+  }
+  return { ok: true, action: isSwitch ? 'switched' : 'registered' };
+}
 
-  // grant-only, or after a successful register/switch: grant this vault (the caller prompts the password only
-  // when the vault has one). A completed grant moves the vault to the device path; a deferred password leaves
-  // it on the account path as a calm, resumable "enter the password" state; a real failure is reported as such.
+/**
+ * The GRANT half on its own: grant one vault to this computer's live identity (the caller prompts the password
+ * only when the vault has one). A completed grant moves the vault to the device path; a deferred password leaves
+ * it on the account path as a calm, resumable "enter the password" state; a real failure is reported as such.
+ * @param {object} io  the grantVault member
+ * @param {{vaultId:string, vaultName:string, hasPassword:boolean}} vault
+ */
+async function runDeviceGrant(io, vault) {
   const g = await io.grantVault({ vaultId: vault.vaultId, vaultName: vault.vaultName, hasPassword: !!vault.hasPassword });
   // A granted vault is on the device path. `recordFailed` means the SERVER grant succeeded but the local record
   // write did not — surface it as a distinct outcome (not a silent 'granted') so the person is told the setup
@@ -94,4 +114,4 @@ async function runDeviceSetup(io, vault) {
   return { via: 'account', outcome: 'grant-failed', reason: (g && g.reason) || 'grant-failed' };
 }
 
-module.exports = { runDeviceSetup };
+module.exports = { runDeviceSetup, runDeviceRegistration, runDeviceGrant };
