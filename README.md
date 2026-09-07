@@ -58,11 +58,20 @@ nothing else removes it; the Windows uninstaller removes it for you.
 Each installer carries its own copy of [rclone](https://rclone.org/), the helper that performs
 Standard-vault sync, so nothing else needs to be installed.
 
-The first time DockVault opens it asks for your server's address (https only) and checks it before
-saving: an address that cannot be reached, a certificate this computer does not trust, or a server
-that is not DockVault each get a plain explanation, never a bypass. From then on the saved server
-is used; the tray's "Change server…" signs you out of the old one first. For development,
-`DOCKVAULT_SERVER` overrides the saved setting, and the tray says so when it does.
+The first time DockVault opens it asks for two addresses and checks both before saving anything:
+your server's address (https only), and the file transfer (SFTP) address that synced folders are
+sent to, which is usually the server's own name on port 2222. Each gets its own light: the server
+must answer as DockVault, and the SFTP address must be reachable and prove its host key. An address
+that cannot be reached, a certificate this computer does not trust, a server that is not DockVault,
+or a port that is not SFTP each get a plain explanation, never a bypass. The check also tells you up
+front whether the server supports syncing folders from this computer at all; if it does not, you can
+still connect and use your files, and the SFTP address is not needed. The SFTP address you verified is
+what sync connects to from then on, even when a deployment publishes SFTP on a different port than the
+server believes. Connecting to a server never sets up sync by itself.
+
+From then on the saved server is used; the tray's "Change server…" signs you out of the old one
+first. For development, `DOCKVAULT_SERVER` overrides the saved setting, and the tray says so when it
+does.
 
 ## Building installers
 

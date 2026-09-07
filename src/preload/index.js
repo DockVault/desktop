@@ -50,17 +50,24 @@ const api = Object.freeze({
     onState: (cb) => subscribe('lockstate', cb),
   }),
   server: Object.freeze({
-    // The setup screen's view of the server setting: { mode, status, host } — mode 'first-run' | 'change',
-    // status 'absent' | 'unreadable' | 'ok' | 'env', and the host of the origin in force (for pre-filling).
-    // Never the file's contents, never whether the file exists beyond that status.
+    // The setup screen's view of the server setting: { mode, status, host, sftp } — mode 'first-run' |
+    // 'change', status 'absent' | 'unreadable' | 'ok' | 'env', the host of the origin in force and the
+    // saved SFTP address as "host:port" (both for pre-filling). Never the file's contents, never whether
+    // the file exists beyond that status.
     state: () => ipcRenderer.invoke('dockvault:server.state'),
-    // Hand the typed address to the main process, which normalises it, checks it against the fixed
-    // health route (no other URL is ever fetched), and saves it only when it answers as DockVault. The
-    // renderer never touches the file. Returns the typed outcome { kind, origin?, host? }; kind
-    // 'needs-confirm' means a saved setting exists that could not be read and the person must confirm
-    // replacing it (replaceUnreadable: true) before anything is written. On ok/degraded, main then loads
-    // the sign-in page from the new server; the page just shows "Connected".
-    connect: (input, options) => ipcRenderer.invoke('dockvault:server.connect', { input: String(input == null ? '' : input), replaceUnreadable: !!(options && options.replaceUnreadable) }),
+    // The verify step: main normalises the typed address and checks it against the fixed health route,
+    // asks the fixed device route whether the server supports syncing, and reaches the typed SFTP
+    // address for its host key (no other URL or port is ever contacted). Writes nothing. Returns
+    // { api: { kind, host? }, sync: { kind }, sftp: { kind, host, port, fingerprint? }, proceed } — kinds
+    // and hosts only, never an error, a key, or a credential.
+    check: (input, sftp) => ipcRenderer.invoke('dockvault:server.check', { input: String(input == null ? '' : input), sftp: String(sftp == null ? '' : sftp) }),
+    // Hand the typed address and SFTP address to the main process, which verifies them again (it never
+    // trusts the page's lights) and saves them only when both verified. The renderer never touches the
+    // file. Returns the typed outcome { kind, origin?, host?, verify }; kind 'needs-confirm' means a saved
+    // setting exists that could not be read and the person must confirm replacing it (replaceUnreadable:
+    // true) before anything is written; 'not-verified' means the SFTP door did not check out. On
+    // ok/degraded, main then loads the sign-in page from the new server; the page just shows "Connected".
+    connect: (input, sftp, options) => ipcRenderer.invoke('dockvault:server.connect', { input: String(input == null ? '' : input), sftp: String(sftp == null ? '' : sftp), replaceUnreadable: !!(options && options.replaceUnreadable) }),
   }),
   sync: Object.freeze({
     // Read the current computed sync status on demand. Cred-free: { state, label, reason, vaults[],

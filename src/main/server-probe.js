@@ -16,7 +16,9 @@
  *                   accept it here; the answer is to install the certificate on this computer
  *   redirected      the address answers but points elsewhere and the landing could not be reached (the
  *                   check follows a redirect to find the real address; only a chain that never lands,
- *                   or a transport that refuses, ends here)
+ *                   or a transport that refuses, ends here), or a REMOTE address redirected onto a
+ *                   loopback http origin — the plain-http allowance is for an address the person typed
+ *                   for a local server, never for where a remote server chose to send them
  *   not-dockvault   something answered, but not with the DockVault health object
  *   degraded        a DockVault server that reports a problem — still reachable, so the person proceeds
  *   ok              a DockVault server
@@ -112,6 +114,9 @@ async function probeServer(input, { httpJson }) {
       // A redirect onto plain http (off loopback) is refused like a typed http address would be.
       return { kind: /remote server must use https/.test(String(e && e.message)) ? 'http-refused' : 'malformed', origin, host };
     }
+    // A remote https address that sends the check to a loopback http origin is refused: the loopback
+    // allowance exists for a local server the person typed, not for a landing a remote server chose.
+    if (landed.origin !== origin && /^http:/i.test(landed.origin) && !n.isLoopback) return { kind: 'redirected', origin, host };
     origin = landed.origin;
     host = hostOf(origin);
   }

@@ -107,3 +107,13 @@ test('a refused or malformed address never reaches the network', async () => {
   assert.equal((await probeServer('', { httpJson })).kind, 'empty');
   assert.equal(called, 0);
 });
+
+test('a REMOTE address whose health check redirects onto a loopback http origin is refused as redirected; a typed loopback address may still land on loopback http', async () => {
+  const { probeServer } = require('../src/main/server-probe');
+  const landing = async (url) => ({ ok: true, status: 200, url: 'http://127.0.0.1:8080/health', json: async () => ({ status: 'healthy' }) });
+  const remote = await probeServer('https://front.example.com', { httpJson: landing });
+  assert.deepEqual(remote, { kind: 'redirected', origin: 'https://front.example.com', host: 'front.example.com' });
+  const local = await probeServer('http://localhost:9000', { httpJson: landing });
+  assert.equal(local.kind, 'ok');
+  assert.equal(local.origin, 'http://127.0.0.1:8080');
+});

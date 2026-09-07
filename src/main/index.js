@@ -69,6 +69,7 @@ const { runDeviceSetup } = require('./device-enable');
 const { resumePendingGrants, markerActionForRunReason, runSetupAgainGrants } = require('./device-grant-resume');
 const { decideMigration, groupMigrationOutcomes } = require('./device-migrate');
 const { mintDeviceSftpAccess } = require('./device-mint');
+const sftpEndpoint = require('./sftp-endpoint');
 const { MintPathSelector, identityEndedBy } = require('./mint-path');
 const { refreshDeviceSecret, isRotationDue, identityIsStaleAfter, reconcileRotationMarker } = require('./device-refresh');
 const { RunStateSnapshot } = require('./run-state-snapshot');
@@ -375,6 +376,7 @@ function registerIpc() {
     appOrigin: APP_ORIGIN, pagePath: schemeMod.SHELL_PATH + SETUP_PAGE,
   });
   ipcMain.handle('dockvault:server.state', (e) => (fromSetupPage(e) ? serverScreenState() : null));
+  ipcMain.handle('dockvault:server.check', (e, args) => (fromSetupPage(e) ? checkServer(args) : null));
   ipcMain.handle('dockvault:server.connect', (e, args) => (fromSetupPage(e) ? connectServer(args) : { kind: 'refused' }));
   ipcMain.handle('dockvault:sync.status', () => (syncHub
     ? syncHub.current()
@@ -1302,40 +1304,57 @@ function startSyncScheduler() {
     },
   });
 
+  // The SFTP address the person entered and verified at setup replaces whatever host and port the server
+  // advertises with a credential: a deployment that publishes SFTP on another host port than the one the
+  // vault binds inside its container advertises the inside number, and would otherwise send every sync to
+  // the wrong place. A set-up saved before the address was asked for has none, and keeps the advertised values.
+  // When the two disagree, that fact is worth one line in the log (hosts and ports only — never the
+  // credential): it is the trace a person troubleshooting "the server thinks SFTP is elsewhere" needs.
+  let notedAdvertised = null;
+  const atVerifiedEndpoint = (bundle) => {
+    const r = sftpEndpoint.applySftpEndpoint(bundle, serverConfig.readSftpEndpoint(dir));
+    const key = `${r.advertised.host}:${r.advertised.port}`;
+    if (r.overridden && notedAdvertised !== key) {
+      notedAdvertised = key;
+      try { console.warn(`[dockvault] sync connects to the SFTP address verified at setup (${r.bundle.host}:${r.bundle.port}); the server advertises ${key}`); } catch { /* ignore */ }
+    }
+    return r.bundle;
+  };
   credCache = new CredCache({
-    mint: async (vaultId) => {
-      const via = mintPath.current(vaultId);
-      // The device path: this computer's own identity mints against its grant. No account session, no vault
-      // password. The response carries the host key to pin and the real SFTP host/port. A failure here is the
-      // device's own typed refusal and is NEVER retried on the account path within the run.
-      if (via === 'device') return withDeviceSecret((origin, secret) => mintDeviceSftpAccess({ serverOrigin: origin, deviceSecret: secret, vaultId }, mainHttpJson));
-      // No path was chosen for this vault's run: a wiring fault (a mint with no eligibility step before it),
-      // surfaced as an internal error rather than silently taking either path.
-      if (via !== 'account') { const e = new Error('no credential path chosen for this run'); e.reason = 'internal-error'; throw e; }
-      // The account path (set-ups not yet moved over to device sync).
-      const origin = serverConfig.readServerOrigin(dir);
-      const token = await resolveAccountToken();
-      if (!origin || !token) { const e = new Error('not signed in'); e.status = 401; throw e; } // -> 'no-session' -> sign in
-      // A password-protected vault must never be minted without its held password: the server treats a
-      // missing password like a wrong one — 400 plus a burnt attempt on the limiter it SHARES with the web
-      // UI's vault-open. So pull the access password (bound to THIS vault, fresh) and refuse BEFORE any
-      // server call when it isn't available, surfacing the non-retrying 'needs-unlock' rather than minting.
-      let vaultPassword;
-      if (vaultRequiresPassword(vaultId)) {
-        vaultPassword = await pullVaultPasswordForMint(vaultId);
-        if (!vaultPassword) { const e = new Error('vault password not available'); e.reason = 'needs-unlock'; throw e; }
-      }
-      try {
-        return await mintSftpAccess({ serverOrigin: origin, sessionToken: token, vaultId, vaultPassword }, mainHttpJson);
-      } finally {
-        vaultPassword = ''; // single-use: drop the plaintext the moment the mint request has been issued
-      }
-    },
+    mint: async (vaultId) => atVerifiedEndpoint(await mintAtAdvertisedEndpoint(vaultId)),
     // Bind the send to the child epoch sampled at mint time: a restart mid-mint refuses delivery to the
     // replacement child (a credential minted for a child that is gone is never handed to its successor).
     send: (bundle, epoch) => daemon.sendSftpCred(bundle, 12000, epoch),
     epoch: () => daemon.currentEpoch(),
   });
+  async function mintAtAdvertisedEndpoint(vaultId) {
+    const via = mintPath.current(vaultId);
+    // The device path: this computer's own identity mints against its grant. No account session, no vault
+    // password. The response carries the host key to pin and the real SFTP host/port. A failure here is the
+    // device's own typed refusal and is NEVER retried on the account path within the run.
+    if (via === 'device') return withDeviceSecret((origin, secret) => mintDeviceSftpAccess({ serverOrigin: origin, deviceSecret: secret, vaultId }, mainHttpJson));
+    // No path was chosen for this vault's run: a wiring fault (a mint with no eligibility step before it),
+    // surfaced as an internal error rather than silently taking either path.
+    if (via !== 'account') { const e = new Error('no credential path chosen for this run'); e.reason = 'internal-error'; throw e; }
+    // The account path (set-ups not yet moved over to device sync).
+    const origin = serverConfig.readServerOrigin(dir);
+    const token = await resolveAccountToken();
+    if (!origin || !token) { const e = new Error('not signed in'); e.status = 401; throw e; } // -> 'no-session' -> sign in
+    // A password-protected vault must never be minted without its held password: the server treats a
+    // missing password like a wrong one — 400 plus a burnt attempt on the limiter it SHARES with the web
+    // UI's vault-open. So pull the access password (bound to THIS vault, fresh) and refuse BEFORE any
+    // server call when it isn't available, surfacing the non-retrying 'needs-unlock' rather than minting.
+    let vaultPassword;
+    if (vaultRequiresPassword(vaultId)) {
+      vaultPassword = await pullVaultPasswordForMint(vaultId);
+      if (!vaultPassword) { const e = new Error('vault password not available'); e.reason = 'needs-unlock'; throw e; }
+    }
+    try {
+      return await mintSftpAccess({ serverOrigin: origin, sessionToken: token, vaultId, vaultPassword }, mainHttpJson);
+    } finally {
+      vaultPassword = ''; // single-use: drop the plaintext the moment the mint request has been issued
+    }
+  }
   const sink = new schedulerIo.StatusSink(syncHub);
   const io = schedulerIo.makeSchedulerIo({
     listConfigured: () => { try { return storedConfig().filter((e) => e.enabled !== false); } catch { return []; } },
@@ -2409,10 +2428,11 @@ function notifyInstalled(registered) {
 // route, the normalisation, and the write; the screen only ever sees a kind and a host.
 let setupMode = null; // 'change' while the person is switching servers; null otherwise
 let changeHost = null; // the old server's host, kept in memory only to pre-fill the field during a switch
+let changeSftp = null; // likewise the old server's SFTP address ("host:port")
 
 function serverConfigState() {
   try { return serverConfig.readServerConfigState(app.getPath('userData')); }
-  catch { return { status: 'unreadable', origin: null, envOrigin: null, fileOrigin: null, envOverrides: false }; }
+  catch { return { status: 'unreadable', origin: null, envOrigin: null, fileOrigin: null, envOverrides: false, sftp: null }; }
 }
 
 // The screen's two intents, answered by server-setup.js (the probe, the unreadable-confirm rule, the
@@ -2421,13 +2441,16 @@ let serverSetupInstance = null;
 function serverSetup() {
   if (!serverSetupInstance) {
     serverSetupInstance = serverSetupMod.createServerSetup({
-      dir: app.getPath('userData'), httpJson: mainHttpJson, mode: () => setupMode, changeHost: () => changeHost,
-      onSaved: () => { setupMode = null; changeHost = null; refreshTray(); void openSignInAfterSetup(); },
+      dir: app.getPath('userData'), httpJson: mainHttpJson, mode: () => setupMode, changeHost: () => changeHost, changeSftp: () => changeSftp,
+      // Saving the server opens the sign-in page and nothing else: sync is set up separately, from its
+      // own flow, and only when the person asks for it.
+      onSaved: () => { setupMode = null; changeHost = null; changeSftp = null; refreshTray(); void openSignInAfterSetup(); },
     });
   }
   return serverSetupInstance;
 }
 function serverScreenState() { return serverSetup().state(); }
+function checkServer(args) { return serverSetup().check(args); }
 function connectServer(args) { return serverSetup().connect(args); }
 
 // Swap the setup screen for the real UI through the one normal path (session seed, renderer probe, lock
@@ -2454,6 +2477,7 @@ async function changeServer() {
   } catch { return; }
   if (!res || res.response !== 1) return;
   changeHost = s.origin ? serverProbe.hostOf(s.origin) : null;
+  changeSftp = s.sftp ? sftpEndpoint.formatSftpEndpoint(s.sftp) : null;
   await forgetServerRelationship(s.origin);
   setupMode = 'change';
   refreshTray();
