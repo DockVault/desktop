@@ -94,3 +94,15 @@ test('fetchStandardVaults: fails closed on a non-OK response and on missing inpu
   await assert.rejects(() => fetchStandardVaults({ serverOrigin: '', sessionToken: 't' }, async () => ({ ok: true })), /server origin and an account session/);
   await assert.rejects(() => fetchStandardVaults({ serverOrigin: 'https://v', sessionToken: '' }, async () => ({ ok: true })), /server origin and an account session/);
 });
+
+test('fetchStandardVaults: a non-OK response carries the HTTP status on the error (retryable transport, not internal-error)', async () => {
+  const { isTransportError } = require('../src/main/net-errors');
+  await assert.rejects(
+    () => fetchStandardVaults({ serverOrigin: 'https://v', sessionToken: 't' }, async () => ({ ok: false, status: 503, json: async () => ({}) })),
+    (e) => {
+      assert.strictEqual(e.status, 503, 'the status rides on the error, not only in the message');
+      assert.strictEqual(isTransportError(e), true, 'so the eligibility re-check reads it as vault-list-unavailable, never internal-error');
+      return true;
+    },
+  );
+});

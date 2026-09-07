@@ -33,24 +33,77 @@ function normalizeServer(input) {
 
 function configFile(userDataDir) { return path.join(userDataDir, 'server-config.json'); }
 
-/** The configured server origin, or null if none. Env override wins. */
-function readServerOrigin(userDataDir) {
-  if (process.env.DOCKVAULT_SERVER) {
-    try { return normalizeServer(process.env.DOCKVAULT_SERVER).origin; } catch { return null; }
+/**
+ * The saved server setting as a fact with a status, never a bare null that hides why:
+ *   { status: 'absent' }                      no file — the first run, nothing decided yet
+ *   { status: 'ok', origin }                  a saved, valid origin
+ *   { status: 'unreadable' }                  a file exists but cannot be trusted (truncated, malformed,
+ *                                             not an https origin, unreadable) — NOT absent: the app must
+ *                                             not treat it as "nothing saved" and quietly write over it
+ * Unreadable is kept apart from absent for the same reason the other stores do it: a person's setting
+ * that cannot be read is still their setting until they say otherwise.
+ */
+function readSavedServer(userDataDir) {
+  let raw;
+  try { raw = fs.readFileSync(configFile(userDataDir), 'utf8'); } catch (e) {
+    return (e && e.code === 'ENOENT') ? { status: 'absent' } : { status: 'unreadable' };
   }
   try {
-    const raw = JSON.parse(fs.readFileSync(configFile(userDataDir), 'utf8'));
-    if (raw && raw.origin) return normalizeServer(raw.origin).origin;
-  } catch { /* not configured yet */ }
-  return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.origin !== 'string') return { status: 'unreadable' };
+    return { status: 'ok', origin: normalizeServer(parsed.origin).origin };
+  } catch { return { status: 'unreadable' }; }
 }
 
-/** Persist a user-entered server URL (validated). Returns the normalized origin. */
+/**
+ * Everything that decides which server is in force, so the shell can be honest about it:
+ *   { status: 'env' | 'ok' | 'absent' | 'unreadable', origin, envOrigin, fileOrigin, envOverrides }
+ * The DOCKVAULT_SERVER variable still wins (a development convenience), but when it and a saved
+ * setting both exist and differ, envOverrides is true so the tray can say which one is used — a
+ * saved setting silently ignored would be a lie. An env value that does not normalise is ignored.
+ */
+// The DOCKVAULT_SERVER variable is a development convenience. An installed app never honours it
+// (main switches this off once at startup for a packaged build), so nothing in a person's
+// environment can quietly re-point the app; the saved setting alone decides.
+let envOverrideAllowed = true;
+function setEnvOverrideAllowed(allowed) { envOverrideAllowed = allowed === true; }
+
+function readServerConfigState(userDataDir, env = process.env) {
+  let envOrigin = null;
+  if (envOverrideAllowed && env.DOCKVAULT_SERVER) {
+    try { envOrigin = normalizeServer(env.DOCKVAULT_SERVER).origin; } catch { envOrigin = null; }
+  }
+  const saved = readSavedServer(userDataDir);
+  const fileOrigin = saved.status === 'ok' ? saved.origin : null;
+  if (envOrigin) {
+    return { status: 'env', origin: envOrigin, envOrigin, fileOrigin, envOverrides: !!(fileOrigin && fileOrigin !== envOrigin) || saved.status === 'unreadable' };
+  }
+  return { status: saved.status, origin: fileOrigin, envOrigin: null, fileOrigin, envOverrides: false };
+}
+
+/** The configured server origin, or null if none. Env override wins. */
+function readServerOrigin(userDataDir) {
+  return readServerConfigState(userDataDir).origin;
+}
+
+/**
+ * Persist a user-entered server URL (validated). Returns the normalized origin. Written through a
+ * temporary file and a rename so a crash mid-write can never leave a truncated file that reads as
+ * "not configured" (or as unreadable) on the next launch.
+ */
 function writeServerOrigin(userDataDir, input) {
   const { origin } = normalizeServer(input);
   fs.mkdirSync(userDataDir, { recursive: true });
-  fs.writeFileSync(configFile(userDataDir), JSON.stringify({ origin }));
+  const file = configFile(userDataDir);
+  const partial = `${file}.tmp`;
+  fs.writeFileSync(partial, JSON.stringify({ origin }) + '\n', { mode: 0o600 });
+  fs.renameSync(partial, file);
   return origin;
 }
 
-module.exports = { normalizeServer, readServerOrigin, writeServerOrigin };
+/** Forget the saved server (a server switch): a missing file is already the wanted state. */
+function removeServerOrigin(userDataDir) {
+  try { fs.unlinkSync(configFile(userDataDir)); } catch (e) { if (!e || e.code !== 'ENOENT') throw e; }
+}
+
+module.exports = { normalizeServer, readSavedServer, readServerConfigState, readServerOrigin, writeServerOrigin, removeServerOrigin, setEnvOverrideAllowed, configFile };

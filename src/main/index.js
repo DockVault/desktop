@@ -44,13 +44,33 @@ const { AutoLock } = require('./auto-lock');
 const keyProtect = require('./key-protection');
 const { SyncStatusHub } = require('./sync-status-hub');
 const trayPresentation = require('./tray-presentation');
+const rcloneBundle = require('./rclone-bundle');
+const { APP_ID } = require('./app-identity');
+const loginItemMod = require('./login-item');
+const serverProbe = require('./server-probe');
+const serverSetupMod = require('./server-setup');
 const syncEnable = require('./sync-enable');
+// Every helper description (tooltip, notification, dialog) speaks as an installed app when it is one.
+trayPresentation.setPackaged(app.isPackaged);
+// The DOCKVAULT_SERVER variable is honoured only by development runs; an installed app uses its saved setting alone.
+serverConfig.setEnvOverrideAllowed(!app.isPackaged);
 const syncVaults = require('./sync-vaults');
 const syncConfig = require('./sync-config');
 const syncConfigStore = require('./sync-config-store');
 const enableCopy = require('./enable-copy');
 const { mintSftpAccess } = require('./sftp-cred');
 const { CredCache } = require('./cred-cache');
+const deviceSecretStore = require('./device-secret-store');
+const deviceRegister = require('./device-register');
+const deviceGrant = require('./device-grant');
+const deviceGrantStore = require('./device-grant-store');
+const devicePending = require('./device-pending-grant');
+const { runDeviceSetup } = require('./device-enable');
+const { resumePendingGrants, markerActionForRunReason, runSetupAgainGrants } = require('./device-grant-resume');
+const { decideMigration, groupMigrationOutcomes } = require('./device-migrate');
+const { mintDeviceSftpAccess } = require('./device-mint');
+const { MintPathSelector, identityEndedBy } = require('./mint-path');
+const { refreshDeviceSecret, isRotationDue, identityIsStaleAfter, reconcileRotationMarker } = require('./device-refresh');
 const { RunStateSnapshot } = require('./run-state-snapshot');
 const { SyncScheduler } = require('./sync-scheduler');
 const schedulerIo = require('./scheduler-io');
@@ -59,9 +79,24 @@ const { ensureFolderSecure, recoverOwnerOnly, classifyForeignAces } = require('.
 
 const STATIC_ROOT = path.resolve(__dirname, '..', '..', 'vendor', 'vault', 'static');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'index.js');
-const FAIL_HTML = path.join(__dirname, '..', 'renderer', 'selftest-fail.html');
+// The shell's own pages, served over the app scheme (a packaged app keeps them inside its archive,
+// which the file protocol cannot read). Names under src/renderer; see scheme.js SHELL_PATH.
+const FAIL_PAGE = 'selftest-fail.html';
+const SETUP_PAGE = 'server-setup.html'; // the first thing an installed app shows
+// Forgetting this computer on the OLD server when the person switches servers (revoke the device by id under
+// the old session when reachable, then drop the device secret). The device registration lives in its own
+// modules, which wire this hook; until then it is a documented no-op and the rest of the forget path runs.
+let deviceForget = async (/* { origin, sessionToken } */) => {};
 const APP_ICON = path.join(__dirname, '..', '..', 'build', 'icon.png'); // the DockVault window + tray icon
 const SMOKE = process.env.DOCKVAULT_SMOKE === '1';
+// A second in-module self-test flag, modelled on SMOKE above: DOCKVAULT_TRAY_SELFTEST=1 boots the app, forces
+// the device-sync tray assembly into one drawn menu and drives its click handlers, then writes
+// .local/tray-selftest.json and exits. It exists so the two SILENT merge modes this file has hit — a
+// migration/pending/reset assembly dropped from the drawn menu (render), and a click bound to a function the
+// merge deleted (a ReferenceError) — are caught by an autonomous check, not only a person at the OS tray.
+// Honoured ONLY in an unpackaged run or an explicitly-overridden user-data dir (asserted where it runs), never
+// a real profile. See finishTraySelftestIfNeeded at the end of this file.
+const TRAY_SELFTEST = process.env.DOCKVAULT_TRAY_SELFTEST === '1';
 // A NON-persistent (in-memory) partition, held by the main process for the app's lifetime: the UI's
 // web storage never touches disk (so the account bearer the UI keeps in localStorage is never at
 // rest on disk), yet it survives window destroy -> recreate on close-to-tray, resetting only on a
@@ -80,7 +115,19 @@ let rcloneCfg = null; // the pinned rclone config { bin, version, sha256 }; `ver
 let lockState = null; // the single source of truth for lock state (main-owned)
 let autoLock = null;  // the automatic lock triggers (idle timer + OS suspend/screen-lock)
 let syncHub = null;   // the main-owned computed sync status (feeds the tray, notifications, channel)
-let syncScheduler = null;   // the background scheduler (decides when/whether each vault syncs)
+let syncScheduler = null;
+let mintPath = null;      // per-run credential-path choice (device identity vs account session), see mint-path.js
+// The scheduled rotation of this computer's sync identity (device-refresh.js): an hourly check that rotates once
+// the stored identity is old enough. Single-flight, online-only, never per mint.
+const DEVICE_REFRESH_TICK_MS = 60 * 60 * 1000;
+let deviceRefreshTimer = null;
+let deviceRefreshBusy = false;
+// Set when a rotation's answer was lost (the refresh refused the held secret as retired, or the server rotated
+// but the new secret could not be kept here): the identity is STALE — presenting it past the server's grace
+// would suspend this computer, so the mint path refuses with the server's own literal until the computer is set
+// up again. The durable record is the store's stale MARKER (markDeviceSecretStale), read back with the identity
+// after a restart; this flag is the in-process fallback for a marker that could not be written.
+let deviceIdentityStale = false;   // the background scheduler (decides when/whether each vault syncs)
 let runStateSnapshot = null; // main-side cache of per-vault run-state, refreshed from the daemon
 let credCache = null;        // per-vault SFTP credential cache (mint via the account session, send to the daemon)
 let syncTickTimer = null;    // the routine sync cadence timer
@@ -120,9 +167,10 @@ const status = { mainSelfTest: null, rendererProbe: null, shown: false, failCode
 app.disableHardwareAcceleration();
 
 // Windows taskbar identity: without an explicit AppUserModelID a dev/unpackaged run groups under the
-// generic Electron identity and shows its icon. Setting it ties the taskbar button (and notifications)
-// to DockVault so the window icon is used. (Kept in step with the packaged app id at packaging time.)
-if (process.platform === 'win32') app.setAppUserModelId('DockVault');
+// generic Electron identity and shows its icon. It is the application id the installer stamps on the
+// shortcuts, so the taskbar groups the running window with its shortcut and attributes notifications
+// to DockVault. (This is separate from app.name, which decides where the app's data lives.)
+if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
 
 // The scheme must be registered before the 'ready' event.
 schemeMod.registerPrivileged();
@@ -159,13 +207,14 @@ function writeState(patch) {
   return next;
 }
 
-// Standard-vault sync uses a pinned rclone binary. Its path + version + SHA-256 are configuration
-// (sourced from the environment here; a bundled-binary manifest supplies them once packaging lands).
-// Absent a configured binary the daemon simply offers no standard sync — it is never a fatal condition.
+// Standard-vault sync uses a pinned rclone binary that the installer bundles beside the app archive;
+// its pinned version + SHA-256 come from the manifest inside the integrity-checked archive (see
+// rclone-bundle.js for the rules, including the development-only environment override). Null means the
+// manifest has no entry for this platform: the daemon then offers no standard sync — never fatal.
 function resolveRcloneConfig() {
-  const bin = process.env.DOCKVAULT_RCLONE;
-  if (!bin) return null;
-  return { bin, version: process.env.DOCKVAULT_RCLONE_VERSION || null, sha256: process.env.DOCKVAULT_RCLONE_SHA256 || null };
+  return rcloneBundle.resolveBundledRclone({
+    isPackaged: app.isPackaged, resourcesPath: process.resourcesPath, platform: process.platform, arch: process.arch, env: process.env,
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -200,6 +249,9 @@ async function boot() {
     () => serverConfig.readServerOrigin(app.getPath('userData')), uiSession);
   registerIpc();
   setupTray();
+  // An installed app's first launch registers itself to start at login and says so; see login-item.js
+  // for the rule (never unasked once the person has chosen, never from a development run).
+  if (!SMOKE) maybeRegisterLoginItem();
   await showOrCreateWindow();
   // Start the supervised sync daemon (skipped under the headless shell smoke, which only exercises the
   // window). It forks a utility child, is handed the DB key once, and auto-restarts on an unexpected exit.
@@ -240,8 +292,11 @@ async function boot() {
       // The hub's locked signal tracks the ACCOUNT-TIER pause, read from the lock-state source of truth (appLocked)
       // rather than the zero-knowledge 'locked'/'unlocked' event vocabulary — so a lock pauses the glance, an
       // account-tier resume clears it, and a (future) zero-knowledge unlock can never clear it while account-tier
-      // sync is still paused. The two tiers stay separate on the hub path too.
-      if (syncHub) syncHub.setLocked(lockState.snapshot().appLocked);
+      // sync is still paused. The two tiers stay separate on the hub path too. The status model composes this
+      // lock per vault by credential path (a device vault keeps syncing on its own identity and reads its real
+      // state; an account vault reads paused-locked instead of a stale green; the glance leads with "Locked" and
+      // appends the sync truth), so the raw appLocked is fed — the honesty is in the model, not a suppressed signal.
+      if (syncHub) { syncHub.setLocked(lockState.snapshot().appLocked); syncHub.setDeviceLive(deviceIdentityLive()); }
       // #5 clear-on-lock: a lock pauses sync dispatch, so drop the account-tier SFTP credential as hygiene
       // — the main-side cache AND the helper's prepared config — re-minted from the still-live session on
       // unlock/resume. (The account session itself persists across a lock; only the derived credential is dropped.)
@@ -250,7 +305,7 @@ async function boot() {
       // can re-mint. Keyed on the account-tier signal, never the zero-knowledge 'unlocked' event, so the sync path
       // stays independent of the zero-knowledge key. 'account-active' asserts NO zero-knowledge key; the lock UI is
       // untouched.
-      if (s === 'account-active') { void maybeOfferSyncSetup(); void tickSync(); }
+      if (s === 'account-active') { deviceUnreadableStreak = 0; if (syncScheduler) syncScheduler.releaseHolds(); void maybeOfferSyncSetup(); void maybeOfferDeviceMigration(); void tickSync(); } // unlock resets the escape-hatch streak: a lock episode never counts toward the reset offer
       refreshTray();
     },
   });
@@ -261,15 +316,26 @@ async function boot() {
     autoLock = new AutoLock({
       powerMonitor, lockState, getWindow: () => mainWindow,
       onDegraded: (code) => { console.warn('[dockvault] auto-lock posture degraded:', code); },
+      // On OS wake, kick a sync so a device-path vault (which keeps syncing under the lock) catches up after the
+      // freeze. It is gated like any tick — an account-path vault stays paused under the still-held lock, and the
+      // ZK key is not re-derived — so it resumes sync only, never the account tier or the key.
+      onResume: () => { void tickSync(); },
     });
     autoLock.start();
     // A first sync pass shortly after boot when the app starts active for account-tier sync: the resume hook
     // only kicks on a lock->resume TRANSITION, so a cold start (appLocked defaults false) would otherwise sit
     // until the routine interval. Deferred a moment so the window and account session settle; gated like any
     // tick (the dispatch still re-checks the live account session, so no run starts before sign-in completes).
-    if (lockState.isAccountUsable()) { const t = setTimeout(() => { void tickSync(); }, BOOT_SYNC_KICK_MS); if (t.unref) t.unref(); }
+    // ...and the migration offer on the same cold-start branch: its probe otherwise fills the door only on a
+    // lock->unlock transition, so a desktop that boots signed-in and unlocked (or with auto-lock off) would
+    // show no door until it happened to lock and unlock once — the one launch where the offer matters most.
+    if (lockState.isAccountUsable()) { const t = setTimeout(() => { void tickSync(); void maybeOfferDeviceMigration(); }, BOOT_SYNC_KICK_MS); if (t.unref) t.unref(); }
   }
   await finishSmokeIfNeeded();
+  // The tray self-test lands HERE — the END of boot — not beside setupTray(): syncHub is not assigned until
+  // later in boot, and refreshTray's pre-hub early return draws buildTrayMenu([], null), which is itself the
+  // failure mode (a) exists to catch (a false red). By here syncHub and the tray both exist.
+  await finishTraySelftestIfNeeded();
 }
 
 function hardenSession(ses) {
@@ -298,6 +364,18 @@ function registerIpc() {
   // symbolic reasons) — never a credential, host key, token, or raw helper output. Observe-only: there
   // is no renderer channel that starts, stops, or configures sync, so the lock and safety gates can
   // never be reached from a page.
+  // The server setup screen's two intents. Main owns the route (/health), the normalisation, and the
+  // write; the renderer sends what was typed and gets back a kind and a host, never a file's contents.
+  // Only the shell's own setup page may ask: the web interface the server supplies runs on the same
+  // origin with the same preload, and must never be able to re-point the app.
+  // Three checks, all required: the sender is the main window's page, the frame is that page's main
+  // frame (not something framed inside it), and its URL is exactly the setup page.
+  const fromSetupPage = (e) => serverSetupMod.isTrustedSetupSender(e, {
+    webContents: (mainWindow && !mainWindow.isDestroyed()) ? mainWindow.webContents : null,
+    appOrigin: APP_ORIGIN, pagePath: schemeMod.SHELL_PATH + SETUP_PAGE,
+  });
+  ipcMain.handle('dockvault:server.state', (e) => (fromSetupPage(e) ? serverScreenState() : null));
+  ipcMain.handle('dockvault:server.connect', (e, args) => (fromSetupPage(e) ? connectServer(args) : { kind: 'refused' }));
   ipcMain.handle('dockvault:sync.status', () => (syncHub
     ? syncHub.current()
     : { state: 'unavailable', label: 'Sync unavailable', reason: 'no-secure-store', vaults: [], condition: 'unavailable' }));
@@ -362,7 +440,7 @@ async function seedRestoredSession(win) {
 // and surfaces 'needs-unlock' WITHOUT calling the server — so no attempt is spent on the shared limiter).
 const VAULT_PW_MAX_LEN = 1024;              // a generous upper bound; longer -> reject as malformed
 const VAULT_PW_WINDOW_MS = 15 * 60 * 1000;  // main-enforced freshness, matching the renderer's own window
-async function pullVaultPasswordForMint(vaultId) {
+async function pullVaultUnlock(vaultId) {
   const win = mainWindow;
   if (!win || win.isDestroyed() || typeof vaultId !== 'string' || !vaultId) return null;
   let pulled = null;
@@ -385,7 +463,15 @@ async function pullVaultPasswordForMint(vaultId) {
   const ts = typeof pulled.ts === 'number' ? pulled.ts : 0;                                    // fresh: the renderer timestamp
   if (!ts || (Date.now() - ts) > VAULT_PW_WINDOW_MS) { pulled.password = ''; return null; }
   pulled.password = ''; // drop our reference to the wrapper's copy; the returned string is the only live one
-  return pw;
+  return { password: pw, stamp: ts }; // stamp = the unlock instant, so the re-proof gate retries only on a NEWER unlock
+}
+
+// The vault password for a device mint: the string form of the unlock above, or null. The device-grant resume
+// reads the {password, stamp} form (pullVaultUnlock) directly, so it can refuse to re-prove with an unlock that
+// already failed and wait for a fresh one.
+async function pullVaultPasswordForMint(vaultId) {
+  const u = await pullVaultUnlock(vaultId);
+  return u ? u.password : null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -412,22 +498,133 @@ function setupTray() {
   }
 }
 
+// Three-state history of a vault's device grant — the SINGLE source both grant-history readers share, so the
+// resume sweep and the tray reminder can never drift into treating an unreadable record differently by
+// accident. getGrantMeta throws GRANT_META_UNREADABLE on a transiently-unreadable store (a locked keychain, a
+// torn blob), which is DISTINCT from a genuine null (never granted). Collapsing "unreadable" into "never
+// granted" is the fail-open we must not have: it would let the resume re-grant — and the server reactivate —
+// a grant the owner revoked. So an unreadable read is its OWN answer, and each caller handles it deliberately:
+//   'granted'     a record exists → a re-proof (the resume runs the revoked-grant guard);
+//   'first-setup' no record → a first setup (nothing to reactivate);
+//   'unreadable'  the record could not be read right now → the resume DEFERS (leave the marker, retry), and
+//                 the tray shows the neutral first-setup wording — NEVER the "your password changed" line.
+function deviceGrantHistory(dir, id) {
+  try { return deviceGrantStore.getGrantMeta(safeStorage, dir, id) ? 'granted' : 'first-setup'; }
+  catch { return 'unreadable'; } // locked keychain / torn blob — never conflate with "never granted"
+}
+
+// The last device-sync support answer for the CURRENT server, cached from the migration probe so the tray door
+// can be derived on every refresh without a network call. Keyed by origin so a server switch never reads a stale
+// 'ok'/'too-old'; null until the first probe (the door simply waits, like an unprobed server).
+let deviceMigrateSupport = null; // { origin, reason } | null
+
+// A short-lived cache of the computed migration view. refreshTray runs on every hub status change — several
+// times a second during a sync — while the door's inputs (support, identity, records, config) change only at a
+// handful of events, so recomputing per tick is waste. The view is served from cache within a small window and
+// force-recomputed the moment a door-changing event calls invalidateMigrationView (a fresh probe, a migration,
+// a reset, a completed resume grant).
+let _migrationView = null;
+let _migrationViewAt = 0;
+let _migrationViewOrigin = null;
+const MIGRATION_VIEW_TTL_MS = 2000;
+function invalidateMigrationView() { _migrationView = null; }
+
+// The device identity status for the DOOR, from NON-SECRET reads only: readIdentityMeta decrypts the blob but
+// never surfaces the secret (so the secret is not read into the menu-drawing path — the read-at-use rule), and
+// the rotating marker flags the recheck state. A blob that will not read is treated as 'absent' for the door: a
+// transient-unreadable click is a harmless account-only outcome, and a persistently-unreadable identity rides
+// the escape hatch, not this door.
+function migrationDeviceStatus(dir, origin) {
+  try { if (deviceSecretStore.hasRotatingMarker(dir)) return 'rechecking'; } catch { /* fall through */ }
+  let meta = null;
+  try { meta = deviceSecretStore.readIdentityMeta(safeStorage, dir); } catch { meta = null; }
+  if (!meta) return 'absent';
+  return deviceSecretStore.sameOrigin(meta.serverOrigin, origin) ? 'ok' : 'absent-for-this-server';
+}
+
+// The existing-setup migration view: is the "set this computer up to sync on its own" door (or the honest switch
+// line, or the too-old note) applicable right now, and which configured vaults would move over. Assembled from
+// LOCAL, NON-SECRET reads — the cached support (this origin only), the identity status (no secret decrypted into
+// this path), and each configured vault's three-state grant record from ONE readGrantMeta map (never a decrypt
+// per vault). Best-effort + throttled: any read failure yields no door, and the result is cached for a short
+// window so a busy refresh loop does not recompute it every tick.
+function computeMigration(dir) {
+  const origin = serverConfig.readServerOrigin(dir);
+  const now = Date.now();
+  if (_migrationView && _migrationViewOrigin === origin && (now - _migrationViewAt) < MIGRATION_VIEW_TTL_MS) return _migrationView;
+  const support = (deviceMigrateSupport && deviceMigrateSupport.origin === origin) ? deviceMigrateSupport.reason : null;
+  const deviceStatus = migrationDeviceStatus(dir, origin);
+  // One grant-record read for the whole compute: an unreadable store makes every vault 'unreadable' (excluded
+  // from the offer), an own-key is 'granted' (already migrated), anything else 'first-setup' (still to move) —
+  // the store's three-state from a single map, never flattened and never a decrypt per vault.
+  let recordFor;
+  try {
+    const gm = deviceGrantStore.readGrantMeta(safeStorage, dir);
+    recordFor = deviceGrantStore.isUnreadable(gm.status)
+      ? () => 'unreadable'
+      : (id) => (Object.prototype.hasOwnProperty.call(gm.meta, id) ? 'granted' : 'first-setup');
+  } catch { recordFor = () => 'unreadable'; }
+  let configured = [];
+  try { configured = storedConfig().map((e) => ({ vaultId: e.vaultId, vaultName: e.vaultName, record: recordFor(e.vaultId) })); } catch { configured = []; }
+  let offeredOrigin = null;
+  try { offeredOrigin = readState().deviceMigrationOfferOrigin || null; } catch { offeredOrigin = null; }
+  const view = decideMigration({ support, deviceStatus, configured, offeredOrigin, currentOrigin: origin });
+  _migrationView = view; _migrationViewAt = now; _migrationViewOrigin = origin;
+  return view;
+}
+
 // The ONE owner of the tray glance and menu: it composes both from the current computed sync status
 // and the lock phase, so lock and sync never fight over the tooltip. Called on every status change
 // and on every lock-phase change.
 function refreshTray() {
   if (!tray) return;
   try {
-    if (!syncHub) { tray.setToolTip('DockVault'); tray.setContextMenu(buildTrayMenu([], null)); return; }
+    const server = serverConfigState();
+    if (!syncHub) { tray.setToolTip(server.origin ? 'DockVault' : 'DockVault — Not connected'); tray.setContextMenu(buildTrayMenu([], null)); return; }
     const model = syncHub.current();
-    tray.setToolTip(trayPresentation.tooltip(model, effectiveLockPhase(), rcloneCfg && rcloneCfg.version));
-    tray.setContextMenu(buildTrayMenu(trayPresentation.mustActItems(model), model));
+    // The lock REASON (only while the account tier is actually paused) so the glance can tell a sleep-woken
+    // desktop — unlocked but paused until Resume — from a plain screen lock, instead of a bare "Locked".
+    const lockReason = (() => { try { const s = lockState && lockState.snapshot(); return s && s.appLocked ? s.reason : null; } catch { return null; } })();
+    tray.setToolTip(trayPresentation.tooltip(model, effectiveLockPhase(), rcloneCfg && rcloneCfg.version, { lockReason, server }));
+    // Map each configured vault's id → its name so must-act labels read the vault's NAME, not its id (the
+    // model is keyed by id). A vault missing from the config falls back to its id inside mustActItems.
+    let nameById = {};
+    try { for (const e of storedConfig()) if (e && e.vaultId) nameById[e.vaultId] = e.vaultName; } catch { nameById = {}; }
+    const mustAct = trayPresentation.mustActItems(model, nameById);
+    // Append the calm "finish setting up on this computer" reminder for any vault whose device grant is
+    // pending — only while a device identity is live (else the resume can't complete it), and never for a
+    // vault that already has a real must-act line above it. The auto-resume finishes it on the next open;
+    // this is just the visible reminder, so it is best-effort.
+    let items = mustAct;
+    try {
+      const dir = app.getPath('userData');
+      const pend = deviceIdentityLive() ? devicePending.listPending(safeStorage, dir) : [];
+      if (pend.length) {
+        const shown = new Set(mustAct.map((it) => it.vault).filter(Boolean));
+        const pendingItems = trayPresentation.pendingSetupItems(pend, {
+          nameById,
+          // Wording only. Only a vault KNOWN to have been granted before earns the "open with its new password"
+          // re-proof line; a first setup AND an unreadable record both take the neutral "finish setting it up"
+          // wording — an unreadable keychain must never surface an alarming "your password changed" line, and
+          // this cosmetic read must not throw (the menu still has to render).
+          wasGranted: (id) => deviceGrantHistory(dir, id) === 'granted',
+          alreadyShown: (id) => shown.has(id),
+        });
+        if (pendingItems.length) items = [...mustAct, ...pendingItems];
+      }
+    } catch { /* the reminder is best-effort; the resume still completes a deferred setup on open */ }
+    // Escape hatch: once the identity has been unreadable long enough (the streak crossed the threshold), add
+    // the one-time reset offer beneath everything else — the calm paused glance has already had its chances.
+    if (deviceUnreadableStreak >= DEVICE_UNREADABLE_RESET_THRESHOLD) items = [...items, trayPresentation.deviceResetItem()];
+    let migration = null;
+    try { migration = computeMigration(app.getPath('userData')); } catch { migration = null; } // best-effort; the door is never load-bearing
+    tray.setContextMenu(buildTrayMenu(items, model, migration));
   } catch { /* tray gone */ }
 }
 
 // Unresolved items sit at the TOP as reachable actions, so a decision, repair, or sign-in is never
 // buried inside the (destroyable) main window — the tray always offers a way to act.
-function buildTrayMenu(items, model) {
+function buildTrayMenu(items, model, migration = null) {
   const template = [];
   for (const it of items) template.push({ label: it.label, click: () => handleMustAct(it) });
   if (items.length) template.push({ type: 'separator' });
@@ -435,36 +632,62 @@ function buildTrayMenu(items, model) {
   // Sync is offered, never imposed: browsing a vault never requires setting this up.
   if (syncHub) {
     template.push({ label: 'Set up sync…', click: () => { void setupSyncForVault(); } });
+    // Existing-setup migration: a standing DOOR (never a status item, so the glance keeps reading up-to-date) to
+    // move account-path vaults onto this computer's own identity; or, when this computer is set up with a
+    // DIFFERENT server, an honest hand-off to the switch flow instead of a silent account path. Both open the
+    // same migration flow, which decides register / grant-only / switch on its own. The copy never says "device
+    // sync" and always states the meanwhile-truth (the vaults keep syncing through the sign-in until then).
+    if (migration && migration.doorShow) {
+      template.push({ label: 'Set up this computer to sync on its own — until then your vaults sync through your sign-in', click: () => { void runDeviceMigration(); } });
+    } else if (migration && migration.otherServerNote) {
+      template.push({ label: 'This computer is set up with a different server — switch it to keep syncing here on its own', click: () => { void runDeviceMigration(); } });
+    }
     let configured = [];
     try { configured = storedConfig(); } catch { /* none */ }
     if (configured.length) {
       // The honest per-vault submenu content (Sync-now/Syncing… + the last-synced line, matched to live
       // status by id) is composed by the pure, tested trayPresentation.vaultRows; here it is only mapped
       // to menu items and bound to clicks.
-      template.push({
-        label: 'Synced folders',
-        submenu: trayPresentation.vaultRows(configured, model && model.vaults, Date.now()).map((r) => ({
-          label: r.vaultName,
-          submenu: [
-            { label: r.lastSynced, enabled: false },
-            { type: 'separator' },
-            { label: r.syncLabel, enabled: r.syncEnabled, click: () => syncVaultNow(r.vaultId) },
-            { label: `Stop syncing ${r.vaultName}`, click: () => { void stopSyncing(r.vaultId, r.vaultName); } },
-          ],
-        })),
-      });
+      const folderRows = trayPresentation.vaultRows(configured, model && model.vaults, Date.now()).map((r) => ({
+        label: r.vaultName,
+        submenu: [
+          { label: r.lastSynced, enabled: false },
+          { type: 'separator' },
+          { label: r.syncLabel, enabled: r.syncEnabled, click: () => syncVaultNow(r.vaultId) },
+          { label: `Stop syncing ${r.vaultName}`, click: () => { void stopSyncing(r.vaultId, r.vaultName); } },
+        ],
+      }));
+      // A server too old for the device model: a calm, non-actionable note at the top of the folder list (no
+      // menu item, no notification) — there is nothing to fix from here, and the vaults keep syncing on the
+      // account session. Only shown when the migration view says so (support 'too-old').
+      const submenu = (migration && migration.tooOldNote)
+        ? [{ label: "This server doesn't support syncing individual computers yet — syncing continues through your sign-in", enabled: false }, { type: 'separator' }, ...folderRows]
+        : folderRows;
+      template.push({ label: 'Synced folders', submenu });
     }
     template.push({ type: 'separator' });
   }
+  // Which server is in force, honestly: a note when the environment overrides a saved setting, a way to
+  // change servers, or a way to set one up when none is known (the same screen the app opens with).
+  for (const it of trayPresentation.serverMenuItems(serverConfigState())) {
+    if (it.kind === 'change-server') template.push({ label: it.label, click: () => { void changeServer(); } });
+    else if (it.kind === 'setup-server') template.push({ label: it.label, click: () => { void showOrCreateWindow(); } });
+    else template.push({ label: it.label, enabled: false });
+  }
   template.push({ label: 'Open DockVault', click: () => { void showOrCreateWindow(); } });
   // When the account tier is paused by a lock, offer an explicit way back rather than a "Lock now" that is
-  // already in effect. An idle / OS lock resumes on its own when input returns, but a deliberate "Lock now"
-  // does NOT auto-resume (by design) — so this is the affordance that keeps a lock from being a one-way door
-  // until relaunch. resumeAccount() re-enables ONLY the account tier; it never asserts the ZK key.
+  // already in effect. An IDLE lock reverses on its own when input returns; a SLEEP or OS-screen lock (and a
+  // deliberate "Lock now") does NOT auto-resume on mere input — a machine woken from sleep without a password
+  // prompt stays paused on an unlocked desktop until this Resume item (or a real unlock-screen). So this
+  // affordance keeps a lock from being a one-way door until relaunch. resumeAccount() re-enables ONLY the
+  // account tier; it never asserts the ZK key.
   const accountPaused = (() => { try { const s = lockState && lockState.snapshot(); return !!(s && s.appLocked); } catch { return false; } })();
   template.push(accountPaused
     ? { label: 'Resume sync', click: () => { if (lockState) lockState.resumeAccount(); } }
     : { label: 'Lock now', click: () => { if (lockState) void lockState.lock('manual').catch(() => { /* state machine surfaces lock-error */ }); } });
+  // Start-at-login as the machine sees it right now (login-item.js reads the real registration on every
+  // build of this menu), so the box can never disagree with what will actually happen at login.
+  template.push({ ...trayPresentation.loginItemMenu(loginItem().isEnabled()), click: () => toggleLoginItem() });
   template.push(
     { type: 'separator' },
     { label: 'Quit DockVault', click: () => { isQuitting = true; app.quit(); } },
@@ -482,22 +705,204 @@ function handleMustAct(item) {
   // >50%-delete abort). It enqueues a manual repair run; the dispatch then asks the keep-both confirm
   // (confirmFirstUpload kind 'repair') before doing a zero-loss resync — nothing is auto-resynced.
   if (item && item.kind === 'repair' && item.vault) { if (syncScheduler) syncScheduler.requestRepair(item.vault); return; }
-  // The sync helper (rclone) isn't ready — there is NO in-app install flow (the binary + its pinned version and
-  // checksum come from the environment), so this action shows a real how-to dialog rather than a door to nowhere.
+  // The sync helper (rclone) isn't ready — there is NO in-app install flow (the helper ships with the installer,
+  // hash-pinned), so this action shows a real how-to dialog rather than a door to nowhere.
   if (item && item.kind === 'setup-helper') { showHelperFixDialog(item); return; }
+  // The escape-hatch reset for a persistently unreadable device identity — its own confirmed forget flow,
+  // never the plain open-the-app default.
+  if (item && item.kind === 'reset-device') { void resetDeviceIdentity(); return; }
+  // Set this computer up again after its identity ended (revoked / expired / not-recognized) or was reset:
+  // re-register and re-establish the recorded vaults.
+  if (item && item.kind === 'set-up-again') { void runDeviceSetupAgain(); return; }
   void showOrCreateWindow();
 }
 
-// A native how-to dialog for an unready sync helper: the specific reason + the pinned version + the (non-secret)
-// config variable NAMES + "restart after fixing". Leak-safe — never a path, a value, or a SHA. The helper is
-// env-configured until packaging bundles it, so correcting those settings and relaunching is the fix.
+// The escape hatch itself: a device identity that has read unreadable for too long (the streak crossed the
+// threshold), reset on the person's confirmation. forgetDevice takes the id-only path here — the blob is
+// unreadable, so there is no origin to read back: an account-scoped, deviceId-only best-effort revoke via the
+// sidecar id hint plus the local clear, never a re-register on top of the unreadable blob (the clear leaves an
+// ABSENT slot, so the set-up-again that follows registers cleanly). Never touches vault data.
+async function resetDeviceIdentity() {
+  if (syncFlowBusy) return; // don't race a setup/stop flow
+  syncFlowBusy = true;
+  try {
+    const confirmed = await dialog.showMessageBox(mainWindow, {
+      type: 'warning', title: 'Reset sync on this computer', noLink: true,
+      message: 'Reset sync on this computer?',
+      detail: "DockVault can't read this computer's sync identity, and it hasn't cleared on its own. Resetting removes the identity from this computer so you can set it up again. Your vault files are untouched, and your vaults keep syncing through your sign-in meanwhile. If this computer still appears in your account afterwards, remove it there.",
+      buttons: ['Cancel', 'Reset'], defaultId: 0, cancelId: 0,
+    }).then((r) => r.response === 1).catch(() => false);
+    if (!confirmed) return;
+    const dir = app.getPath('userData');
+    const accountToken = await resolveAccountToken();
+    try { await deviceRegister.forgetDevice({ serverOrigin: serverConfig.readServerOrigin(dir), accountToken, dir, safeStorage }, { fetchFn: mainHttpJson }); }
+    catch { /* forgetDevice never throws; the local clear still runs even if the revoke could not */ }
+    try { devicePending.clearAllPending(safeStorage, dir); } catch { /* the pending markers belonged to the identity just removed; a set-up-again re-creates the ones it needs */ }
+    // A reset re-offers migration: the offer flag is keyed by origin and a reset does not change the origin, so
+    // clear it (and the cached support) here, else the one-time nudge would never fire again for this server.
+    try { writeState({ deviceMigrationOfferOrigin: null }); } catch { /* best-effort; the standing door still stands */ }
+    deviceMigrateSupport = null;
+    invalidateMigrationView();
+    deviceUnreadableStreak = 0;    // the identity is gone; the streak starts fresh if a new one later turns unreadable
+    deviceIdentityStale = false;   // nothing to present any more
+    try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ }
+    refreshTray();
+    void tickSync();
+  } finally { syncFlowBusy = false; }
+}
+
+// The set-up-again DOOR: re-register this computer on a FRESH identity and re-establish its recorded vaults —
+// reachable from the device-ended tray lines (revoked / expired / not-recognized) and after the escape-hatch
+// reset, all of which promised "set it up again" with nowhere to do it. The old identity is forgotten first
+// (idempotent: already absent after a server-end or a reset), so register lands on an absent slot; then each
+// recorded vault's OLD grant record is dropped so it counts as a FIRST setup on the new identity (else the
+// resume guard would read it as "granted before", find nothing on the new identity, and silently drop it), and
+// re-granted — no-password vaults now, password vaults via a pending marker the resume finishes on next open.
+// Fail-soft: any incomplete step leaves the vaults syncing on the account session. Never touches vault data.
+async function runDeviceSetupAgain() {
+  if (syncFlowBusy) return;
+  syncFlowBusy = true;
+  try {
+    const dir = app.getPath('userData');
+    const origin = serverConfig.readServerOrigin(dir);
+    const accountToken = await resolveAccountToken();
+    const info = (detail) => { try { return dialog.showMessageBox(mainWindow, { type: 'info', title: 'Set up this computer', noLink: true, message: 'Set up this computer', detail, buttons: ['OK'] }); } catch { return Promise.resolve(); } };
+    if (!origin || !accountToken) { await info('Open DockVault and sign in to your account, then set this computer up again from the tray.'); return; }
+    // The vaults recorded under the OLD identity — the set to re-establish. The record carries no identity, so
+    // it survives the forget; read it up front so a set-up-again always knows which vaults to bring back.
+    let recorded = [];
+    try {
+      const cur = deviceGrantStore.readGrantMeta(safeStorage, dir);
+      const meta = (cur && cur.meta) || {};
+      recorded = Object.keys(meta).map((vaultId) => ({ vaultId, vaultName: (meta[vaultId] && meta[vaultId].name) || vaultId, hasPassword: !!(meta[vaultId] && meta[vaultId].hasPassword) }));
+    } catch { recorded = []; } // an unreadable record: re-register only; the vaults re-establish as they are next used
+    const probe = await deviceRegister.checkDeviceSyncSupported({ serverOrigin: origin, accountToken }, mainHttpJson);
+    if (probe.reason !== 'ok') {
+      await info(probe.reason === 'auth' ? 'Sign in again, then set this computer up from the tray.'
+        : probe.reason === 'too-old' ? "This server doesn't support syncing individual computers yet."
+          : "Couldn't check right now — try again in a little while.");
+      return;
+    }
+    // The same (a') consent as first setup — taken FIRST, before the one irreversible step (the forget): the
+    // permanent name, the can't-rename truth, the under-lock disclosure. A decline costs nothing, leaving any
+    // still-present (not-recognised) identity exactly as it was rather than forgetting it for no reason.
+    const label = deviceRegister.suggestDeviceLabel(Array.isArray(probe.devices) ? probe.devices.map((d) => d && d.label).filter((l) => typeof l === 'string') : []);
+    const consent = await dialog.showMessageBox(mainWindow, {
+      type: 'question', title: 'Set up this computer for sync?', noLink: true,
+      message: 'Set this computer up to sync again?',
+      detail: `It will appear in your account as "${label}". You can't rename it later without setting this computer up again. This computer keeps syncing on its own — even while DockVault or the screen is locked.`,
+      buttons: ['Not now', 'Set up'], defaultId: 0, cancelId: 0,
+    }).then((r) => r.response === 1).catch(() => false);
+    if (!consent) return; // the vaults keep syncing on the account session; nothing forgotten
+    // Consented: now the irreversible forget (idempotent — already absent after a server-end or a reset) so
+    // register lands on an ABSENT slot, never a refusal over a stale blob.
+    try { await deviceRegister.forgetDevice({ serverOrigin: origin, accountToken, dir, safeStorage }, { fetchFn: mainHttpJson }); }
+    catch { /* forgetDevice never throws */ }
+    const reg = await deviceRegister.registerDevice({ serverOrigin: origin, accountToken, label, dir, safeStorage }, { fetchFn: mainHttpJson });
+    if (!reg || !reg.ok) { await info("Setting this computer up didn't finish. Your vaults keep syncing through your sign-in — you can try again."); return; }
+    const deviceId = reg.deviceId;
+    // Re-establish the recorded vaults on the NEW identity (drop the old record first; no-password now,
+    // password pending). The sequencer's order + branch are unit-tested in device-grant-resume.
+    await runSetupAgainGrants({
+      dropMeta: (vaultId) => { try { deviceGrantStore.removeGrantMeta(safeStorage, dir, vaultId); } catch { /* best-effort; the guard is the backstop */ } },
+      addPending: (vaultId) => { devicePending.addPending(safeStorage, dir, vaultId); }, // may throw on an unreadable store → the sequencer records it failed
+      grant: async ({ vaultId, vaultName }) => {
+        const r = await deviceGrant.grantAndRecord({ serverOrigin: origin, accountToken, deviceId, vaultId, vaultType: 'standard', vaultName, dir, safeStorage }, { fetchFn: mainHttpJson });
+        return (r && r.ok) ? { ok: true } : { ok: false, reason: (r && r.reason) || 'grant-failed' };
+      },
+    }, recorded);
+    deviceUnreadableStreak = 0;
+    deviceIdentityStale = false;
+    try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ }
+    refreshTray();
+    void tickSync();
+    await info('This computer is set up to sync again. Your vaults sync on it now; a password-protected vault finishes the moment you next open it.');
+  } finally { syncFlowBusy = false; }
+}
+
+// Move a desktop that already syncs on the ACCOUNT path onto this computer's own device identity — the
+// existing-setup migration. It reuses the enable machinery (runDeviceSetup over buildDeviceEnableIo): the FIRST
+// un-recorded vault drives the ONE identity step — register on a genuinely-absent slot, grant-only on a live
+// identity for this server, or the CONSENTED switch on an identity bound to another server — and each further
+// vault is grant-only (the identity now reads 'ok'), so the register/switch consent is shown once, never per
+// vault. A no-password vault is granted here; a password vault defers to a pending marker + "open it once" that
+// the resume sweep completes. grantAndRecord writes each vault's record, which is exactly what makes a later
+// revoke terminal (no account fallback). It NEVER forgets a live identity for THIS server. Fail-soft: any vault
+// short of a device grant simply keeps syncing on the account session. Un-recorded is read as the store's own
+// three-state ('first-setup' only) so an unreadable record is left for later, never re-granted on a locked store.
+async function runDeviceMigration() {
+  if (syncFlowBusy) return;
+  syncFlowBusy = true;
+  try {
+    const dir = app.getPath('userData');
+    let unrecorded = [];
+    try {
+      unrecorded = storedConfig()
+        .filter((e) => e && typeof e.vaultId === 'string' && e.vaultId && deviceGrantHistory(dir, e.vaultId) === 'first-setup')
+        .map((e) => ({ vaultId: e.vaultId, vaultName: e.vaultName || e.vaultId, hasPassword: vaultRequiresPassword(e.vaultId) }));
+    } catch { unrecorded = []; }
+    if (!unrecorded.length) { refreshTray(); return; } // nothing to move (already migrated, or records unreadable) — the door re-derives
+    const io = buildDeviceEnableIo(unrecorded[0]); // ONE shared identity step, then grant each vault through the same io
+    const outcomes = [];
+    for (const v of unrecorded) {
+      let outcome;
+      try { outcome = await runDeviceSetup(io, v); }
+      catch { outcome = { via: 'account', outcome: 'grant-failed', reason: 'device-step-error' }; } // fail-soft: the vault still syncs on the account session
+      if (outcome && outcome.outcome === 'grant-deferred') {
+        try { devicePending.addPending(safeStorage, dir, v.vaultId); } catch { /* an unreadable pending store is non-fatal; the account path still syncs */ }
+      }
+      outcomes.push({ vault: v, outcome });
+      // The identity step (register / switch / sign-in) is shared: if it did not land it will not land for the
+      // rest either, so stop rather than re-prompt per vault. A per-vault grant defer/failure keeps the loop going.
+      const o = outcome && outcome.outcome;
+      if (o === 'register-cancelled' || o === 'switch-declined' || o === 'register-failed' || o === 'account-only' || o === 'sign-in') break;
+    }
+    try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ }
+    invalidateMigrationView(); // records changed (grants written / pending) → the door must re-derive now, not from cache
+    void tickSync();      // reflect the resulting path (device vs account) in the tray
+    refreshTray();        // the door re-derives from records now — a fully-migrated set makes it vanish
+    await showMigrationOutcomes(outcomes);
+  } finally { syncFlowBusy = false; }
+}
+
+// ONE grouped result for a migration pass — never a dialog per vault. Success and the person's own declines are
+// quiet (the tray already reflects them); everything else is shown as honest deviceOutcomeCopy lines in a SINGLE
+// dialog, so a person sees what still needs a step and that nothing was lost (each vault keeps syncing on the
+// account session meanwhile). The grouping is pure + tested (groupMigrationOutcomes): an identity-level outcome
+// (decided once for the whole pass) is one line naming the vaults collectively; a per-vault outcome is one line
+// per vault, so the singular copy always reads correctly.
+async function showMigrationOutcomes(outcomes) {
+  const groups = groupMigrationOutcomes(outcomes);
+  if (!groups.length) return; // all granted / all declined → quiet
+  const lines = [];
+  for (const g of groups) {
+    const sample = { outcome: g.outcome, reason: g.reason || undefined, switched: g.switched };
+    if (g.idLevel) lines.push(enableCopy.deviceOutcomeCopy(sample, { vaultName: 'your vaults' }).message);
+    else for (const name of g.names) lines.push(enableCopy.deviceOutcomeCopy(sample, { vaultName: name }).message);
+  }
+  try {
+    await dialog.showMessageBox(mainWindow, {
+      type: 'info', title: 'Set up this computer', noLink: true,
+      message: 'Set up this computer for sync', detail: lines.join('\n\n'), buttons: ['OK'],
+    });
+  } catch { /* best-effort */ }
+}
+
+// A native how-to dialog for an unready sync helper: the specific reason, then the remedy that fits it. Leak-safe —
+// never a path, a value, or a SHA. A packaged app's helper came bundled with the installer, so the remedy follows
+// the typed reason (reinstall for a damaged helper, allow-and-restart for a blocked one, restart-first otherwise);
+// a development checkout is told which settings drive the helper and how to place the bundled one.
 function showHelperFixDialog(item) {
-  const detail = trayPresentation.helperDetail(item && item.sub, item && item.installed, rcloneCfg && rcloneCfg.version);
+  const sub = item && item.sub;
+  const detail = trayPresentation.helperDetail(sub, item && item.installed, rcloneCfg && rcloneCfg.version, app.isPackaged);
+  const remedy = app.isPackaged
+    ? trayPresentation.helperRemedy(sub, process.platform)
+    : 'The sync helper (rclone) comes from these settings: DOCKVAULT_RCLONE (the binary), DOCKVAULT_RCLONE_VERSION, and DOCKVAULT_RCLONE_SHA256 — or run `npm run fetch-rclone` to place the bundled helper. Correct whichever is wrong or missing, then restart DockVault.';
   try {
     dialog.showMessageBox(mainWindow, {
       type: 'warning', noLink: true, buttons: ['OK'], defaultId: 0,
       message: "The sync helper isn't ready",
-      detail: `${detail}\n\nThe sync helper (rclone) is configured from these settings: DOCKVAULT_RCLONE (the binary), DOCKVAULT_RCLONE_VERSION, and DOCKVAULT_RCLONE_SHA256. Correct whichever is wrong or missing, then restart DockVault.`,
+      detail: `${detail}\n\n${remedy}`,
     });
   } catch { /* dialog unavailable; nothing else to offer */ }
 }
@@ -654,7 +1059,9 @@ function storedConfig() { return syncConfigStore.loadConfig(safeStorage, app.get
 // The account-session vault list is fetched through the shared JSON GET, which conforms to the
 // injected-fetch (url, init) contract the sync modules call with — so the Authorization header they set
 // in init.headers is actually sent. Used only to list the account's vaults; never carries a credential.
-const mainHttpJson = require('./http-json').httpJson;
+// Every main-process request goes through Electron's network layer, so certificate trust is the
+// operating system's store — the same one the interface's proxied requests use. See http-json.js.
+const mainHttpJson = require('./http-json').createHttpJson(net);
 
 // Re-resolve the account session at the moment a flow needs it — never the boot-time snapshot, which
 // goes stale (a first-run user who just signed in would otherwise get a false "not signed in" until a
@@ -680,6 +1087,45 @@ function syncConfiguredIds() { return syncConfigList().map((e) => e.vaultId); }
 // can never disagree. Fail-closed: an unknown state is a calm offline (never a false "syncing"/"up to date").
 function isOnlineNow() { try { return net.isOnline(); } catch { return false; } }
 
+// Whether THIS computer holds a live sync identity of its own for the configured server ('ok' or 'stale', or a
+// rotation caught mid-flight and marked stale). The one place both the scheduler's dispatch gate and the lock
+// glance ask "is there a device path that keeps syncing under the OS lock?". Fails closed to false — any read
+// error, or no configured server, is "no identity" — and reads the non-secret status only, dropping the secret.
+function deviceIdentityLive() {
+  try {
+    const dir = app.getPath('userData');
+    const origin = serverConfig.readServerOrigin(dir);
+    if (!origin) return false;
+    // NON-SECRET read (the last per-draw/per-tick one): migrationDeviceStatus derives presence from
+    // readIdentityMeta (which decrypts but NEVER surfaces the secret) + the rotating marker, so answering "is
+    // there an identity for this server?" no longer materializes the device secret on every tray draw and tick.
+    // 'ok' (a live, origin-matched identity — stale-marked or not) or 'rechecking' (a surviving rotation marker)
+    // is exactly the old readDeviceSecret status ok||stale; 'absent' / 'absent-for-this-server' are not.
+    const s = migrationDeviceStatus(dir, origin);
+    return s === 'ok' || s === 'rechecking' || deviceIdentityStale;
+  } catch { return false; }
+}
+
+// The device identity's raw read status, for the escape-hatch streak below: 'ok' | 'stale' | 'absent' |
+// 'unreadable' | 'absent-for-this-server' | 'no-secure-store'. Reads the non-secret status only and drops the
+// secret; fails closed to 'unreadable' (an escalation toward the reset offer, never a false 'ok').
+function deviceIdentityStatus() {
+  try {
+    const dir = app.getPath('userData');
+    const origin = serverConfig.readServerOrigin(dir);
+    if (!origin) return 'absent';
+    const r = deviceSecretStore.readDeviceSecret(safeStorage, dir, origin);
+    if (r && r.secret) { try { deviceSecretStore.zeroizeSecret(r.secret); } catch { /* best-effort */ } r.secret = null; }
+    return (r && r.status) || 'absent';
+  } catch { return 'unreadable'; }
+}
+
+// Escape hatch: consecutive ticks that read the identity UNREADABLE. A persistently locked/torn keychain
+// escalates the calm paused glance to a one-time reset offer only after it fails to clear for a while; any
+// readable status resets the streak. Per-identity (global), in-memory — a restart re-counts from zero.
+const DEVICE_UNREADABLE_RESET_THRESHOLD = 3; // ~15 min at the 5-min tick, so a transient lock clears first
+let deviceUnreadableStreak = 0;
+
 // One sync pass: refresh the run-state view from the helper, drop any expired credentials (clearing the
 // helper's now-stale slot too), then let the scheduler decide each configured vault. A manual pass
 // ("Sync now") asks for each enabled vault ahead of the routine queue; a routine pass ticks them all. The
@@ -693,10 +1139,27 @@ async function tickSync({ manual = false } = {}) {
   // so the tray glance and the run gate can never disagree. Without this the glance stays a false green
   // "Up to date" while the machine is offline and edits accrue; the model already renders offline as a calm
   // paused "waiting to reconnect".
-  if (syncHub) syncHub.setOnline(isOnlineNow());
+  if (syncHub) { syncHub.setOnline(isOnlineNow()); syncHub.setDeviceLive(deviceIdentityLive()); } // keep the lock glance's device-identity signal at most one tick behind the gate (same reader)
+  // Escape hatch: advance the unreadable streak ONLY while unlocked — a keyring that locks with the screen
+  // reads unreadable on every locked tick, and those lock-induced reads must not count toward the reset offer.
+  // Any readable status, or a locked tick, resets it; the unlock transition also resets it.
+  const appLocked = !!(lockState && typeof lockState.snapshot === 'function' && lockState.snapshot().appLocked);
+  deviceUnreadableStreak = deviceRegister.nextUnreadableStreak(deviceUnreadableStreak, { status: deviceIdentityStatus(), appLocked });
+  // A surviving rotation marker only resolves on a device-refresh pass; kick one here (when none is in flight)
+  // so a sign-in — which fires this tick — reconciles the calm "being re-checked" wait within one pass rather
+  // than up to an hour later on the routine device-refresh tick.
+  try { if (deviceSecretStore.hasRotatingMarker(app.getPath('userData')) && !deviceRefreshBusy) void tickDeviceRefresh(); } catch { /* best-effort */ }
+  // Retry the migration offer's support probe when it is not yet known for the current server (a boot probe that
+  // failed offline, or a freshly-switched server): fill the door within one routine tick rather than only on a
+  // lock->unlock cycle. Fail-quiet + idempotent; the one-time notification stays governed by the origin flag.
+  try { const o = serverConfig.readServerOrigin(app.getPath('userData')); if (o && (!deviceMigrateSupport || deviceMigrateSupport.origin !== o)) void maybeOfferDeviceMigration(); } catch { /* best-effort */ }
   await runStateSnapshot.refresh(syncConfiguredIds()); // a failed refresh keeps it not-fresh → the scheduler skips
   if (manual) { for (const e of syncConfigList()) if (e && e.enabled) syncScheduler.requestSync(e.vaultId, { manual: true }); }
   else syncScheduler.tickAll();
+  // Complete any device grant that deferred at setup, now that this pass may find the vault open (the pass is
+  // more frequent than the password-freshness window, so an open vault is never missed). Fire-and-forget and
+  // single-flighted, so it never blocks or stacks on the tick.
+  void maybeResumeDeviceGrants();
 }
 
 // A per-run icacls invocation (an argv array, never a shell string) for the owner-only folder ACL on
@@ -794,8 +1257,62 @@ function startSyncScheduler() {
   const entryByFolder = (folder) => { try { return storedConfig().find((e) => e.localFolder === folder) || null; } catch { return null; } };
 
   runStateSnapshot = new RunStateSnapshot({ fetch: (ids) => daemon.runStates(ids) });
+
+  // Which credential path a run takes — this computer's registered identity (the device path) or the account
+  // session (the account path, kept for set-ups not yet moved over) — decided ONCE per run from the device
+  // identity, the server's fresh grant list and the local grant record, then latched for that run so every
+  // credential minted during it (the dispatch mint and each per-step mint) takes the same path. The device
+  // secret is read from the OS store at the moment it is needed and never kept on any of these closures.
+  const withDeviceSecret = async (fn) => {
+    if (deviceIdentityStale) { const e = new Error('device identity is stale'); e.reason = 'device-secret-stale'; throw e; } // never present a retired secret
+    const origin = serverConfig.readServerOrigin(dir);
+    const id = deviceSecretStore.readDeviceSecret(safeStorage, dir, origin);
+    if (id.status === 'stale') { const e = new Error('device identity is stale'); e.reason = 'device-secret-stale'; throw e; } // the durable mark, after a restart
+    // The identity was 'ok' when this run began; anything else now is a LOCAL change (a forget raced the run,
+    // the keyring locked), never a server refusal — the next pass simply decides afresh.
+    if (id.status !== 'ok') { const e = new Error('device identity unavailable'); e.reason = id.status === 'unreadable' ? 'device-secret-unreadable' : 'device-identity-missing'; throw e; }
+    try { return await fn(origin, id.secret); } finally { id.secret = null; }
+  };
+  mintPath = new MintPathSelector({
+    readSecret: () => {
+      const r = deviceSecretStore.readDeviceSecret(safeStorage, dir, serverConfig.readServerOrigin(dir)); r.secret = null;
+      if (r.status === 'absent') deviceIdentityStale = false; // the identity is gone (forgotten; a new one may register) — a merely unreadable one keeps the flag
+      if (deviceIdentityStale && r.status === 'ok') return { status: 'stale' }; // an in-memory retired mark over a live blob
+      // A raw 'stale' from a surviving ROTATING marker (not the durable retired flag) is being re-checked, not
+      // terminal: report it distinctly so the selector shows the calm wait rather than a set-up-again.
+      if (r.status === 'stale' && !deviceIdentityStale && deviceSecretStore.hasRotatingMarker(dir)) return { status: 'rechecking' };
+      return { status: r.status };
+    },
+    listGrants: () => withDeviceSecret((origin, secret) => deviceGrant.listMyGrants({ serverOrigin: origin, deviceSecret: secret, dir, safeStorage }, { fetchFn: mainHttpJson })),
+    readGrantRecord: () => deviceGrantStore.readGrantMeta(safeStorage, dir),
+    // A grant whose details were never recorded here (or could not be read): fill them in from the account's
+    // own vault listing when a session is live, and record them best-effort for next time. The listing holds
+    // only Standard vaults, so a vault found there is Standard by construction; one not found stays pending.
+    backfill: async (vaultId) => {
+      const origin = serverConfig.readServerOrigin(dir);
+      const token = await resolveAccountToken();
+      if (!origin || !token) return null;
+      const res = await syncVaults.fetchStandardVaults({ serverOrigin: origin, sessionToken: token }, mainHttpJson);
+      rememberVaultPasswordFlags(res && res.vaults);
+      const v = ((res && res.vaults) || []).find((x) => x && x.vaultId === vaultId);
+      if (!v) return null;
+      const meta = { name: v.vaultName, vaultType: 'standard', hasPassword: v.hasPassword !== false };
+      try { deviceGrantStore.setGrantMeta(safeStorage, dir, vaultId, meta); } catch { /* the record is a convenience; the grant list is the authority */ }
+      return meta;
+    },
+  });
+
   credCache = new CredCache({
     mint: async (vaultId) => {
+      const via = mintPath.current(vaultId);
+      // The device path: this computer's own identity mints against its grant. No account session, no vault
+      // password. The response carries the host key to pin and the real SFTP host/port. A failure here is the
+      // device's own typed refusal and is NEVER retried on the account path within the run.
+      if (via === 'device') return withDeviceSecret((origin, secret) => mintDeviceSftpAccess({ serverOrigin: origin, deviceSecret: secret, vaultId }, mainHttpJson));
+      // No path was chosen for this vault's run: a wiring fault (a mint with no eligibility step before it),
+      // surfaced as an internal error rather than silently taking either path.
+      if (via !== 'account') { const e = new Error('no credential path chosen for this run'); e.reason = 'internal-error'; throw e; }
+      // The account path (set-ups not yet moved over to device sync).
       const origin = serverConfig.readServerOrigin(dir);
       const token = await resolveAccountToken();
       if (!origin || !token) { const e = new Error('not signed in'); e.status = 401; throw e; } // -> 'no-session' -> sign in
@@ -857,8 +1374,36 @@ function startSyncScheduler() {
     isAccountUsable: () => !!(lockState && lockState.isAccountUsable()),
     vaultHasPassword: (vaultId) => vaultRequiresPassword(vaultId), // route a persistent auth-failed here to needs-unlock
     hasAccount: () => { try { return !!(serverConfig.readServerOrigin(dir) && ((sessionBundle && sessionBundle.authToken) || (tokenStore.loadSession(safeStorage, dir) || {}).authToken)); } catch { return false; } },
+    // This computer's own sync identity for the configured server: 'ok' dispatches on the device path; 'stale' counts
+    // too, so a run reaches the eligibility step and is refused there with the honest device reason rather than a
+    // misleading "sign in". Anything else is no identity (absent, another server's, unreadable, no secure store).
+    hasDeviceIdentity: deviceIdentityLive,
     isOnline: isOnlineNow, // the one online source — shared with the status hub's glance (tickSync setOnline)
     onEvent: (vaultId, ev) => {
+      // Stamp the run with the credential path it took, so the glance can say which kind of sync ran; and
+      // once the run has ended in any way, forget the run's latched path so the next run decides afresh.
+      if (ev && ev.phase === 'running') ev = { ...ev, via: mintPath.current(vaultId) };
+      // The server has ended this computer's identity (removed by the owner, or expired): the local secret can
+      // never be presented again, so it is wiped now — the state database is left alone, and the recorded grant
+      // details stay for the next set-up. The refusal itself is still recorded and held below.
+      if (ev && (ev.phase === 'refused' || ev.phase === 'paused' || ev.phase === 'skipped') && identityEndedBy(ev.reason)) {
+        try { deviceSecretStore.clearDeviceSecret(dir); } catch { /* best effort; the next read re-decides */ }
+        deviceIdentityStale = false;
+        if (syncHub) syncHub.setDeviceLive(false); // the identity is gone -> the lock overlay must not keep a device vault's stale green
+      }
+      // The pending-grant marker follows the run's reason: a re-proof (the vault password changed) FEEDS it so
+      // the resume finishes it on the next open; a revoked/withdrawn grant or an ended identity CLEARS it so the
+      // resume never reactivates a grant the owner withdrew. Best-effort — the sweep's own listMyGrants
+      // active-check is the second layer, and a first grant reactivates nothing.
+      const markerAct = ev && markerActionForRunReason(ev.reason);
+      if (markerAct) {
+        try {
+          if (markerAct === 'add') devicePending.addPending(safeStorage, dir, vaultId);
+          else if (markerAct === 'clear') devicePending.clearPending(safeStorage, dir, vaultId);
+          else if (markerAct === 'clear-all') devicePending.clearAllPending(safeStorage, dir);
+        } catch { /* an unreadable pending store: the sweep's guard still prevents a wrong grant */ }
+      }
+      const terminal = !!(ev && ['done', 'error', 'blocked', 'paused', 'skipped', 'refused', 'noop'].includes(ev.phase));
       // A deliberate "Sync now" press earns one completion answer. 'running'/'noop' are not terminal — the
       // press is still in progress or has joined an in-flight run, so keep waiting; any terminal outcome
       // resolves it. Mark it BEFORE sink.apply so the hub's must-act notification (fired synchronously inside
@@ -877,9 +1422,24 @@ function startSyncScheduler() {
         if (manualTerminal) { pendingManualSync.delete(vaultId); notifyManualComplete(vaultId, ev); }
       } finally {
         manualHookPending = null; // the guarantee window is only this callback
+        if (terminal) mintPath.end(vaultId);
       }
     },
   });
+  // The run-time eligibility step decides the credential path first. On the device path the vault must be
+  // among this computer's active grants with a recorded Standard tier, and the remote path is the vault's
+  // rename-proof id form; on the account path the existing fresh vault-list re-assert runs as before.
+  io.credentialPath = (vaultId) => mintPath.current(vaultId); // which path this vault's run took, for the auth-failure routing
+  const accountEligible = io.verifyEligible;
+  io.verifyEligible = async (vaultId) => {
+    const d = await mintPath.begin(vaultId);
+    if (!d.ok) return d;
+    if (d.via === 'device') return { ok: true, via: 'device', remotePath: d.remotePath, vaultName: d.vaultName };
+    // Carry the latched path on the account result too, so the dispatch gate's under-lock re-check can tell a
+    // device run (which keeps syncing under the account-tier lock) from an account run (which pauses).
+    const acc = await accountEligible(vaultId);
+    return (acc && acc.ok) ? { ...acc, via: 'account' } : acc;
+  };
   syncScheduler = new SyncScheduler(io);
   // Authorise the helper's per-step credential requests (a resync mints one fresh single-use credential per
   // rclone process). Main holds the say: it mints ONLY for the vault whose run is in flight right now, and only
@@ -888,9 +1448,14 @@ function startSyncScheduler() {
   // helper's requested vaultId is CHECKED against the scheduler's in-flight vault, never trusted as an input;
   // the fresh credential is delivered on the existing sftp-cred path, and this returns only { ok, reason }.
   if (daemon) daemon.setCredProvider(async (vault) => {
-    if (!syncScheduler || syncScheduler.current() !== vault) return { ok: false, reason: 'not-in-flight' };
-    if (!(lockState && lockState.isAccountUsable())) return { ok: false, reason: 'paused-locked' };
-    if (!io.hasAccount()) return { ok: false, reason: 'no-session' };
+    // The device path needs no account session; the account path does; a run that chose no path mints nothing.
+    const refuse = schedulerIo.perStepGate({
+      inFlight: !!(syncScheduler && syncScheduler.current() === vault),
+      locked: !(lockState && lockState.isAccountUsable()),
+      via: mintPath.current(vault),
+      accountLive: io.hasAccount(),
+    });
+    if (refuse) return { ok: false, reason: refuse };
     return credCache.ensureSent(vault);
   });
   // The routine cadence. Unref'd so it never keeps the process alive; each tick is a cheap gated skip when
@@ -898,6 +1463,90 @@ function startSyncScheduler() {
   if (syncTickTimer) clearInterval(syncTickTimer);
   syncTickTimer = setInterval(() => { void tickSync(); }, SYNC_TICK_MS);
   if (syncTickTimer.unref) syncTickTimer.unref();
+  // The identity rotation: its own cadence beside the sync tick (never coupled to a mint), with a first look
+  // shortly after boot once the network has settled.
+  if (deviceRefreshTimer) clearInterval(deviceRefreshTimer);
+  deviceRefreshTimer = setInterval(() => { void tickDeviceRefresh(); }, DEVICE_REFRESH_TICK_MS);
+  if (deviceRefreshTimer.unref) deviceRefreshTimer.unref();
+  const firstLook = setTimeout(() => { void tickDeviceRefresh(); }, BOOT_SYNC_KICK_MS + 15000);
+  if (firstLook.unref) firstLook.unref();
+}
+
+// One rotation check: rotate this computer's identity when it is old enough. Quiet on every failure other than
+// a STALE refusal (the secret held here is already retired): that flips the identity to stale so no run presents
+// it again, and the next pass surfaces the honest state. Everything else simply tries again next hour.
+async function tickDeviceRefresh() {
+  if (SMOKE || deviceRefreshBusy || !isOnlineNow()) return;
+  const dir = app.getPath('userData');
+  const origin = serverConfig.readServerOrigin(dir);
+  if (!origin) return;
+  // Rotation RECOVERY takes precedence: a ROTATING marker present when no refresh is in flight (this tick is
+  // not busy) is a crash-survivor or an ambiguous-failure keep — the held secret MAY be retired, so it is
+  // never presented; reconcile it against the account's device list instead of rotating.
+  if (deviceSecretStore.hasRotatingMarker(dir)) {
+    deviceRefreshBusy = true;
+    try { await reconcileSurvivedRotation(dir, origin); } finally { deviceRefreshBusy = false; }
+    return;
+  }
+  let read;
+  try { read = deviceSecretStore.readDeviceSecret(safeStorage, dir, origin); } catch { return; }
+  if (read) read.secret = null;
+  if (!read || read.status !== 'ok' || deviceIdentityStale || !isRotationDue(read, Date.now())) return;
+  deviceRefreshBusy = true;
+  try {
+    const r = await refreshDeviceSecret({ serverOrigin: origin, dir, safeStorage }, { fetchFn: mainHttpJson });
+    // Stale: the server refused the held secret as retired, OR it rotated and this side lost the answer (a store
+    // that failed, an answer with no usable secret). Either way the secret held here is retired — stop presenting it.
+    if (identityIsStaleAfter(r)) {
+      deviceIdentityStale = true;
+      deviceSecretStore.markDeviceSecretStale(dir); // durable: survives a restart, so the boot kick never presents the retired secret
+      if (syncScheduler) syncScheduler.releaseHolds();
+      void tickSync(); // let the next pass show the honest state rather than wait for the routine tick
+    }
+  } catch { /* a rotation never throws; belt-and-suspenders */ }
+  finally { deviceRefreshBusy = false; }
+}
+
+// Reconcile a SURVIVING rotation marker (a crash between /device/refresh and the store, or an ambiguous
+// failure that kept the mark) WITHOUT presenting the possibly-retired secret. The account session's device
+// list is the source of truth: match this computer's row by its (non-secret) deviceId and compare the
+// server's epoch to the blob's. Only an exact match LIFTS the mark; every doubt keeps it and waits.
+//   clear   → the rotation never landed; the held secret is still current → clear the mark, resume.
+//   stale   → the server rotated and this side lost the new secret → mark stale + clear the rotating mark
+//             (so the state becomes unambiguously terminal), route to set-up-again.
+//   revoked → the row is gone/inactive → same terminal treatment; set-up-again.
+//   keep    → leave the mark; a later tick (or a sign-in) retries. Meanwhile the identity reads "being
+//             re-checked" (a calm paused wait), never a set-up-again alarm.
+async function reconcileSurvivedRotation(dir, origin) {
+  const accountToken = await resolveAccountToken();
+  if (!accountToken) return;                                   // no session → keep the mark + wait (the calm "being re-checked" glance shows)
+  const meta = deviceSecretStore.readIdentityMeta(safeStorage, dir);
+  if (!meta || !meta.deviceId) return;                         // cannot name the row → keep + wait
+  let probe;
+  try { probe = await deviceRegister.checkDeviceSyncSupported({ serverOrigin: origin, accountToken }, mainHttpJson); }
+  catch { return; }                                            // could not reach/list → doubt → keep + wait
+  if (!probe || probe.reason !== 'ok' || !Array.isArray(probe.devices)) return; // not a clean device list → keep
+  const row = probe.devices.find((d) => d && (d.device_id === meta.deviceId || d.id === meta.deviceId));
+  const lookup = row ? { found: true, isActive: row.is_active !== false, epoch: row.epoch } : { found: false };
+  const decision = reconcileRotationMarker(lookup, meta.epoch);
+  let changed = false;
+  if (decision === 'clear') {
+    deviceSecretStore.clearDeviceSecretRotating(dir);          // the held secret IS current → recover
+    deviceIdentityStale = false;
+    changed = true;
+  } else if (decision === 'stale') {
+    deviceSecretStore.markDeviceSecretStale(dir);              // the server rotated and this side lost the answer → retired
+    deviceSecretStore.clearDeviceSecretRotating(dir);          // drop the rotating mark so the state is unambiguously stale (no longer "being re-checked")
+    deviceIdentityStale = true;
+    if (syncScheduler) syncScheduler.releaseHolds();
+    changed = true;
+  } else if (decision === 'revoked') {
+    deviceSecretStore.clearDeviceSecret(dir);                  // the device row is GONE → wipe the identity so it reads as REMOVED ("set it up again"), not merely "not recognised"
+    deviceIdentityStale = false;                               // nothing to present; the blob is gone
+    if (syncScheduler) syncScheduler.releaseHolds();
+    changed = true;
+  } // 'keep' → leave the mark untouched; retry next pass (no state change → no tick, so the sign-in kick can't loop)
+  if (changed) { try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ } void tickSync(); }
 }
 
 function buildEnableIo() {
@@ -1018,6 +1667,247 @@ function buildEnableIo() {
   };
 }
 
+// The IO surface for the DEVICE STEP of enabling sync (runDeviceSetup drives the order + the fail-soft
+// rules; this only carries each step out). Every server call goes over mainHttpJson — the real Electron net
+// the vault-list fetch already uses. Nothing here holds a credential: the device secret lives in the OS
+// store, and the vault password is proven ONCE from the renderer's unlock state (pullVaultPasswordForMint),
+// the same single-use, never-stored path the mint uses — there is no native password prompt.
+function buildDeviceEnableIo(vault) {
+  const dir = app.getPath('userData');
+  const origin = serverConfig.readServerOrigin(dir);
+  let deviceId = null;       // set by a successful register, or read from the store for the grant-only path
+  let otherOrigin = null;    // captured from the store for the switch-server dialog
+  let existingLabels = [];   // captured from the probe so the suggested label does not collide
+  return {
+    probe: async () => {
+      const accountToken = await resolveAccountToken();
+      const r = await deviceRegister.checkDeviceSyncSupported({ serverOrigin: origin, accountToken }, mainHttpJson);
+      if (Array.isArray(r.devices)) existingLabels = r.devices.map((d) => d && d.label).filter((l) => typeof l === 'string');
+      return { reason: r.reason };
+    },
+    readStatus: () => {
+      try {
+        const read = deviceSecretStore.readDeviceSecret(safeStorage, dir, origin);
+        const status = (read && read.status) || 'absent';
+        if (read && read.status === 'ok' && typeof read.deviceId === 'string') deviceId = read.deviceId; // grant-only path id
+        if (read && read.status === 'absent-for-this-server') otherOrigin = read.otherOrigin || null;
+        if (read && read.secret) { try { deviceSecretStore.zeroizeSecret(read.secret); } catch { /* best-effort */ } read.secret = null; }
+        return status;
+      } catch { return 'unreadable'; } // never register on top of a blob we could not read
+    },
+    confirmSwitchServer: async () => {
+      const other = otherOrigin || 'another server';
+      const res = await dialog.showMessageBox(mainWindow, {
+        type: 'warning', title: 'Switch this computer to this server?', noLink: true,
+        message: 'This computer is already set up to sync with another server',
+        // The truth of the absent-for-this-server forget: this session CANNOT revoke on the other server
+        // (it can't speak for it), so it clears the local identity and registers here — the other server
+        // keeps listing this computer until its owner removes it there. Never promise a removal we can't do.
+        detail: `This computer will stop using its identity for ${other} and get a new one here. ${other} will still list this computer until its owner removes it there.`,
+        buttons: ['Cancel', 'Switch to this server'], defaultId: 0, cancelId: 0,
+      });
+      return res.response === 1;
+    },
+    forget: async () => {
+      const accountToken = await resolveAccountToken();
+      try { await deviceRegister.forgetDevice({ serverOrigin: origin, accountToken, dir, safeStorage }, { fetchFn: mainHttpJson }); }
+      catch { /* forgetDevice never throws; belt-and-suspenders */ }
+      try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* the identity is now absent → refresh the glance */ }
+    },
+    promptLabel: async () => {
+      // (a'): no main-process text input, so auto-assign a non-identifying label (never the hostname) and
+      // SHOW the permanent name in the buttons-only consent, alongside the permanence and the lock
+      // disclosure — one dialog that carries the register consent and both truths.
+      const label = deviceRegister.suggestDeviceLabel(existingLabels);
+      const res = await dialog.showMessageBox(mainWindow, {
+        type: 'question', title: 'Set up this computer for sync?', noLink: true,
+        message: 'Set up this computer for sync?',
+        detail: `It will appear in your account as "${label}". You can't rename it later without setting this computer up again. This computer keeps syncing on its own — even while DockVault or the screen is locked.`,
+        // Default to the SAFE button: the dialog exists so the permanent name and the under-lock behaviour
+        // are READ before they are accepted; an Enter-key default on "Set up" would skip that reading.
+        buttons: ['Not now', 'Set up'], defaultId: 0, cancelId: 0,
+      });
+      return res.response === 1 ? label : null;
+    },
+    register: async (label) => {
+      const accountToken = await resolveAccountToken();
+      // registerDevice runs the fail-safe order itself (pre-check store → POST → store → orphan-clean the
+      // server row on ANY post-POST failure), so there is no second revoke path to add here.
+      const r = await deviceRegister.registerDevice({ serverOrigin: origin, accountToken, label, dir, safeStorage }, { fetchFn: mainHttpJson });
+      if (r && r.ok) { deviceId = r.deviceId; try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* now present → refresh */ } }
+      return r;
+    },
+    grantVault: async ({ vaultId, vaultName, hasPassword }) => {
+      const accountToken = await resolveAccountToken();
+      if (!deviceId) { // defensive: the grant-only path if readStatus did not capture the id
+        try { const read = deviceSecretStore.readDeviceSecret(safeStorage, dir, origin); if (read) { if (typeof read.deviceId === 'string') deviceId = read.deviceId; if (read.secret) { try { deviceSecretStore.zeroizeSecret(read.secret); } catch { /* best-effort */ } read.secret = null; } } } catch { /* fall through */ }
+      }
+      if (!deviceId) return { granted: false, reason: 'no-identity' };
+      // If the server already lists this vault's grant ACTIVE, the grant STANDS — an earlier local record write
+      // may have failed (grantAndRecord is best-effort: a full/locked store leaves recorded:false while the
+      // server grant is real). Re-write the record and SKIP the redundant POST: no password is needed, and the
+      // recovered record is what makes a later revoke terminal instead of resting on a best-effort write. We do
+      // NOT hard-block the 'revoked'/absent answer — checkActiveDeviceGrant returns 'revoked' for a NEVER-granted
+      // vault too, so blocking would refuse every genuine first setup; the remaining "revoked + lost record +
+      // explicit re-grant" is a bounded, same-principal, explicit-click residual (the server-side distinction is
+      // the GA fix). 'inconclusive' → proceed, exactly as a first setup would.
+      let active;
+      try { active = await checkActiveDeviceGrant(vaultId); } catch { active = 'inconclusive'; }
+      if (active === 'active') {
+        let recorded = false;
+        try { deviceGrantStore.setGrantMeta(safeStorage, dir, vaultId, { name: typeof vaultName === 'string' ? vaultName : '', vaultType: 'standard', hasPassword: !!hasPassword }); recorded = true; } catch { recorded = false; }
+        return recorded ? { granted: true } : { granted: true, recordFailed: true };
+      }
+      let vaultPassword;
+      if (hasPassword) {
+        // The one place the vault password is proven for the device grant: pulled from the renderer's unlock
+        // state (vault open + <15min fresh), single-use. Not open → a calm deferred, never a password box.
+        vaultPassword = await pullVaultPasswordForMint(vaultId);
+        if (!vaultPassword) return { granted: false, deferred: true };
+      }
+      try {
+        const r = await deviceGrant.grantAndRecord({ serverOrigin: origin, accountToken, deviceId, vaultId, vaultType: 'standard', vaultName, vaultPassword, dir, safeStorage }, { fetchFn: mainHttpJson });
+        if (!(r && r.ok)) return { granted: false, reason: (r && r.reason) || 'grant-failed' };
+        // The grant is created (server-authoritative). recorded:false means the local record write failed — the
+        // grant STANDS, but surface it honestly (never a silent clean success) so the person can clear the cause
+        // and the vault is not left silently looking un-set-up.
+        return r.recorded ? { granted: true } : { granted: true, recordFailed: true };
+      } finally { vaultPassword = undefined; } // drop our reference; grantDeviceVault also drops the wire copy
+    },
+  };
+}
+
+// Carry out the device step for a just-enabled vault, fail-soft on top of the already-saved config. A
+// deferred grant (the vault was not open to prove its password) records the intent so the resume path can
+// finish it later; any other non-device outcome simply leaves the vault syncing on the account session.
+async function runDeviceStepForVault(entry) {
+  if (!entry || typeof entry.vaultId !== 'string' || !entry.vaultId) return;
+  const dir = app.getPath('userData');
+  const vault = { vaultId: entry.vaultId, vaultName: entry.vaultName, hasPassword: vaultRequiresPassword(entry.vaultId) };
+  let outcome;
+  try { outcome = await runDeviceSetup(buildDeviceEnableIo(vault), vault); }
+  catch { outcome = { via: 'account', outcome: 'grant-failed', reason: 'device-step-error' }; } // fail-soft: the vault still syncs on the account session
+  if (outcome && outcome.outcome === 'grant-deferred') {
+    try { devicePending.addPending(safeStorage, dir, entry.vaultId); } catch { /* an unreadable pending store is non-fatal; the account path still syncs */ }
+  }
+  try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* glance refresh is best-effort */ }
+  void tickSync(); // reflect the resulting path (device vs account) in the tray
+  await showDeviceOutcome(outcome, vault);
+}
+
+// Tell the person what the device step did. A granted device path is quiet success (the tray shows it
+// syncing, the first-success toast fires); every other outcome is one honest, non-blaming line — never a
+// dead end, because the vault is already syncing on the account session.
+async function showDeviceOutcome(outcome, vault) {
+  if (!outcome) return;
+  // A granted device path is quiet success (the tray shows it syncing). And after the person's OWN choice to
+  // decline — a cancelled setup or a declined switch — a dialog repeating that choice is noise; the tray
+  // already reflects it. Keep the honest line only for outcomes the person did NOT choose (deferred, failed,
+  // sign-in, account-only), where they need to know the vault fell back to the account session.
+  if (outcome.via === 'device' && outcome.outcome === 'granted') return;
+  if (outcome.outcome === 'register-cancelled' || outcome.outcome === 'switch-declined') return;
+  const { message } = enableCopy.deviceOutcomeCopy(outcome, { vaultName: vault.vaultName });
+  try {
+    await dialog.showMessageBox(mainWindow, {
+      type: 'info', title: 'Sync setup', noLink: true,
+      message: 'Sync setup', detail: message, buttons: ['OK'],
+    });
+  } catch { /* best-effort */ }
+}
+
+// One acknowledgement that a vault finished setting up on this computer — name only, shown once (the marker is
+// cleared on success, so a later pass never re-announces it), the way the first-sync toast is.
+function ackDeviceSetupComplete(vaultName) {
+  try {
+    if (!Notification || !Notification.isSupported || !Notification.isSupported()) return;
+    new Notification({ title: 'DockVault', body: `${vaultName || 'This vault'} is now set up to sync on this computer.` }).show();
+  } catch { /* best-effort */ }
+}
+
+// The server's authoritative answer for the re-proof guard: does THIS device still hold an ACTIVE grant for
+// the vault? Reads the device secret with the same never-present-a-retired-secret guard the mint uses, asks
+// the device-Bearer grant list, and drops the secret. 'active' | 'revoked' | 'inconclusive' — a stale or
+// unreadable identity, or any failed / unusable answer, is inconclusive, so the sweep DEFERS rather than
+// reactivating a grant on doubt. GET /device/grants returns only active grants, so a clean list that omits
+// the vault is a definitive revoke.
+async function checkActiveDeviceGrant(vaultId) {
+  if (deviceIdentityStale) return 'inconclusive';                 // a retired secret must never be presented (a replay)
+  const dir = app.getPath('userData');
+  const origin = serverConfig.readServerOrigin(dir);
+  if (!origin) return 'inconclusive';
+  let id;
+  try { id = deviceSecretStore.readDeviceSecret(safeStorage, dir, origin); } catch { return 'inconclusive'; }
+  if (!id || id.status !== 'ok') { if (id && id.secret) { try { deviceSecretStore.zeroizeSecret(id.secret); } catch { /* best-effort */ } id.secret = null; } return 'inconclusive'; }
+  let res;
+  try { res = await deviceGrant.listMyGrants({ serverOrigin: origin, deviceSecret: id.secret, dir, safeStorage }, { fetchFn: mainHttpJson }); }
+  catch { res = null; }
+  finally { try { deviceSecretStore.zeroizeSecret(id.secret); } catch { /* best-effort */ } id.secret = null; }
+  if (!res || !res.ok || !Array.isArray(res.grants)) return 'inconclusive'; // a failed / unusable answer → defer, never proceed on doubt
+  return res.grants.some((g) => g && g.vaultId === vaultId) ? 'active' : 'revoked'; // clean list: present = active, absent = revoked
+}
+
+// Per-vault, in-memory: the unlock instant that last got a wrong-password re-proof, so the sweep never re-proves
+// again with the SAME unlock (each stale attempt burns the vault's shared web-open limiter). A newer unlock
+// re-arms it; a success clears it; a restart clears it (a restart is itself a fresh unlock).
+const deviceGrantFailedUnlock = new Map();
+
+// Complete any deferred device grants whose vault is now open + fresh. Called from every sync pass (so an
+// unlock is picked up within one tick), single-flighted, and a cheap no-op unless a device identity, an
+// account session, and at least one pending marker are all present. The sequencer's keep/clear/ack rules are
+// unit-tested in device-grant-resume; here is only the IO it drives.
+let deviceGrantResumeBusy = false;
+async function maybeResumeDeviceGrants() {
+  if (deviceGrantResumeBusy) return;
+  const dir = app.getPath('userData');
+  if (!deviceIdentityLive()) return;                       // no device identity here → nothing to complete
+  let hasPending = false;
+  try { hasPending = devicePending.listPending(safeStorage, dir).length > 0; } catch { hasPending = false; }
+  if (!hasPending) return;                                 // fast path: nothing waiting
+  const origin = serverConfig.readServerOrigin(dir);
+  if (!origin) return;
+  const accountToken = await resolveAccountToken();
+  if (!accountToken) return;                               // grant-create needs the account session
+  let deviceId = null;
+  try {
+    const read = deviceSecretStore.readDeviceSecret(safeStorage, dir, origin);
+    if (read) { if (typeof read.deviceId === 'string') deviceId = read.deviceId; if (read.secret) { try { deviceSecretStore.zeroizeSecret(read.secret); } catch { /* best-effort */ } read.secret = null; } }
+  } catch { /* fall through: no id → skip */ }
+  if (!deviceId) return;
+  deviceGrantResumeBusy = true;
+  const pulledStamp = new Map(); // vaultId → the unlock stamp used this pass, to attribute a wrong-password to it
+  try {
+    const out = await resumePendingGrants({
+      listPending: () => devicePending.listPending(safeStorage, dir),
+      isConfigured: (id) => syncConfiguredIds().includes(id),
+      // Granted before → a re-proof: run the active-grant guard so a revoked grant is never reactivated. A
+      // never-granted vault (a first setup) skips the guard (it reactivates nothing). An UNREADABLE record is
+      // passed through as 'unreadable' — NOT collapsed to first-setup — so the sweep DEFERS on it rather than
+      // silently re-granting a vault whose grant the owner may have revoked (unreadable must fail CLOSED).
+      wasGranted: (id) => { const h = deviceGrantHistory(dir, id); return h === 'unreadable' ? 'unreadable' : h === 'granted'; },
+      checkActiveGrant: (id) => checkActiveDeviceGrant(id),
+      vaultRequiresPassword: (id) => vaultRequiresPassword(id),
+      pullPassword: async (id) => {
+        const u = await pullVaultUnlock(id); // unlock-state, fresh, single-use — same as the mint
+        if (!u) return null;
+        if (deviceGrantFailedUnlock.get(id) === u.stamp) return null; // this exact unlock already failed → wait for a newer one (limiter gate)
+        pulledStamp.set(id, u.stamp);
+        return u.password;
+      },
+      grant: async ({ vaultId, vaultPassword }) => {
+        const entry = syncConfigList().find((e) => e.vaultId === vaultId);
+        const r = await deviceGrant.grantAndRecord({ serverOrigin: origin, accountToken, deviceId, vaultId, vaultType: 'standard', vaultName: entry ? entry.vaultName : '', vaultPassword, dir, safeStorage }, { fetchFn: mainHttpJson });
+        if (r && r.ok) { deviceGrantFailedUnlock.delete(vaultId); return { ok: true }; }
+        // A wrong password: remember this unlock so the next pass does not re-prove with it (one limiter burn, not one per tick).
+        if (r && r.reason === 'wrong-password') { const st = pulledStamp.get(vaultId); if (st !== undefined) deviceGrantFailedUnlock.set(vaultId, st); }
+        return { ok: false, reason: (r && r.reason) || 'grant-failed' };
+      },
+      clearPending: (id) => { devicePending.clearPending(safeStorage, dir, id); },
+      ackComplete: (id) => { const entry = syncConfigList().find((e) => e.vaultId === id); ackDeviceSetupComplete(entry ? entry.vaultName : ''); },
+    });
+    if (out.granted.length) { invalidateMigrationView(); try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ } refreshTray(); } // a resumed grant wrote a record → the door drops that vault; reflect it, the next mint uses the device path
+  } finally { deviceGrantResumeBusy = false; }
+}
+
 async function setupSyncForVault() {
   if (!syncHub) return { enabled: false, reason: 'unavailable' };
   // Single-flight: never open a second enable/stop flow while one is in progress (the overlap check is
@@ -1049,6 +1939,10 @@ async function setupSyncForVault() {
       // list FIRST — otherwise the just-enabled id is uncovered and would read never-run, auto-resyncing a
       // re-enabled but still-latched vault instead of blocking it. The dispatch stays gated as usual.
       void tickSync();
+      // Then the device step, fail-soft on top of the saved config: try to move this vault onto this
+      // computer's own device identity. The config is already saved and syncing on the account session, so
+      // any device-step outcome short of a grant simply leaves it there — this never blocks or undoes setup.
+      await runDeviceStepForVault(r.entry);
     } else if (r && r.reason === 'no-standard-vaults') {
       try {
         await dialog.showMessageBox(mainWindow, {
@@ -1106,6 +2000,9 @@ async function stopSyncing(vaultId, vaultName) {
       return;
     }
     try { if (syncHub) syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* none */ }
+    // Drop any pending device-grant marker for the vault the person just stopped syncing, so the resume sweep
+    // never tries to finish a setup they abandoned (the sweep also drops an unconfigured vault; this is prompt).
+    try { devicePending.clearPending(safeStorage, dir, vaultId); } catch { /* best-effort; the sweep drops it anyway */ }
     refreshTray();
   } finally {
     syncFlowBusy = false;
@@ -1137,6 +2034,36 @@ async function maybeOfferSyncSetup() {
     n.on('click', () => { void setupSyncForVault(); });
     n.show();
   } catch { /* best-effort */ }
+}
+
+// The one-time existing-setup migration nudge — the maybeOfferSyncSetup shape, for a desktop already syncing on
+// the account path. Probes the server's device-sync support, caches it (so the standing tray door can be derived
+// without a per-refresh network call), and — only when the offer actually applies AND it has not been shown for
+// THIS server origin — fires ONE notification whose click opens the setup. Fail-quiet on every uncertain edge:
+// not signed in, or a transport error, shows nothing and marks nothing, so a person is never nudged (or told
+// their server is old) because they were merely offline; the flag is keyed by origin, so a server switch (or a
+// hatch reset, which clears it) offers again, but a decline never re-nudges on the same server.
+async function maybeOfferDeviceMigration() {
+  if (!syncHub || SMOKE) return;
+  const dir = app.getPath('userData');
+  const origin = serverConfig.readServerOrigin(dir);
+  const token = await resolveAccountToken(); // live token, not the boot snapshot
+  if (!origin || !token) return; // not signed in yet — fail-quiet, retry on a later unlock
+  let probe;
+  try { probe = await deviceRegister.checkDeviceSyncSupported({ serverOrigin: origin, accountToken: token }, mainHttpJson); }
+  catch { return; } // transport — cache nothing wrong, retry later
+  deviceMigrateSupport = { origin, reason: probe.reason }; // known now: the door derives from this
+  invalidateMigrationView(); // the support input just changed → recompute rather than serve the cached view
+  refreshTray(); // reflect the door/switch/too-old line the fresh support enables
+  const m = computeMigration(dir);
+  if (!m.notify) return; // door doesn't apply, or already offered for this origin, or support unknown/too-old
+  if (!Notification || !Notification.isSupported || !Notification.isSupported()) return; // can't notify; the door still stands
+  try {
+    const n = new Notification({ title: 'DockVault', body: 'This computer can now sync on its own, even while the screen is locked — set it up any time from the tray menu.' });
+    n.on('click', () => { void runDeviceMigration(); });
+    n.show();
+    writeState({ deviceMigrationOfferOrigin: origin }); // shown once for this origin: a decline won't re-nudge; a server switch will
+  } catch { /* best-effort; the standing door still carries the offer */ }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1171,7 +2098,16 @@ async function showOrCreateWindow() {
   mainWindow = win;
 
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));            // no popups
-  win.webContents.on('will-navigate', (e, url) => { if (!url.startsWith(APP_ORIGIN)) e.preventDefault(); });
+  win.webContents.on('will-navigate', (e, url) => {
+    if (!url.startsWith(APP_ORIGIN)) { e.preventDefault(); return; }
+    // The shell's own pages are reached only through the main process: content the server supplied
+    // may never navigate INTO them (so it cannot even show the setup screen), and a shell page never
+    // navigates AWAY on its own (so a frame that passed the sender check cannot be repurposed).
+    const shell = APP_ORIGIN + schemeMod.SHELL_PATH;
+    let current = '';
+    try { current = win.webContents.getURL() || ''; } catch { current = ''; }
+    if (url.startsWith(shell) || current.startsWith(shell)) e.preventDefault();
+  });
 
   if (!bootSelfTest || !bootSelfTest.ok) {
     status.failCode = (bootSelfTest && bootSelfTest.code) || 'UNKNOWN';
@@ -1183,6 +2119,18 @@ async function showOrCreateWindow() {
   // With no real OS secret store the app still loads and is fully interactive (memory-only): at-rest
   // persistence and background sync are withheld elsewhere, not the interface. The session store
   // already returned nothing to seed in that case, so a fresh sign-in is required each launch.
+  // No server known (nothing saved, or a saved setting that cannot be read), or the person chose to
+  // switch: the setup screen is what opens, never a web UI with nowhere to send its calls. The smoke
+  // check keeps the plain path so it asserts the UI load as before.
+  const srv = serverConfigState();
+  if (!SMOKE && (setupMode === 'change' || !srv.origin)) {
+    await win.loadURL(schemeMod.shellPageUrl(APP_ORIGIN, SETUP_PAGE));
+    win.show();
+    wireCloseToTray(win);
+    wireBoundsPersistence(win);
+    return win;
+  }
+
   await seedRestoredSession(win);
   await win.loadURL(`${APP_ORIGIN}/`);
 
@@ -1210,7 +2158,7 @@ async function showOrCreateWindow() {
 }
 
 async function loadFailInto(win, code) {
-  await win.loadFile(FAIL_HTML);
+  await win.loadURL(schemeMod.shellPageUrl(APP_ORIGIN, FAIL_PAGE));
   try {
     await win.webContents.executeJavaScript(
       `document.getElementById('code').textContent = ${JSON.stringify(String(code))};`, true);
@@ -1282,4 +2230,254 @@ async function finishSmokeIfNeeded() {
   app.quit();
 }
 
+// ---------------------------------------------------------------------------------------------
+// DOCKVAULT_TRAY_SELFTEST — the autonomous (a)/(b) tray check for the two SILENT merge modes this file hits
+// when the device-sync assembly is brought together with the rest of the app (modelled on DOCKVAULT_SMOKE above):
+//   (a) RENDER — a refreshTray that draws the menu WITHOUT the device assembly (the failure a two-argument
+//       buildTrayMenu call produces: migration is null, so the migration door, the pending "finish setting up"
+//       reminder and the escape-hatch reset offer silently never appear);
+//   (b) CLICK  — a drawn menu whose click handlers reference a function the merge deleted (runDeviceMigration,
+//       resetDeviceIdentity, runDeviceSetupAgain), so the menu draws and the click throws ReferenceError.
+// Neither mode lives in Electron's Tray/Menu layer; both live in this module's JavaScript, so an in-module
+// check proves them and an OS click adds nothing. State is forced through the EXISTING module seams (the config
+// store, the pending-grant store, the migration-support / unreadable-streak module vars) — NO real device
+// secret is written: an ABSENT identity keeps the migration door applicable while deviceIdentityStale makes the
+// pending reminder live, so the check can neither leak a secret nor forget a real identity. The (b) clicks run
+// with the module's own single-flight guard (syncFlowBusy) set, so each device flow returns at its first line —
+// no dialog, no network, no forget — while a DELETED function still throws at the click reference BEFORE that
+// guard runs, which is exactly the mode (b) must catch.
+
+// Invoke a captured click handler and record whether it settles without throwing. A function the merge dropped
+// throws ReferenceError SYNCHRONOUSLY at the call below — the (b) failure — and is recorded false.
+async function settlesNoThrow(name, clickFn, record) {
+  if (typeof clickFn !== 'function') { record(name, false, 'click handler missing from the drawn menu'); return; }
+  try {
+    const r = clickFn();                            // a dropped-function reference throws HERE, synchronously
+    if (r && typeof r.then === 'function') await r; // a returned thenable must also settle without rejecting
+    record(name, true);
+  } catch (e) { record(name, false, String((e && e.message) || e)); }
+}
+
+async function finishTraySelftestIfNeeded() {
+  if (!TRAY_SELFTEST) return;
+  // ISOLATION (fail-closed): refuse UNLESS an explicit --user-data-dir override is present, regardless of packaging.
+  // An unpackaged run with no override would land on the DEFAULT profile, where the seed replaces the server origin
+  // and the whole sync config — so require the override always (it is how every packaged *-check.js and this check
+  // are launched). NEVER a real profile, so it cannot touch a person's data.
+  if (!app.commandLine.hasSwitch('user-data-dir')) {
+    try { console.warn('[dockvault] DOCKVAULT_TRAY_SELFTEST ignored: no --user-data-dir override (refusing to touch a real profile)'); } catch { /* ignore */ }
+    return;
+  }
+  const rows = [];
+  const record = (row, ok, note) => { rows.push(note === undefined ? { row, ok } : { row, ok, note }); };
+  const dir = app.getPath('userData');
+  try {
+    if (!tray) {
+      record('tray-available', false, 'no system tray in this environment — cannot self-test the tray');
+    } else {
+      const VAULT = { vaultId: 'selftest-vault', vaultName: 'Self-Test Vault' };
+      // Seed the door's, the pending reminder's and the reset offer's inputs through EXISTING seams only.
+      // A throwaway server origin is REQUIRED: deviceIdentityLive() (which gates the pending reminder) fails
+      // closed to false when no server is configured, so without it the pending row never draws. The `.invalid`
+      // TLD never resolves (RFC 6761), and syncFlowBusy (set before the clicks) short-circuits every device
+      // flow at its first line anyway, so no request is ever attempted against it.
+      const ORIGIN = serverConfig.writeServerOrigin(dir, 'https://tray-selftest.invalid');
+      try { syncConfigStore.saveConfig(safeStorage, dir, [{ vaultId: VAULT.vaultId, vaultName: VAULT.vaultName, localFolder: path.join(dir, 'selftest-folder'), remotePath: 'selftest', enabled: true, consented: true }]); }
+      catch (e) { record('seed-config', false, String((e && e.message) || e)); }
+      try { devicePending.addPending(safeStorage, dir, VAULT.vaultId); } catch (e) { record('seed-pending', false, String((e && e.message) || e)); }
+      deviceMigrateSupport = { origin: ORIGIN, reason: 'ok' };    // device support 'ok' for THIS origin (matches computeMigration's readServerOrigin)
+      deviceIdentityStale = true;                                 // with an origin set, deviceIdentityLive() -> true on an ABSENT identity, so the pending reminder draws
+      deviceUnreadableStreak = DEVICE_UNREADABLE_RESET_THRESHOLD; // the escape-hatch reset offer crosses its threshold
+      invalidateMigrationView();                                  // MUST: boot cached an empty pre-seed migration view (2s TTL) — drop it so the door recomputes
+
+      // (a) RENDER — capture the menu refreshTray draws (and the tooltip it sets) WITHOUT changing either.
+      let menu = null, tip = null;
+      const protoSetMenu = tray.setContextMenu, protoSetTip = tray.setToolTip;
+      tray.setContextMenu = function (m) { menu = m; return protoSetMenu.call(tray, m); };
+      tray.setToolTip = function (s) { tip = s; return protoSetTip.call(tray, s); };
+      try { refreshTray(); } finally { delete tray.setContextMenu; delete tray.setToolTip; }
+      const items = (menu && Array.isArray(menu.items)) ? menu.items : [];
+      const labels = items.map((it) => (it && typeof it.label === 'string') ? it.label : '');
+      // The reset + pending EXPECTED strings come from their OWN presentation functions — immune to wording
+      // drift, and present in the drawn menu only if refreshTray actually ran the device assembly. The door is
+      // inline in buildTrayMenu, matched by its stable, unambiguous leading phrase (the switch-line and too-old
+      // note begin differently). A two-argument buildTrayMenu (migration null, empty items) draws NONE of these.
+      const RESET = trayPresentation.deviceResetItem().label;
+      const pendingItems = trayPresentation.pendingSetupItems([VAULT.vaultId], { nameById: { [VAULT.vaultId]: VAULT.vaultName }, wasGranted: () => false, alreadyShown: () => false });
+      const PENDING = (pendingItems[0] && pendingItems[0].label) || '<<no pending item produced>>';
+      const DOOR_PHRASE = 'Set up this computer to sync on its own';
+      record('render-migration-door', labels.some((l) => l.startsWith(DOOR_PHRASE)));
+      record('render-pending-setup', labels.includes(PENDING));
+      record('render-reset-offer', labels.includes(RESET));
+      // tooltip lock-reason path: a paused-locked model + a 'sleep' reason reads the sleep glance. The tooltip's
+      // 4th parameter is the lock reason on this branch and an options object on the merged tree, so try the branch
+      // shape first and fall back to the object — the assertion then holds on BOTH with no merge-side edit.
+      const lockedModel = { condition: 'paused', state: 'paused', reason: 'locked', vaults: [] };
+      const readsSleep = (arg) => { const t = trayPresentation.tooltip(lockedModel, 'locked', '0.0.0', arg); return typeof t === 'string' && t.includes('paused since sleep'); };
+      record('tooltip-lock-reason', readsSleep('sleep') || readsSleep({ lockReason: 'sleep' }));
+      // The tooltip SERVER-truth: with no server in force the glance says so, and it OUTRANKS the lock — tooltip
+      // reads the server before every lock and state branch, so even a paused-locked model reads "Not connected"
+      // rather than a lock phrase with nothing behind it. The `server` option exists only once the two sides are
+      // together, so this assertion cannot be written on either branch alone; it is what the merge owes the check.
+      record('tooltip-server-truth',
+        trayPresentation.tooltip(lockedModel, 'locked', '0.0.0', { server: { origin: null } }) === 'DockVault — Not connected');
+      record('refreshtray-set-tooltip', typeof tip === 'string' && tip.length > 0);
+
+      // (b) CLICK — the door + reset (and set-up-again) handlers resolve without a dropped-function throw.
+      try { dialog.showMessageBox = () => Promise.resolve({ response: 0 }); } catch { /* belt-and-suspenders; syncFlowBusy short-circuits before any dialog anyway */ }
+      syncFlowBusy = true; // the module's own single-flight guard: every device flow returns at its first line
+      const door = items.find((it) => it && typeof it.label === 'string' && it.label.startsWith(DOOR_PHRASE));
+      const reset = items.find((it) => it && it.label === RESET);
+      await settlesNoThrow('click-migration-door', door && door.click, record);
+      await settlesNoThrow('click-reset-offer', reset && reset.click, record);
+      await settlesNoThrow('click-set-up-again', () => handleMustAct({ kind: 'set-up-again' }), record);
+    }
+  } catch (e) {
+    record('selftest-harness', false, String((e && e.message) || e));
+  }
+  const ok = rows.every((r) => r.ok !== false); // a null row (a documented re-merge fold) does not fail the run
+  try {
+    const outDir = path.join(__dirname, '..', '..', '.local');
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, 'tray-selftest.json'), JSON.stringify({ ok, rows }, null, 2));
+  } catch { /* best effort */ }
+  // Tear the background workers down EXPLICITLY, then app.exit() with the REAL code. Two facts force this shape:
+  // app.exit() skips the before-quit handler (:162) that stops the daemon, so its rclone child would be orphaned;
+  // but app.quit() does NOT honour process.exitCode (it exits 0 regardless), which would make this check vacuously
+  // green on failure. So stop the daemon and auto-lock here as before-quit would, then app.exit(ok ? 0 : 1) so the
+  // exit code is the true pass/fail.
+  try { if (autoLock) autoLock.stop(); } catch { /* best-effort */ }
+  try { if (daemon) daemon.stop(); } catch { /* best-effort */ }
+  app.exit(ok ? 0 : 1);
+}
+
 module.exports = { __private: { readState, writeState } }; // exposed only for tests
+
+// ---------------------------------------------------------------------------------------------
+// Start at login. One honest fact, read from the platform every time (login-item.js); the person's
+// explicit choice lives in the data folder and only decides whether the app may register itself
+// unasked (an installed app's first launch), never what the checkbox shows.
+let loginItemInstance = null;
+function loginItem() {
+  if (!loginItemInstance) {
+    loginItemInstance = loginItemMod.createLoginItem({
+      app, platform: process.platform, fs, homeDir: app.getPath('home'), env: process.env, execPath: process.execPath,
+    });
+  }
+  return loginItemInstance;
+}
+function loginChoice() { return loginItemMod.createLoginChoiceStore({ fs, dir: app.getPath('userData') }); }
+
+function maybeRegisterLoginItem() {
+  try {
+    const store = loginChoice();
+    const d = loginItemMod.decideOnLaunch({ storedChoice: store.read(), isPackaged: app.isPackaged });
+    if (!d.register) return;
+    // The read-back, not the intent: a platform that refuses without throwing leaves it off, and the
+    // notice then points at the switch rather than claiming it will start. The choice is stored either
+    // way so this never runs unasked again.
+    const registered = loginItem().setEnabled(true) === true;
+    store.write(registered);
+    refreshTray();
+    if (d.notify) notifyInstalled(registered);
+  } catch { /* the checkbox keeps showing the real state; nothing else to do */ }
+}
+
+function toggleLoginItem() {
+  try {
+    const on = !loginItem().isEnabled();
+    loginItem().setEnabled(on);
+    loginChoice().write(on);
+  } catch { /* leave the real state to the menu */ }
+  refreshTray();
+}
+
+// The one notification of an installed app's first launch: the visible result of a silent one-click
+// install AND the disclosure of the login item, with where to turn it off. Best-effort, like every toast.
+function notifyInstalled(registered) {
+  try {
+    if (!Notification || !Notification.isSupported || !Notification.isSupported()) return;
+    const msg = trayPresentation.installedNotification(process.platform, registered);
+    const n = new Notification({ title: msg.title, body: msg.body });
+    n.on('click', () => { void showOrCreateWindow(); });
+    n.show();
+  } catch { /* notifications are best-effort */ }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The server setting: which server is in force, the setup screen, and switching servers. Main owns the
+// route, the normalisation, and the write; the screen only ever sees a kind and a host.
+let setupMode = null; // 'change' while the person is switching servers; null otherwise
+let changeHost = null; // the old server's host, kept in memory only to pre-fill the field during a switch
+
+function serverConfigState() {
+  try { return serverConfig.readServerConfigState(app.getPath('userData')); }
+  catch { return { status: 'unreadable', origin: null, envOrigin: null, fileOrigin: null, envOverrides: false }; }
+}
+
+// The screen's two intents, answered by server-setup.js (the probe, the unreadable-confirm rule, the
+// atomic write, the degraded hold); this file only supplies the window-side effects.
+let serverSetupInstance = null;
+function serverSetup() {
+  if (!serverSetupInstance) {
+    serverSetupInstance = serverSetupMod.createServerSetup({
+      dir: app.getPath('userData'), httpJson: mainHttpJson, mode: () => setupMode, changeHost: () => changeHost,
+      onSaved: () => { setupMode = null; changeHost = null; refreshTray(); void openSignInAfterSetup(); },
+    });
+  }
+  return serverSetupInstance;
+}
+function serverScreenState() { return serverSetup().state(); }
+function connectServer(args) { return serverSetup().connect(args); }
+
+// Swap the setup screen for the real UI through the one normal path (session seed, renderer probe, lock
+// state), so a first run and a later run look the same from here on.
+async function openSignInAfterSetup() {
+  const win = mainWindow;
+  if (win && !win.isDestroyed()) { try { win.destroy(); } catch { /* already gone */ } }
+  mainWindow = null;
+  try { await showOrCreateWindow(); } catch { /* the tray still offers Open DockVault */ }
+}
+
+// Switching servers is a relationship end: the session, the sync credential, the sync setup and this
+// computer's registration all belong to the old server, so they are forgotten BEFORE the new address is
+// asked for. Every step is best-effort — a person who chose to leave is never left stuck on the old server.
+async function changeServer() {
+  const s = serverConfigState();
+  const consent = trayPresentation.changeServerConsent(s.origin ? serverProbe.hostOf(s.origin) : '');
+  let res;
+  try {
+    res = await dialog.showMessageBox(mainWindow, {
+      type: 'question', title: consent.title, noLink: true, message: consent.message,
+      buttons: consent.buttons, defaultId: 0, cancelId: 0,
+    });
+  } catch { return; }
+  if (!res || res.response !== 1) return;
+  changeHost = s.origin ? serverProbe.hostOf(s.origin) : null;
+  await forgetServerRelationship(s.origin);
+  setupMode = 'change';
+  refreshTray();
+  const win = mainWindow;
+  if (win && !win.isDestroyed()) {
+    try { await win.loadURL(schemeMod.shellPageUrl(APP_ORIGIN, SETUP_PAGE)); win.show(); win.focus(); return; } catch { /* recreate below */ }
+  }
+  await showOrCreateWindow();
+}
+
+async function forgetServerRelationship(origin) {
+  const dir = app.getPath('userData');
+  let token = null;
+  try { token = (sessionBundle && sessionBundle.authToken) || ((tokenStore.loadSession(safeStorage, dir) || {}).authToken) || null; } catch { token = null; }
+  try { tokenStore.clearSession(dir); } catch { /* best effort */ }
+  sessionBundle = null;
+  try { if (credCache) credCache.clear(); } catch { /* best effort */ }
+  try { if (daemon) await daemon.clearSftpCred(); } catch { /* best effort */ }
+  try { syncConfigStore.saveConfig(safeStorage, dir, []); } catch { /* best effort */ }
+  try { if (syncHub) syncHub.setVaults([]); } catch { /* best effort */ }
+  try { await deviceForget({ origin, sessionToken: token }); } catch { /* best effort */ }
+  token = null;
+  try { if (uiSession) await uiSession.clearStorageData(); } catch { /* best effort */ }
+  // The saved address goes too, so a quit and relaunch mid-switch lands on the setup screen with the
+  // tray reading "Not connected", never back on the old server's sign-in.
+  try { serverConfig.removeServerOrigin(dir); } catch { /* best effort */ }
+}

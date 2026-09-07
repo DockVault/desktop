@@ -95,6 +95,9 @@ const OUTCOME_STATE = Object.freeze({
   // A persistent auth-failed for a password-protected vault (past its one retry): the likely cause is a rotated
   // vault password, so the remedy is to unlock the vault (re-enter its password), NOT to sign in again.
   'auth-failed-locked': { state: STATE.NEEDS_DECISION, reason: 'needs-unlock' },
+  // A device-path run refused at the SFTP door: this computer's standing is re-checked on the next pass and
+  // becomes its own honest state there (revoked, suspended, prove-once-more) — calm meanwhile.
+  'auth-failed-device': { state: STATE.PAUSED, reason: 'device-access-check' },
   'path-too-long': { state: STATE.NEEDS_DECISION, reason: 'path-too-long' },
   'host-key-unverified': { state: STATE.PAUSED, reason: 'cannot-verify-yet' },
   'host-key-mismatch': { state: STATE.SYNC_PROBLEM, reason: 'host-key-mismatch' },
@@ -128,7 +131,7 @@ const OUTCOME_STATE = Object.freeze({
  *   affects the state (a stale success time must not make a failing vault read green).
  * @returns {{vault:string, state:string, reason:(string|null), running:boolean, resyncRequired:boolean, lastSyncedAt:(number|null)}}
  */
-function vaultState(v) {
+function vaultStateCore(v) {
   const running = !!v.running;
   const transferring = !!v.transferring;
   const resyncRequired = !!v.resyncRequired;
@@ -170,6 +173,27 @@ function baseVaultState(v, transferring, running, resyncRequired) {
   return { vault: v.vault, state: STATE.WAITING, reason: 'waiting-first-sync', running, resyncRequired };
 }
 
+// The per-vault state, plus which credential path the run took ('device' | 'account') when known — a
+// presentation fact carried alongside the state, never an input to it.
+function vaultState(v) {
+  const r = vaultStateCore(v);
+  if (v && (v.via === 'device' || v.via === 'account')) r.via = v.via;
+  return r;
+}
+
+// The per-vault app-lock overlay, composed at model time by credential path (no stored condition). Under the
+// lock a vault on THIS computer's own device identity keeps its real state — it keeps syncing on its own
+// identity, which needs no account session or zero-knowledge key — but ONLY while the identity is still live
+// (deviceLive): a vault whose last run was on the device path but whose identity has since gone reads
+// paused-locked, not a stale "up to date", so the glance agrees with the dispatch gate by construction. An
+// account-path or not-yet-latched vault reads Paused (reason 'locked'). An unresolved item on the vault (a
+// decision or a problem, ranked above PAUSED) still shows: the lock never masks something that needs a person.
+function applyLockOverlay(v, deviceLive) {
+  if (v.via === 'device' && deviceLive === true) return v; // the device path keeps syncing under the lock, while the identity is live
+  if (RANK[v.state] > RANK[STATE.PAUSED]) return v;        // a decision / problem on the vault outranks the overlay
+  return { ...v, state: STATE.PAUSED, reason: 'locked' };
+}
+
 /**
  * Compute the one honest aggregate plus the per-vault breakdown.
  *
@@ -196,17 +220,24 @@ function computeStatus(s) {
     const vaults = Array.isArray(s.vaults) ? s.vaults.map(vaultState) : [];
     return { state: STATE.SYNC_PROBLEM, label: LABEL[STATE.SYNC_PROBLEM], reason: 'state-unreadable', vaults, condition: null };
   }
-  const vaults = Array.isArray(s.vaults) ? s.vaults.map(vaultState) : [];
-  if (vaults.length === 0) {
+  const rawVaults = Array.isArray(s.vaults) ? s.vaults.map(vaultState) : [];
+  if (rawVaults.length === 0) {
     return { state: STATE.NOT_CONFIGURED, label: LABEL[STATE.NOT_CONFIGURED], reason: null, vaults: [], condition: 'not-configured' };
   }
+  // Compose the app-lock per vault by path: a device vault (with a live identity) keeps its real state (it syncs
+  // under the lock), an account-path / not-yet-latched vault reads Paused ('locked'), and an unresolved item
+  // still outranks it. deviceLive gates the device-path bypass so the glance can never keep a stale green for an
+  // identity that has gone since that vault's last device run.
+  const vaults = s.locked ? rawVaults.map((v) => applyLockOverlay(v, s.deviceLive === true)) : rawVaults;
 
   // Global contributors, each carrying the reason that drives its wording.
   const contributors = [];
   // A helper that has given up (crash-loop ceiling) is a problem, and must never hide behind a calm
   // face. It outranks everything below and is surfaced until a deliberate restart.
   if (s.crashLoopLatched) contributors.push({ state: STATE.SYNC_PROBLEM, reason: 'sync-stopped' });
-  // The app being locked pauses sync — but only wins the glance if nothing unresolved outranks it.
+  // The app-lock leads the glance as the security state the person chose ('locked'), and the tray appends the
+  // sync truth from the per-vault breakdown (a device vault keeps syncing on its own identity). It only wins the
+  // aggregate if nothing unresolved outranks it — a decision or a problem on any vault still leads instead.
   if (s.locked) contributors.push({ state: STATE.PAUSED, reason: 'locked' });
   // Offline is a calm, transient paused-tier state, never an alarm.
   if (s.online === false) contributors.push({ state: STATE.PAUSED, reason: 'waiting-to-reconnect' });
@@ -232,6 +263,9 @@ function computeStatus(s) {
     installed: winner.installed || null,
     // The glance's transfer detail, present only when the winning contributor is a syncing vault.
     progress: (winner.state === STATE.SYNCING && winner.progress) ? winner.progress : null,
+    // Carried for the tray's locked glance so it can say "waiting to reconnect" under the lock when offline
+    // (nothing can sync then), rather than a stale "up to date". Presentation-only; never affects the state.
+    online: s.online !== false,
     vaults,
     condition: null,
   };

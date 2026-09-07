@@ -1,0 +1,155 @@
+name: Build installers
+
+# Produces the platform installers: a .dmg per architecture for macOS, an NSIS .exe for Windows,
+# and an AppImage plus .deb for Linux. Runs on demand (installers kept as workflow artifacts) and on
+# version tags, where the installers are also attached to the GitHub release for that tag.
+#
+# Signing is driven entirely by repository secrets. When they are absent the artifacts are
+# produced UNSIGNED and the job summary says so; nothing in this workflow or the repository holds a
+# certificate, password, or Apple credential.
+#
+#   Windows Authenticode : CSC_LINK (base64 .pfx), CSC_KEY_PASSWORD
+#   macOS signing        : CSC_LINK (base64 .p12), CSC_KEY_PASSWORD
+#   macOS notarization   : APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            script: dist:win
+          - name: macOS
+            os: macos-latest
+            script: dist:mac
+          - name: Linux
+            os: ubuntu-latest
+            script: dist:linux
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Decide whether this build can be signed
+        id: signing
+        shell: bash
+        env:
+          HAS_CERT: ${{ secrets.CSC_LINK != '' && secrets.CSC_KEY_PASSWORD != '' }}
+          HAS_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+        run: |
+          echo "cert=$HAS_CERT" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_CERT" != "true" ]; then
+            echo "### ${{ matrix.name }}: UNSIGNED build (no signing certificate configured)" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ runner.os }}" = "macOS" ] && [ "$HAS_NOTARY" != "true" ]; then
+            echo "### ${{ matrix.name }}: signed but NOT notarized (no Apple credentials configured)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### ${{ matrix.name }}: signed build" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build installers
+        shell: bash
+        env:
+          # With no certificate, stop electron-builder from looking for one in the keychain.
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ steps.signing.outputs.cert }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run ${{ matrix.script }}
+
+      # Each leg records whether its installers are signed, so the release job can refuse to publish
+      # unsigned ones. Linux has no code signing in this pipeline, so its record is "not-applicable".
+      - name: Record signing state
+        shell: bash
+        env:
+          CERT: ${{ steps.signing.outputs.cert }}
+          NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+        run: |
+          case "${{ runner.os }}" in
+            Windows) if [ "$CERT" = "true" ]; then state=signed; else state=unsigned; fi ;;
+            macOS)   if [ "$CERT" = "true" ] && [ "$NOTARY" = "true" ]; then state=signed; else state=unsigned; fi ;;
+            *)       state=not-applicable ;;
+          esac
+          echo "$state" > "dist/signing-${{ matrix.name }}.txt"
+          echo "signing state: $state"
+
+      - name: List artifacts
+        shell: bash
+        run: ls -l dist | grep -Ev "\.(yml|yaml|blockmap)$" || true
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dockvault-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.AppImage
+            dist/*.deb
+            dist/signing-*.txt
+
+  # On a version tag, attach every installer to the release for that tag (created as a draft if it
+  # does not exist yet, so the notes can be written before it is published). This is the only job
+  # that can write to the repository, and only on tags. It publishes only when every one of the three
+  # legs reports exactly "signed" or "not-applicable" (an allowlist, so an unexpected or empty record
+  # also refuses): an unsigned installer is for local testing, never for a release.
+  release:
+    name: Attach installers to the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: installers
+          merge-multiple: true
+
+      - name: Attach to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l installers
+          records=0
+          for f in installers/signing-*.txt; do
+            [ -e "$f" ] || continue
+            records=$((records + 1))
+            state=$(tr -d '[:space:]' < "$f")
+            echo "$f: $state"
+            case "$state" in
+              signed|not-applicable) ;;
+              *) echo "::error::$f reports '$state'; only signed builds are published. Configure the signing secrets and re-run."; exit 1 ;;
+            esac
+          done
+          if [ "$records" -ne 3 ]; then
+            echo "::error::expected signing records from all three legs, found $records; refusing to publish."
+            exit 1
+          fi
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --title "$TAG" --notes ""
+          gh release upload "$TAG" installers/*.exe installers/*.dmg installers/*.AppImage installers/*.deb --clobber

@@ -36,6 +36,7 @@ class SyncStatusHub {
       hasSecureStore: deps.hasSecureStore !== false,
       locked: !!deps.locked,
       online: deps.online !== false,
+      deviceLive: !!deps.deviceLive,
       daemon: 'starting',
       crashLoopLatched: false,
     };
@@ -78,6 +79,10 @@ class SyncStatusHub {
   // ---- signal setters (the app + the scheduler drive these) ----
   setLocked(locked) { this._sig.locked = !!locked; this._recompute(); }
   setOnline(online) { this._sig.online = online !== false; this._recompute(); }
+  // Whether this computer holds a LIVE device identity for the configured server — read by the per-vault lock
+  // overlay so a device vault keeps its real state under the lock ONLY while the identity is still live (a
+  // wiped/absent identity since the vault's last device run reads paused-locked, not a stale "up to date").
+  setDeviceLive(live) { this._sig.deviceLive = !!live; this._recompute(); }
   setSecureStore(has) { this._sig.hasSecureStore = has !== false; this._recompute(); }
 
   /** Declare which vaults are configured for sync (drops any no longer configured). */
@@ -91,9 +96,12 @@ class SyncStatusHub {
     this._recompute();
   }
 
-  setRunning(vault, running) {
+  setRunning(vault, running, via) {
     const e = this._vaults.get(vault); if (!e) return;
     e.running = !!running;
+    // Which credential path the run in flight took ('device' | 'account'), kept through its outcome so the
+    // glance can say which kind of sync last ran; a run that starts without one clears the stale value.
+    if (e.running) e.via = via === 'device' || via === 'account' ? via : null;
     // Transfer motion is per-run: starting or ending a run clears any prior counts, so a fresh run begins
     // with no "syncing" motion (it surfaces only once bytes move) and a finished one trails none.
     e.transferring = false;
@@ -164,6 +172,7 @@ class SyncStatusHub {
       hasSecureStore: this._sig.hasSecureStore,
       locked: this._sig.locked,
       online: this._sig.online,
+      deviceLive: this._sig.deviceLive,
       daemon: this._sig.daemon,
       crashLoopLatched: this._sig.crashLoopLatched,
       vaults: [...this._vaults.entries()].map(([vault, e]) => ({ vault, ...e })),

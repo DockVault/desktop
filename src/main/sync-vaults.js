@@ -54,7 +54,15 @@ async function fetchStandardVaults({ serverOrigin, sessionToken }, fetchFn) {
   if (!serverOrigin || !sessionToken) throw new Error('the vault list needs a server origin and an account session');
   const url = `${String(serverOrigin).replace(/\/+$/, '')}/vaults`;
   const res = await fetchFn(url, { method: 'GET', headers: { Authorization: `Bearer ${sessionToken}` } });
-  if (!res || !res.ok) throw new Error(`could not load the vault list (status ${res ? res.status : 'none'})`);
+  if (!res || !res.ok) {
+    // Carry the HTTP status on the error, not only in the message, so the eligibility check can classify it: a
+    // 5xx/429 reads as a RETRYABLE transport/server condition (a calm "vault list unavailable"), and a 401/403 as
+    // an expired session ('no-session' → sign in) — never as our-side 'internal-error'. Both the transport test
+    // and the 401/403 split key on e.status, and a status buried only in the message is invisible to them.
+    const err = new Error(`could not load the vault list (status ${res ? res.status : 'none'})`);
+    if (res && typeof res.status === 'number') err.status = res.status;
+    throw err;
+  }
   const body = await res.json();
   const arr = Array.isArray(body) ? body : ((body && (body.vaults || body.data || body.items)) || []);
   // Filter on the RAW records (server tier), then expose only id + name for the picker.

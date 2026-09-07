@@ -1,0 +1,30 @@
+{
+  "version": "1.75.0",
+  "baseUrl": "https://downloads.rclone.org",
+  "targets": {
+    "win32-x64": {
+      "archive": "rclone-v1.75.0-windows-amd64.zip",
+      "archiveSha256": "203581f0a7baeae873f2347483a798c79e2eaf5c384a4e9d866aa374f1c89ac0",
+      "binary": "rclone.exe",
+      "binarySha256": "8be30f02266a6eaad9d481941ef287b9744bb7140034b097ad862a2ccff3e24c"
+    },
+    "darwin-arm64": {
+      "archive": "rclone-v1.75.0-osx-arm64.zip",
+      "archiveSha256": "35e8f2a666ce789b29111db0dd843ddabc0d59c6b609d07bcaae5d1a07cba6f8",
+      "binary": "rclone",
+      "binarySha256": "f52ccc22e6fe61ea5791f0e186db323155ad1cc1b6dfe547f4bc665bea57a2dd"
+    },
+    "darwin-x64": {
+      "archive": "rclone-v1.75.0-osx-amd64.zip",
+      "archiveSha256": "19edbb8e5e73096eb66e92a42abbc5c34bfa8981ea3986a53872c7eef85a22f4",
+      "binary": "rclone",
+      "binarySha256": "da8f28fd63f96815505bbb6f2c8afc101f0dc5f6c12347d49bfad75d52547f41"
+    },
+    "linux-x64": {
+      "archive": "rclone-v1.75.0-linux-amd64.zip",
+      "archiveSha256": "aa2804e08f48250e71009c727124b6341cd0288465804a9a09d14663cabafbaa",
+      "binary": "rclone",
+      "binarySha256": "f3f9aff817f9766029e50adf9a7963c169e475b8f10c7927823568a0d9443db7"
+    }
+  }
+}

@@ -54,7 +54,23 @@ function bodyForConditionReason(reason, name) {
       // (a misconfigured helper): this one self-recovers, so it is a calm, retryable line, NEVER the "how to
       // fix it" setup pointer, and never "misconfigured".
       return `Can't reach the sync helper for ${name} right now — it'll keep trying.`;
+    // Device sync (this computer's identity and per-vault access) — one honest line each, no retry promise.
+    case 'grant-needs-reproof': return `${name}'s password changed — this computer needs it entered once more before it can keep syncing.`;
+    case 'device-revoked': return `This computer was removed from your synced computers. It can't sync until it's set up again.`;
+    case 'device-expired': return `This computer's sync access has expired. It can't sync until it's renewed.`;
+    case 'device-suspended': return `Syncing on this computer is paused by your server pending the owner's review.`;
+    case 'device-not-recognized': return `Your server no longer recognises this computer. It can't sync until it's set up again.`;
+    case 'account-inactive': return `Your DockVault account is locked — syncing resumes when it's active again.`;
+    case 'grant-withdrawn': return `This computer isn't set up to sync ${name} any more.`;
+    case 'vault-not-standard': return `${name} is end-to-end encrypted, so it stays on the web — only Standard vaults sync here.`;
+    case 'device-cred-cap': return `${name} can't sync yet: this computer has reached your server's sync-credential limit. Try again in a while.`;
+    case 'device-refused': return `${name} couldn't sync — your server refused this computer. Open DockVault.`;
+    case 'device-identity-unreadable': return `${name} will sync once this computer's sync identity can be read again.`;
+    case 'grant-details-pending': return `Sign in once to finish setting up ${name} on this computer.`;
+    case 'device-access-check': return `${name} couldn't sync just now — this computer's access is being re-checked.`;
     case 'error': return `${name} couldn't sync. Open DockVault to see why.`;
+    // A fault in our OWN sync step (not the connection, not sign-in) — own it, and never promise a retry.
+    case 'sync-error': return `Something in DockVault's own sync step failed for ${name} — this is on our side. Open DockVault.`;
     case 'retrying':
     default: return `${name} couldn't sync just now. Try again in a moment.`;
   }
@@ -99,4 +115,4 @@ function manualCompletionBody(ev, name) {
   }
 }
 
-module.exports = { manualCompletionBody };
+module.exports = { manualCompletionBody, bodyForConditionReason };

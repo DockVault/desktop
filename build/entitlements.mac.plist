@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <!--
+    Hardened-runtime entitlements for the DockVault app and its helper processes.
+
+    Only the JIT exception is granted: V8 needs it to run JavaScript. Nothing here allows unsigned
+    executable memory, dyld environment variables, or unvalidated libraries. The native state
+    database module is signed with the same identity as the app, so library validation stays on.
+    Any addition must be justified by the specific binary that needs it.
+  -->
+  <dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+  </dict>
+</plist>

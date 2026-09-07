@@ -36,6 +36,25 @@ function isAssetPath(p) { return p === '/' || p === '/index.html' || p.startsWit
 // origin's storage with a restored session before loading the real UI.
 const SEED_PATH = '/__dv_session_seed__';
 
+// Reserved same-origin prefix for the shell's OWN pages (the server setup screen, the self-test
+// failure page), served from src/renderer. They must come over the app scheme rather than file:,
+// because a packaged app keeps them inside its archive, which the file protocol cannot read, and
+// because the same origin gives them the same policy header and the same typed preload.
+const SHELL_PATH = '/__dv_shell__/';
+const SHELL_ROOT = path.resolve(__dirname, '..', 'renderer');
+function shellPageUrl(origin, name) { return origin + SHELL_PATH + name; }
+
+// The file for a shell page path, or null: one flat directory, no traversal, no dotfiles.
+function resolveShellFile(pathname, root = SHELL_ROOT) {
+  if (!pathname.startsWith(SHELL_PATH)) return null;
+  let name;
+  try { name = decodeURIComponent(pathname.slice(SHELL_PATH.length).split('?')[0]); } catch { return null; }
+  if (!/^[a-z0-9-]+\.(html|js)$/i.test(name)) return null;
+  const file = path.normalize(path.join(root, name));
+  if (!file.startsWith(path.resolve(root) + path.sep)) return null;
+  return file;
+}
+
 function registerPrivileged() {
   protocol.registerSchemesAsPrivileged([{
     scheme: APP_SCHEME,
@@ -96,6 +115,16 @@ function installHandler(staticRoot, cspHeader, resolveServerOrigin, ses) {
         { headers: { 'content-type': 'text/html; charset=utf-8', 'Content-Security-Policy': cspHeader } });
     }
     if (isAssetPath(pathname)) return serveAsset(pathname);
+    if (pathname.startsWith(SHELL_PATH)) {
+      const file = resolveShellFile(pathname);
+      if (!file || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+        return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+      }
+      const type = contentType(file);
+      const headers = { 'content-type': type };
+      if (type.startsWith('text/html')) headers['Content-Security-Policy'] = cspHeader;
+      return new Response(fs.readFileSync(file), { headers });
+    }
 
     const origin = resolveServerOrigin ? resolveServerOrigin() : null;
     if (origin) return proxy.proxyRequest(request, origin, net);
@@ -103,4 +132,4 @@ function installHandler(staticRoot, cspHeader, resolveServerOrigin, ses) {
   });
 }
 
-module.exports = { registerPrivileged, installHandler, contentType, isAssetPath, SEED_PATH };
+module.exports = { registerPrivileged, installHandler, contentType, isAssetPath, resolveShellFile, shellPageUrl, SEED_PATH, SHELL_PATH };

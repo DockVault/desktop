@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- Shell-owned screen: the one thing an installed app shows before a server is known. Its script
+       talks only to the typed preload surface (window.dockvault.server); it fetches nothing itself and
+       never learns whether a settings file exists beyond a status word. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'">
+  <title>DockVault — connect to your server</title>
+  <style>
+    :root { color-scheme: light dark; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #0a0f18; color: #e6edf6;
+      display: flex; align-items: center; justify-content: center; padding: 2rem; box-sizing: border-box;
+    }
+    .card { width: 100%; max-width: 30rem; }
+    h1 { font-size: 1.35rem; margin: 0 0 .5rem; }
+    p { margin: 0 0 1rem; color: #b9c4d4; }
+    label { display: block; font-weight: 600; margin-bottom: .35rem; }
+    input[type="text"] {
+      width: 100%; box-sizing: border-box; font: inherit; padding: .6rem .75rem;
+      border: 1px solid #2b3a52; border-radius: 8px; background: #101a2c; color: #e6edf6;
+    }
+    input[type="text"]:focus { outline: 2px solid #4c8dff; outline-offset: 1px; }
+    input[aria-invalid="true"] { border-color: #e0685c; }
+    .hint { font-size: .9rem; color: #8aa0bd; margin: .4rem 0 0; }
+    .line { min-height: 1.5rem; margin: .75rem 0 0; }
+    .line[data-tone="error"] { color: #ffb4a8; }
+    .line[data-tone="note"] { color: #b9c4d4; }
+    .line[data-tone="ok"] { color: #9be0b2; }
+    .row { display: flex; gap: .6rem; align-items: center; margin-top: 1.25rem; flex-wrap: wrap; }
+    .btn {
+      font: inherit; font-weight: 600; border: 1px solid #2b3a52; border-radius: 8px; padding: .55rem 1rem;
+      color: #e6edf6; background: #14203a; cursor: pointer;
+    }
+    .btn.primary { background: #2f6fed; border-color: #2f6fed; }
+    .btn:disabled { opacity: .55; cursor: default; }
+    .confirm { margin-top: 1rem; padding: .85rem 1rem; border: 1px solid #5a4a1e; border-radius: 8px; background: #1a1708; }
+    .confirm p { margin: 0 0 .6rem; color: #f0d9a3; }
+    .confirm label { font-weight: 500; display: flex; gap: .5rem; align-items: flex-start; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1 id="title">Connect to your DockVault server</h1>
+    <p id="intro">DockVault keeps your files on a server you or your organization runs. Enter its address to get started.</p>
+    <form id="form" novalidate>
+      <label for="server">Your DockVault server</label>
+      <input id="server" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false"
+             placeholder="vault.example.com" aria-describedby="hint line">
+      <p class="hint" id="hint">Ask whoever runs DockVault for you if you're not sure.</p>
+      <div class="line" id="line" aria-live="polite"></div>
+      <div class="confirm" id="confirm" hidden>
+        <p id="confirm-text">Your saved server setting couldn't be read.</p>
+        <label><input type="checkbox" id="replace"> Replace the saved setting with the server above</label>
+      </div>
+      <div class="row">
+        <button class="btn primary" id="connect" type="submit" disabled>Connect</button>
+      </div>
+    </form>
+  </main>
+  <script src="server-setup.js"></script>
+</body>
+</html>

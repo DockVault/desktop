@@ -32,6 +32,20 @@ test('emits the computed status on change and suppresses no-op re-emits', () => 
   assert.strictEqual(statuses[statuses.length - 1].state, STATE.UP_TO_DATE);
 });
 
+test('the locked glance honours the LIVE device identity: a device vault keeps its state only while deviceLive, else paused-locked', () => {
+  const { hub, daemon } = harness();
+  daemon.emit('ready', { encrypted: true });
+  hub.setVaults(['d']);
+  hub.setRunning('d', true, 'device');       // stamp the device credential path
+  hub.recordOutcome('d', { result: 'ok' });  // up to date; via stays 'device'
+  hub.setLocked(true);
+  hub.setDeviceLive(true);
+  assert.strictEqual(hub.current().vaults.find((v) => v.vault === 'd').state, STATE.UP_TO_DATE, 'a live device vault keeps its state under the lock');
+  hub.setDeviceLive(false);
+  const d = hub.current().vaults.find((v) => v.vault === 'd');
+  assert.deepStrictEqual([d.state, d.reason], [STATE.PAUSED, 'locked'], 'a device vault with no live identity reads paused-locked, not a stale green');
+});
+
 test('daemon lifecycle drives the state: crash -> paused(reconnecting), crash-loop -> sync problem, resume -> starting', () => {
   const { hub, daemon, statuses, notifies } = harness();
   hub.setVaults(['a']);

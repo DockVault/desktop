@@ -73,6 +73,18 @@ test('verifyEligible: a genuine transport failure is a retryable vault-list-unav
   assert.deepStrictEqual(await verify('v1'), { ok: false, reason: 'vault-list-unavailable' });
 });
 
+test('verifyEligible: a 401/403 on the vault list reads as no-session (sign-in), not a generic transport failure', async () => {
+  for (const status of [401, 403]) {
+    const verify = makeVerifyEligible({
+      fetchStandard: async () => { const e = new Error(`could not load the vault list (status ${status})`); e.status = status; throw e; },
+      remotePathForVault,
+    });
+    // The status alone would read as a transport failure; the 401/403 split must win so the person is shown
+    // "sign in", not "vault list unavailable" — and conditionForReason maps no-session to sign-in-needed.
+    assert.deepStrictEqual(await verify('v1'), { ok: false, reason: 'no-session' }, `status ${status}`);
+  }
+});
+
 test('verifyEligible: a CODE fault (no status, no network code) is a non-retryable internal-error, not a retryable list-unavailable', async () => {
   const verify = makeVerifyEligible({
     fetchStandard: async () => { throw new TypeError('x is not a function'); }, // a bug in our own path
@@ -324,6 +336,12 @@ test('conditionForReason: helper-unavailable is a calm PAUSED lane, distinct fro
   assert.notStrictEqual(conditionForReason('paused', 'helper-unavailable').state, STATE.SYNC_PROBLEM, 'a down helper is never a must-act sync problem');
 });
 
+test('conditionForReason: device-being-rechecked is a calm PAUSED wait, distinct from the terminal device-secret-stale set-up-again', () => {
+  assert.deepStrictEqual(conditionForReason('paused', 'device-being-rechecked'), { state: STATE.PAUSED, reason: 'device-being-rechecked' });
+  assert.deepStrictEqual(conditionForReason('refused', 'device-secret-stale'), { state: STATE.NEEDS_DECISION, reason: 'device-not-recognized' });
+  assert.notStrictEqual(conditionForReason('paused', 'device-being-rechecked').state, STATE.NEEDS_DECISION, 'a re-check in progress is never a must-act set-up-again');
+});
+
 test('StatusSink: a lock between failures does NOT count toward the streak', () => {
   const { hub } = hubWithNotify();
   const sink = new StatusSink(hub);
@@ -381,7 +399,7 @@ test('StatusSink: a noop neither increments nor resets the failure streak', () =
 
 test('makeSession: a fresh snapshot yields the three eligibility booleans; not-fresh yields state-uncertain', () => {
   const base = { isAccountUsable: () => true, hasAccount: () => true, isOnline: () => true };
-  assert.deepStrictEqual(makeSession({ ...base, snapshotFresh: () => true })(), { locked: false, accountLive: true, online: true });
+  assert.deepStrictEqual(makeSession({ ...base, snapshotFresh: () => true })(), { locked: false, accountLive: true, deviceLive: false, online: true });
   const stale = makeSession({ ...base, snapshotFresh: () => false })();
   assert.strictEqual(typeof stale.locked, 'undefined', 'no booleans when the run-state view is stale (scheduler reads state-uncertain)');
   assert.strictEqual(stale.uncertain, true);
@@ -389,7 +407,7 @@ test('makeSession: a fresh snapshot yields the three eligibility booleans; not-f
 
 test('makeSession reflects lock / account / online state', () => {
   const s = makeSession({ isAccountUsable: () => false, hasAccount: () => false, isOnline: () => false, snapshotFresh: () => true })();
-  assert.deepStrictEqual(s, { locked: true, accountLive: false, online: false });
+  assert.deepStrictEqual(s, { locked: true, accountLive: false, deviceLive: false, online: false });
 });
 
 test('makeSchedulerIo assembles the io: run-state from the snapshot, resync routing, refreshCred, verifyEligible', async () => {
@@ -408,7 +426,7 @@ test('makeSchedulerIo assembles the io: run-state from the snapshot, resync rout
   });
   assert.deepStrictEqual(io.runState('v1'), { lastResult: 'ok', resyncRequired: false });
   assert.strictEqual(io.runState('other'), null, 'unknown vault -> never-run');
-  assert.deepStrictEqual(io.session(), { locked: false, accountLive: true, online: true });
+  assert.deepStrictEqual(io.session(), { locked: false, accountLive: true, deviceLive: false, online: true });
   // The per-step credential provider (index.js) gates on io.hasAccount() before minting each fresh
   // credential; it must be EXPOSED on the io, not only threaded into session — otherwise io.hasAccount()
   // throws a TypeError on every per-step (first-run/resync) request while the dispatch path works.

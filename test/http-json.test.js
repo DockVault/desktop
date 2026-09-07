@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const http = require('node:http');
-const { httpJson } = require('../src/main/http-json');
+const httpJson = require('../src/main/http-json').createHttpJson({ fetch: globalThis.fetch });
 const { fetchStandardVaults } = require('../src/main/sync-vaults');
 const { mintTempCred } = require('../src/main/sftp-cred');
 
@@ -91,6 +91,30 @@ test('a POST body is actually written and length-declared, and the caller Conten
   );
 });
 
+test('a response over the size cap rejects with a CODED transport error (so the device client reads it as network, not our own internal-error)', async () => {
+  await withServer(
+    (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('x'.repeat(6 * 1024 * 1024)); },
+    async (origin) => {
+      await assert.rejects(
+        () => httpJson(`${origin}/big`, {}),
+        (e) => e && e.code === 'ERESPONSE_TOO_LARGE', // a code transportCode() lifts → network; absent from NEVER_SENT_CODES → keeps the rotation mark
+      );
+    },
+  );
+});
+
+test('a request timeout rejects with code ETIMEDOUT — a retryable, keep-the-rotation-mark transport code (never a codeless throw)', async () => {
+  await withServer(
+    () => { /* accept the request but never respond, forcing the client-side timeout */ },
+    async (origin) => {
+      await assert.rejects(
+        () => httpJson(`${origin}/hang`, { timeoutMs: 60 }),
+        (e) => e && e.code === 'ETIMEDOUT',
+      );
+    },
+  );
+});
+
 // The forward path: the cred mint POSTs a body. Driving the REAL mint through httpJson proves the body
 // is carried end to end (the failure the vault-list bug was, in POST form) before any wiring depends on it.
 test('the cred mint driven through httpJson sends its scoped body and returns the credentials', async () => {
@@ -108,4 +132,28 @@ test('the cred mint driven through httpJson sends its scoped body and returns th
       assert.deepStrictEqual(cred, { user: 'tc_x', password: 'obscured_form', expiresAt: '2026-01-01T00:00:00Z' });
     },
   );
+});
+
+test('redirects: refused by default, allowed only for a request that carries no credential, and never with a bearer', async () => {
+  let targetHits = 0;
+  const target = http.createServer((req, res) => { targetHits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ landed: true, auth: req.headers.authorization || null })); });
+  await new Promise((r) => target.listen(0, '127.0.0.1', r));
+  const targetOrigin = `http://127.0.0.1:${target.address().port}`;
+  const front = http.createServer((req, res) => { res.statusCode = 302; res.setHeader('Location', `${targetOrigin}/landed`); res.end(); });
+  await new Promise((r) => front.listen(0, '127.0.0.1', r));
+  const frontOrigin = `http://127.0.0.1:${front.address().port}`;
+  try {
+    // Default: a redirect fails the request, and the target never hears from us.
+    await assert.rejects(httpJson(`${frontOrigin}/vaults`, { headers: { Authorization: 'Bearer t0k' } }));
+    assert.strictEqual(targetHits, 0);
+    // A bearer may never opt in: refused before any request is made.
+    await assert.rejects(httpJson(`${frontOrigin}/vaults`, { headers: { authorization: 'Bearer t0k' }, redirect: 'follow' }), /may not follow redirects/);
+    assert.strictEqual(targetHits, 0);
+    // A credential-free request may follow, and reports where it landed.
+    const r = await httpJson(`${frontOrigin}/health`, { redirect: 'follow' });
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.url, `${targetOrigin}/landed`);
+    assert.deepStrictEqual(await r.json(), { landed: true, auth: null });
+    assert.strictEqual(targetHits, 1);
+  } finally { front.close(); target.close(); }
 });

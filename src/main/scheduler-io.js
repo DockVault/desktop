@@ -45,6 +45,10 @@ function makeVerifyEligible({ fetchStandard, remotePathForVault }) {
     try { res = await fetchStandard(); }
     catch (e) {
       if (e && e.reason) return { ok: false, reason: e.reason };
+      // A 401/403 on the vault list is an expired or invalid ACCOUNT SESSION, not connectivity — surface it as
+      // 'no-session' so the person is shown "sign in", never "check your connection" or "our own step failed".
+      // (Checked before the transport test, which would otherwise read the status as a generic retryable fault.)
+      if (e && (e.status === 401 || e.status === 403)) return { ok: false, reason: 'no-session' };
       // A genuine fetch/transport failure is a retryable 'vault-list-unavailable'. A code fault (no status, no
       // network code) is NOT connectivity — surface it as a non-retryable 'internal-error' and log its
       // class/code, rather than retrying a programming bug forever behind the retryable reason.
@@ -63,21 +67,52 @@ function makeVerifyEligible({ fetchStandard, remotePathForVault }) {
 
 /*
  * Build the scheduler's session() signal — the eligibility gate read before every dispatch. It reports the
- * three booleans the scheduler needs (account-usable, a live account session, online) EXCEPT when the
- * run-state snapshot is not fresh, when it reports state-uncertain (an object carrying no booleans) so the
- * scheduler SKIPS rather than deciding never-run-vs-blocked from a stale or failed run-state view. This is
- * where the run-state fail-closed is realized: the snapshot only carries `fresh`; the caller must gate here.
+ * booleans the scheduler needs (account-usable, a live account session, a usable device identity, online)
+ * EXCEPT when the run-state snapshot is not fresh, when it reports state-uncertain (an object carrying no
+ * booleans) so the scheduler SKIPS rather than deciding never-run-vs-blocked from a stale or failed run-state
+ * view. This is where the run-state fail-closed is realized: the snapshot only carries `fresh`; the caller
+ * must gate here.
  *
  * `locked` is the ACCOUNT-TIER pause: the negation of isAccountUsable() (app active + not lock-paused). It is
  * deliberately NOT the ZK unlocked state — Standard-vault sync authenticates with the account session and the
  * daemon-held DB key, never the zero-knowledge key, so this path must never read isUnlocked().
- * @param {{ isAccountUsable:()=>boolean, hasAccount:()=>boolean, isOnline:()=>boolean, snapshotFresh:()=>boolean }} io
+ *
+ * `deviceLive` says this computer holds a sync identity of its own (registered here, for this server). A vault
+ * synced on that identity needs no account session at all, so the scheduler dispatches when EITHER the account
+ * session or the device identity is live; which one a given vault actually uses is decided per run by the
+ * eligibility step, and a vault that needs the missing one is refused there with its own honest reason.
+ * @param {{ isAccountUsable:()=>boolean, hasAccount:()=>boolean, hasDeviceIdentity?:()=>boolean, isOnline:()=>boolean, snapshotFresh:()=>boolean }} io
  */
-function makeSession({ isAccountUsable, hasAccount, isOnline, snapshotFresh }) {
+function makeSession({ isAccountUsable, hasAccount, hasDeviceIdentity, isOnline, snapshotFresh }) {
   return () => {
     if (!snapshotFresh()) return { uncertain: true }; // no fresh run-state view → don't decide blind
-    return { locked: !isAccountUsable(), accountLive: !!hasAccount(), online: !!isOnline() };
+    let deviceLive = false;
+    try { deviceLive = typeof hasDeviceIdentity === 'function' && hasDeviceIdentity() === true; } catch { deviceLive = false; }
+    return { locked: !isAccountUsable(), accountLive: !!hasAccount(), deviceLive, online: !!isOnline() };
   };
+}
+
+/**
+ * The gate a per-step credential request (one rclone process of a multi-step run asking for a fresh single-use
+ * credential) must pass, decided from the run's credential path. Returns null when the mint may proceed, else the
+ * typed reason to refuse with. The device path needs no account session; the account path does; a request for
+ * a vault that is not in flight, or a run that never chose a path, is refused — main authorises, it never guesses.
+ *
+ * The ACCOUNT-TIER lock splits by path: a vault synced on THIS computer's own device identity keeps running
+ * under the OS lock — its device secret needs no account session and no zero-knowledge key — while the account
+ * path still pauses (its credential is dropped as lock hygiene). The split keys on the LATCHED credential path and
+ * fails closed: only an explicit device path bypasses the lock; an account path or an un-latched one pauses.
+ * @param {{inFlight:boolean, locked:boolean, via:('device'|'account'|null), accountLive:boolean}} o
+ */
+function perStepGate({ inFlight, locked, via, accountLive }) {
+  if (!inFlight) return 'not-in-flight';
+  // The device path is not gated by the account-tier lock — a device/Standard vault keeps syncing under the lock.
+  if (via === 'device') return null;
+  // Everything else the lock pauses: the account path, and — fail-closed — a run that has not latched a path, so
+  // any doubt about the path pauses under the lock rather than minting.
+  if (locked) return 'paused-locked';
+  if (via === 'account') return accountLive ? null : 'no-session';
+  return 'not-in-flight'; // no path chosen for this run: a mint would be unauthorised
 }
 
 /*
@@ -98,6 +133,7 @@ function makeSession({ isAccountUsable, hasAccount, isOnline, snapshotFresh }) {
  * @param {(o:object)=>Promise<boolean>} [deps.confirmFirstUpload]
  * @param {()=>boolean} deps.isAccountUsable
  * @param {()=>boolean} deps.hasAccount
+ * @param {()=>boolean} [deps.hasDeviceIdentity]  this computer holds a usable sync identity for the configured server
  * @param {(vaultId:string)=>boolean} [deps.vaultHasPassword]
  * @param {()=>boolean} deps.isOnline
  * @param {(vaultId:string, ev:object)=>void} deps.onEvent
@@ -107,7 +143,7 @@ function makeSchedulerIo(deps) {
   return {
     listConfigured: deps.listConfigured,
     runState: (vaultId) => deps.snapshot.get(vaultId),
-    session: makeSession({ isAccountUsable: deps.isAccountUsable, hasAccount: deps.hasAccount, isOnline: deps.isOnline, snapshotFresh: () => deps.snapshot.fresh() }),
+    session: makeSession({ isAccountUsable: deps.isAccountUsable, hasAccount: deps.hasAccount, hasDeviceIdentity: deps.hasDeviceIdentity, isOnline: deps.isOnline, snapshotFresh: () => deps.snapshot.fresh() }),
     // Exposed for the per-step credential provider's live-account gate: it calls io.hasAccount() before
     // minting a fresh credential for each rclone process of a first-run/resync. Threading it only into
     // makeSession left io.hasAccount undefined, so that gate threw (a swallowed TypeError) on every per-step
@@ -165,7 +201,8 @@ function applySchedulerEvent(hub, vaultId, ev) {
   // so it reads as a problem at once, never the generic retryable 'error' that retries-then-escalates.
   if (reason === 'provider-error' || reason === 'internal-error') { hub.recordOutcome(vaultId, { result: 'sync-error' }); return; }
   switch (phase) {
-    case 'running': hub.setRunning(vaultId, true); return;
+    // `via` names the credential path this run took ('device' | 'account'), so the glance can say which.
+    case 'running': hub.setRunning(vaultId, true, ev.via || null); return;
     case 'done': {
       const o = ev.outcome || {};
       hub.recordOutcome(vaultId, { result: o.result, resyncRequired: o.resyncRequired });
@@ -217,6 +254,35 @@ function conditionForReason(phase, reason) {
     // NOT in RETRYABLE_FAILURE_REASONS, so it surfaces once and stays put rather than looping.
     case 'needs-unlock':     return { state: STATE.NEEDS_DECISION, reason: 'needs-unlock' };
     case 'host-key-unavailable': return { state: STATE.PAUSED, reason: 'cannot-verify-yet' }; // older/unverifiable server — calm, not an alarm
+    // This computer's sync identity (device sync). Each server answer is its OWN honest state — none collapses
+    // into a sign-in line, a generic retry, or an alarm it does not deserve. None is retried by the streak logic
+    // below (a refused identity does not become "check your connection"); the calm ones simply wait.
+    case 'grant-needs-reproof': return { state: STATE.NEEDS_DECISION, reason: 'grant-needs-reproof' }; // re-prove the vault password once
+    case 'device-being-rechecked': return { state: STATE.PAUSED, reason: 'device-being-rechecked' };   // a rotation cut off mid-flight is being re-checked against the account — a calm wait, never a set-up-again
+    case 'device-revoked':
+    case 'device-removed':      return { state: STATE.NEEDS_DECISION, reason: 'device-revoked' };      // this computer was removed (the server said so, or its identity is already gone)
+    case 'device-expired':      return { state: STATE.NEEDS_DECISION, reason: 'device-expired' };      // its access ran out
+    case 'device-suspended':    return { state: STATE.NEEDS_DECISION, reason: 'device-suspended' };    // paused by the server pending the owner
+    case 'invalid-device-credential':
+    case 'device-secret-stale': return { state: STATE.NEEDS_DECISION, reason: 'device-not-recognized' }; // the identity held here is not current
+    case 'account-inactive':    return { state: STATE.NEEDS_DECISION, reason: 'account-inactive' };    // the ACCOUNT is locked — not a device fault
+    case 'no-grant':            return { state: STATE.NEEDS_DECISION, reason: 'grant-withdrawn' };     // this vault's access for this computer was withdrawn
+    case 'vault-not-standard':  return { state: STATE.NEEDS_DECISION, reason: 'vault-not-standard' };  // only Standard vaults sync — an explanation, not a fault
+    case 'device-cred-cap':     return { state: STATE.NEEDS_DECISION, reason: 'device-cred-cap' };     // the server's per-computer credential limit — named, never retried per tick
+    case 'device-request-refused': return { state: STATE.SYNC_PROBLEM, reason: 'device-refused' };    // an unrecognised refusal: fail closed, non-retrying
+    case 'device-secret-unreadable':
+    case 'device-state-unreadable':
+    case 'device-identity-missing':
+    case 'grants-unreadable':   return { state: STATE.PAUSED, reason: 'device-identity-unreadable' }; // transient: the OS store / the grant list could not be read just now
+    // A device-path run whose transfer was refused at the SFTP door: the identity is being re-checked on the
+    // next pass (a revoke, a suspension, or a rotated password shows up there as its own state) — never the
+    // account-session remedies, which do not apply to a device-minted credential.
+    case 'device-access-check': return { state: STATE.PAUSED, reason: 'device-access-check' };
+    // Local wiring faults in the device client (a missing secret at request time, a route not on the
+    // allowlist): a problem in our own path, surfaced as such, never retried as connectivity.
+    case 'no-device-secret':
+    case 'route-not-allowed':   return { state: STATE.SYNC_PROBLEM, reason: 'sync-error' };
+    case 'grant-details-pending': return { state: STATE.PAUSED, reason: 'grant-details-pending' };     // waiting for the vault's details from an account session
     // The sync helper did NOT answer — the daemon is down, timed out, or exited (a NO-ANSWER transport failure,
     // never a typed not-ready). Calm + RETRYABLE (below), NOT the non-retrying 'helper-not-ready' misconfigured
     // lane: a crashed-but-fine helper self-recovers, and the one must-act on a crash is the hub's own 'restart'.
@@ -246,7 +312,7 @@ function conditionForReason(phase, reason) {
 // 'error', these should read as a calm retry at first but must NOT read that way forever: repeated, they
 // mean the vault simply is not syncing. The reasons that already have their own honest state — sign-in,
 // cannot-verify-yet, a host-key mismatch, a bad folder or an unavailable vault — are deliberately NOT here.
-const RETRYABLE_FAILURE_REASONS = new Set(['mint-failed', 'cred-send-failed', 'cred-refresh-failed', 'vault-list-unavailable', 'helper-unavailable']);
+const RETRYABLE_FAILURE_REASONS = new Set(['mint-failed', 'cred-send-failed', 'cred-refresh-failed', 'vault-list-unavailable', 'helper-unavailable', 'network', 'server-error']);
 
 function isRetryableFailure(phase, reason) {
   if (phase === 'error') return reason !== 'host-key-mismatch'; // a dispatched run that failed (identity alert excluded)
@@ -296,4 +362,4 @@ class StatusSink {
   }
 }
 
-module.exports = { makeRunEffects, makeVerifyEligible, makeSession, makeSchedulerIo, applySchedulerEvent, conditionForReason, StatusSink };
+module.exports = { makeRunEffects, makeVerifyEligible, makeSession, makeSchedulerIo, perStepGate, applySchedulerEvent, conditionForReason, StatusSink };

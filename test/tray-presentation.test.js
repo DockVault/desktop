@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { tooltip, mustActItems, syncNowItem, lastSyncedLabel, vaultRows } = require('../src/main/tray-presentation');
+const { tooltip, mustActItems, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, vaultRows, HANDLED_ACTION_KINDS } = require('../src/main/tray-presentation');
 const { computeStatus, STATE } = require('../src/main/sync-status-model');
 
 const secure = { hasSecureStore: true, online: true, daemon: 'ready' };
@@ -18,6 +18,40 @@ test('a locked-and-clean vault reads "Locked", not a bare "Paused"', () => {
   const m = computeStatus({ ...secure, locked: true, vaults: [vault({ lastResult: 'ok' })] });
   assert.strictEqual(m.state, STATE.PAUSED);
   assert.strictEqual(tooltip(m, 'locked'), 'DockVault — Locked');
+});
+
+test('under the lock the glance leads with "Locked" and appends the sync truth', () => {
+  const lockedFor = (vaults) => tooltip(computeStatus({ ...secure, locked: true, deviceLive: true, vaults }), 'locked');
+  // Device vaults keep syncing under the lock — the glance says so (plural / singular).
+  assert.strictEqual(lockedFor([
+    vault({ vault: 'd1', via: 'device', transferring: true, lastResult: 'ok' }),
+    vault({ vault: 'd2', via: 'device', transferring: true, lastResult: 'ok' }),
+  ]), 'DockVault — Locked · syncing 2 vaults');
+  assert.strictEqual(lockedFor([
+    vault({ vault: 'd1', via: 'device', transferring: true, lastResult: 'ok' }),
+    vault({ vault: 'a', via: 'account', lastResult: 'ok' }),
+  ]), 'DockVault — Locked · syncing 1 vault');
+  // Device vaults all up to date under the lock.
+  assert.strictEqual(lockedFor([
+    vault({ vault: 'd1', via: 'device', lastResult: 'ok' }),
+    vault({ vault: 'd2', via: 'device', lastResult: 'ok' }),
+  ]), 'DockVault — Locked · up to date');
+  // A device vault up to date beside an account vault the lock paused.
+  assert.strictEqual(lockedFor([
+    vault({ vault: 'd1', via: 'device', lastResult: 'ok' }),
+    vault({ vault: 'a', via: 'account', lastResult: 'ok' }),
+  ]), 'DockVault — Locked · 1 vault paused while locked');
+  // Every configured vault paused by the lock -> plain "Locked" (answers the all-account edge).
+  assert.strictEqual(lockedFor([
+    vault({ vault: 'a1', via: 'account', lastResult: 'ok' }),
+    vault({ vault: 'a2', via: 'account', lastResult: 'ok' }),
+  ]), 'DockVault — Locked');
+  // A needs-repair account vault under the lock outranks the overlay — the decision leads, not "Locked".
+  const decision = computeStatus({ ...secure, locked: true, deviceLive: true, vaults: [vault({ vault: 'a', via: 'account', lastResult: 'conflict-keep-both' })] });
+  assert.notStrictEqual(decision.state, STATE.PAUSED);
+  assert.doesNotMatch(tooltip(decision, 'locked'), /Locked/);
+  // L2: offline under the lock reads "waiting to reconnect" (nothing can sync), never a stale "up to date".
+  assert.strictEqual(tooltip(computeStatus({ ...secure, online: false, locked: true, deviceLive: true, vaults: [vault({ vault: 'd1', via: 'device', lastResult: 'ok' })] }), 'locked'), 'DockVault — Locked · waiting to reconnect');
 });
 
 test('a configured-but-never-run vault reads the set-up-not-running label, never "Syncing"', () => {
@@ -97,6 +131,49 @@ test('a sync-error vault owns the fault in its must-act item (our side, not the 
   assert.ok(it);
   assert.match(it.label, /on our side/);
   assert.match(it.label, /not your connection or sign-in/);
+});
+
+test('must-act labels read the vault NAME via nameById, keep the id for the handler, and fall back to the id when unmapped', () => {
+  const m = computeStatus({ ...secure, vaults: [vault({ vault: 'vault-9f3a2b', lastResult: 'conflict-keep-both' })] });
+  const named = mustActItems(m, { 'vault-9f3a2b': 'Payroll' }).find((it) => it.vault === 'vault-9f3a2b');
+  assert.ok(named, 'the per-vault item is present');
+  assert.match(named.label, /Payroll/, 'the label shows the name');
+  assert.ok(!named.label.includes('vault-9f3a2b'), 'the label does not leak the id when a name is known');
+  assert.strictEqual(named.vault, 'vault-9f3a2b', 'the item still carries the id the handler acts on');
+  // unmapped (or no map at all): fall back to the id, never blank or "undefined"
+  const bare = mustActItems(m).find((it) => it.vault === 'vault-9f3a2b');
+  assert.match(bare.label, /vault-9f3a2b/, 'an unmapped id falls back to the id');
+  assert.ok(!/undefined/.test(bare.label), 'never renders "undefined"');
+});
+
+test('pendingSetupItems: finish-setup vs keep-syncing wording, id fallback, and suppression when already surfaced', () => {
+  const nameById = { v1: 'Payroll', v2: 'Notes' };
+  const items = pendingSetupItems(['v1', 'v2'], { nameById, wasGranted: (id) => id === 'v2' });
+  const byVault = Object.fromEntries(items.map((it) => [it.vault, it]));
+  assert.strictEqual(byVault.v1.kind, 'open');
+  assert.match(byVault.v1.label, /Open Payroll once to finish setting it up/i, 'a never-granted vault reads as finishing setup');
+  assert.match(byVault.v2.label, /Open Notes with its new password to keep syncing it/i, 'a previously-granted vault reads as a re-proof with the new password');
+  // a vault already surfaced with its own must-act line is not repeated as a calm nudge
+  assert.deepStrictEqual(pendingSetupItems(['v1'], { nameById, alreadyShown: (id) => id === 'v1' }), []);
+  // an unmapped id falls back to the id, never blank
+  assert.match(pendingSetupItems(['v3'], {})[0].label, /v3/);
+  assert.deepStrictEqual(pendingSetupItems([], {}), [], 'nothing pending → no items');
+});
+
+test('the device-ended states offer ONE identity-wide set-up-again action (deduped across vaults), a handled kind', () => {
+  const ended = (v) => vault({ vault: v, condition: { state: STATE.NEEDS_DECISION, reason: 'device-revoked' } });
+  const m = computeStatus({ ...secure, vaults: [ended('a'), ended('b')] });
+  const setups = mustActItems(m).filter((it) => it.kind === 'set-up-again');
+  assert.strictEqual(setups.length, 1, 'two revoked vaults collapse to one identity-wide set-up-again line (one re-registration fixes all)');
+  assert.match(setups[0].label, /set it up again/i);
+  assert.ok(HANDLED_ACTION_KINDS.includes('set-up-again'), 'set-up-again is a handled action kind');
+});
+
+test('deviceResetItem (the escape hatch) is a reachable, non-blank reset-device action', () => {
+  const it = deviceResetItem();
+  assert.strictEqual(it.kind, 'reset-device');
+  assert.ok(it.label && it.label.length > 8 && !/undefined/.test(it.label), 'a real, non-blank label');
+  assert.ok(HANDLED_ACTION_KINDS.includes('reset-device'), 'reset-device is in HANDLED_ACTION_KINDS so the tray can wire it');
 });
 
 test('the calm states carry a short why-suffix; up to date is bare', () => {
@@ -237,4 +314,12 @@ test('"Last synced" reads from the last-success time only, never fabricating one
   assert.strictEqual(lastSyncedLabel(now - 3 * 60 * 60 * 1000, now), 'Last synced 3 h ago');
   assert.strictEqual(lastSyncedLabel(now - 2 * 24 * 60 * 60 * 1000, now), 'Last synced 2 d ago');
   assert.strictEqual(lastSyncedLabel(now + 5000, now), 'Last synced just now', 'a clock step to the future never reads as a negative age');
+});
+
+test('a sleep-woken desktop reads "paused since sleep — Resume sync", not a bare Locked; other lock reasons keep Locked', () => {
+  const m = computeStatus({ ...secure, locked: true, deviceLive: true, vaults: [vault({ vault: 'a', via: 'account', lastResult: 'ok' })] });
+  assert.strictEqual(m.state, STATE.PAUSED, 'an account vault under lock is paused');
+  assert.strictEqual(tooltip(m, null, null, { lockReason: 'sleep' }), 'DockVault — Sync paused since sleep — Resume sync to continue');
+  assert.match(tooltip(m, null, null, { lockReason: 'os-lock' }), /^DockVault — Locked/, 'a real screen lock still reads Locked');
+  assert.match(tooltip(m, null, null, {}), /^DockVault — Locked/, 'no reason → the existing Locked glance');
 });

@@ -49,4 +49,96 @@ function consentMessage(vaultName, folder, opts = {}) {
   return m;
 }
 
-module.exports = { refuseMessage, cloudServiceName, cloudWarnMessage, consentMessage, REFUSE_COPY };
+// The one-time disclosure shown while setting this computer up for sync: the device path keeps running under
+// the screen lock (decision-h, now true). Shown at the register step, not as a gate.
+const LOCK_DISCLOSURE = 'This computer keeps syncing even when the screen is locked.';
+
+// The reassurance every fail-soft device-step outcome shares: the vault's sync config is already saved, so it
+// keeps syncing on the account session regardless of what the device step did — no result is ever a dead end.
+const SYNCS_ON = 'keeps syncing using your account sign-in';
+const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+
+/**
+ * Human copy for the result of the device step (runDeviceSetup). Returns { tone, message }:
+ *   tone 'ok'      the vault is on its own device identity now (success);
+ *   tone 'info'    a fail-soft outcome with nothing for the person to do — the vault syncs on the account session;
+ *   tone 'todo'    the vault syncs on the account session AND there is a clear next step to move it onto this computer;
+ *   tone 'sign-in' the person needs to sign in before anything can sync (the calm held wait, never an alarm).
+ * Never blames the person, and never names a surface this version lacks (no "remove a computer" page, no link).
+ * ctx.vaultName and ctx.otherServer fill in when the caller knows them; the copy reads cleanly without either.
+ *
+ * @param {{via:string, outcome:string, reason?:string, switched?:boolean}} result
+ * @param {{vaultName?:string, otherServer?:string}} [ctx]
+ * @returns {{tone:'ok'|'info'|'todo'|'sign-in', message:string}}
+ */
+function deviceOutcomeCopy(result, ctx = {}) {
+  const r = result || {};
+  const vault = (ctx && ctx.vaultName) || 'this vault';
+  const trailing = `It ${SYNCS_ON}.`; // a self-contained sentence; "it" = the vault, so no name is required
+
+  switch (r.outcome) {
+    case 'granted':
+      return { tone: 'ok', message: `${cap(vault)} is now set up to sync on this computer. Your vault password wasn't saved.` };
+
+    case 'granted-not-recorded':
+      // The server grant SUCCEEDED (the vault is set up on this computer), but the local record write did not —
+      // the OS secret store is full, locked, or refusing. Not a failure and not a dead end: it ${SYNCS_ON}
+      // meanwhile and the details save on their own once the cause clears. Honest about the one thing the person
+      // could act on (free up space / unlock the keychain), never blaming.
+      return { tone: 'todo', message: `${cap(vault)} is set up to sync on this computer, but this computer couldn't save the setup details just now — its storage may be full or locked. It ${SYNCS_ON} meanwhile, and finishes saving on its own once that clears.` };
+
+    case 'sign-in':
+      return { tone: 'sign-in', message: `Sign in again to finish setting up sync — ${vault} will start syncing once you do.` };
+
+    case 'grant-deferred':
+      // The mechanism is opening the vault (its password is proven once from the unlock state), NOT typing a
+      // password into a box — the resume sweep completes the grant on the next pass once the vault is open.
+      return { tone: 'todo', message: `Almost there — open ${vault} once to finish setting it up on this computer. Until then, it ${SYNCS_ON}.` };
+
+    case 'grant-failed':
+      if (r.reason === 'wrong-password')
+        return { tone: 'todo', message: `That password didn't match, so ${vault} isn't set up on this computer yet. ${trailing} Try again when you're ready.` };
+      return { tone: 'info', message: `Couldn't finish setting up ${vault} on this computer. ${trailing} You can try again.` };
+
+    case 'register-cancelled':
+      return { tone: 'info', message: `No problem — this computer wasn't set up for sync. ${trailing}` };
+
+    case 'switch-declined':
+      return { tone: 'info', message: `Left as it is — this computer stays set up with its current server. ${trailing}` };
+
+    case 'register-failed': {
+      // `switched` means the forget already removed this computer from the other server (the ordering guarantee
+      // in runDeviceSetup): say so, so the person isn't left thinking nothing changed.
+      const other = (ctx && ctx.otherServer) || 'its previous server';
+      const lead = r.switched ? `This computer is no longer set up with ${other}. ` : '';
+      const why = r.reason === 'device-cap-reached'
+        ? "You've reached this server's limit of synced computers, so it couldn't be added here."
+        : "Setting up this computer for sync didn't finish.";
+      return { tone: 'info', message: `${lead}${why} ${trailing} You can try again.` };
+    }
+
+    case 'account-only':
+      switch (r.reason) {
+        case 'server-too-old':
+          return { tone: 'info', message: `This server doesn't support syncing individual computers yet. ${trailing}` };
+        case 'no-secure-store':
+          return { tone: 'info', message: `This computer can't store a sync key securely, so it can't sync on its own. ${trailing}` };
+        case 'identity-stale':
+          return { tone: 'info', message: `This computer's sync identity is being re-checked right now. ${trailing}` };
+        case 'identity-unreadable':
+          return { tone: 'info', message: `This computer's sync identity can't be read right now — this often clears on its own. ${trailing}` };
+        case 'indeterminate':
+        default:
+          return { tone: 'info', message: `Couldn't check whether this computer can sync on its own right now. ${trailing} You can try again later.` };
+      }
+
+    default:
+      // Defensive: an unmapped outcome fails closed to the benign, honest fallback — never a blank or a scary line.
+      return { tone: 'info', message: `Sync is set up. ${trailing}` };
+  }
+}
+
+module.exports = {
+  refuseMessage, cloudServiceName, cloudWarnMessage, consentMessage, REFUSE_COPY,
+  deviceOutcomeCopy, LOCK_DISCLOSURE,
+};

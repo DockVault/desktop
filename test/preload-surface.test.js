@@ -60,3 +60,13 @@ test('IPC is invoke/on only — no send/sendSync, event channels are allowlisted
     assert.match(call, /ipcRenderer\.invoke\(\s*['"]dockvault:/, `non-literal invoke channel: ${call}`);
   }
 });
+
+test('the server surface is one narrow intent: a state read and a typed-address hand-off, never a URL to fetch', () => {
+  assert.match(CODE, /ipcRenderer\.invoke\(\s*['"]dockvault:server\.state['"]\s*\)/, 'a state query is exposed');
+  assert.match(CODE, /ipcRenderer\.invoke\(\s*['"]dockvault:server\.connect['"]/, 'a connect hand-off is exposed');
+  // The renderer hands over what the person typed and a boolean; main decides the route (/health), the
+  // normalisation, and the write. No way to name a URL, a method, headers, or a file.
+  const connectCall = CODE.match(/dockvault:server\.connect['"][^)]*\)/)[0];
+  assert.ok(!/url|method|headers|path|file/i.test(connectCall), `connect passes only the typed input and a flag: ${connectCall}`);
+  assert.ok(!/dockvault:server\.(write|read|save|delete|open)/.test(CODE), 'no renderer file-level verb on the server setting');
+});

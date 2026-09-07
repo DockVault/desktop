@@ -49,6 +49,19 @@ const api = Object.freeze({
     // carries no key material — only { state, reason }. Returns an unsubscribe fn.
     onState: (cb) => subscribe('lockstate', cb),
   }),
+  server: Object.freeze({
+    // The setup screen's view of the server setting: { mode, status, host } — mode 'first-run' | 'change',
+    // status 'absent' | 'unreadable' | 'ok' | 'env', and the host of the origin in force (for pre-filling).
+    // Never the file's contents, never whether the file exists beyond that status.
+    state: () => ipcRenderer.invoke('dockvault:server.state'),
+    // Hand the typed address to the main process, which normalises it, checks it against the fixed
+    // health route (no other URL is ever fetched), and saves it only when it answers as DockVault. The
+    // renderer never touches the file. Returns the typed outcome { kind, origin?, host? }; kind
+    // 'needs-confirm' means a saved setting exists that could not be read and the person must confirm
+    // replacing it (replaceUnreadable: true) before anything is written. On ok/degraded, main then loads
+    // the sign-in page from the new server; the page just shows "Connected".
+    connect: (input, options) => ipcRenderer.invoke('dockvault:server.connect', { input: String(input == null ? '' : input), replaceUnreadable: !!(options && options.replaceUnreadable) }),
+  }),
   sync: Object.freeze({
     // Read the current computed sync status on demand. Cred-free: { state, label, reason, vaults[],
     // condition } — never a credential, host key, or token. Observe-only, no control surface.

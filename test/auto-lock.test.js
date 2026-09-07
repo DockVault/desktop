@@ -130,14 +130,42 @@ test('reverse edge: idle fires the lock for an account-only user (no ZK key), an
 });
 
 test('reverse edge: a manual lock is NOT auto-resumed by an OS resume signal (waits for the explicit Resume item)', () => {
+  const kicks = [];
   const lock = fakeLock();
   lock.unlocked = false; lock.appLocked = false;
-  const { al, power } = harness({ lock });
+  const { al, power } = harness({ lock, overrides: { onResume: () => kicks.push(1) } });
   al.start();
   lock.lock('manual');                                // a deliberate manual pause
   assert.strictEqual(lock.isAccountUsable(), false);
-  power.emit('resume');                               // an OS resume must NOT auto-resume a manual lock
+  power.emit('resume');                               // an OS resume must NOT auto-resume a manual lock — it only kicks a sync
   assert.strictEqual(lock.isAccountUsable(), false, 'a manual lock stays paused until the explicit Resume item');
+  assert.strictEqual(kicks.length, 1, 'the OS resume kicked a sync (device-path catch-up), never resumed the account tier');
+});
+
+test('reverse edge: a bare OS resume kicks a sync but leaves an unattended lock paused — the ZK key and the account tier resume only on real presence', () => {
+  const kicks = [];
+  const lock = fakeLock();
+  const { al, power } = harness({ lock, overrides: { onResume: () => kicks.push(1) } });
+  al.start();
+  power.emit('suspend');                              // an unattended lock (sleep): account paused, ZK key dropped
+  assert.strictEqual(lock.isAccountUsable(), false);
+  assert.strictEqual(lock.isUnlocked(), false);
+  power.emit('resume');                               // waking is not proof of presence
+  assert.strictEqual(kicks.length, 1, 'the resume kicked a sync so a device-path vault catches up');
+  assert.strictEqual(lock.isAccountUsable(), false, 'the account tier stays paused across a bare resume (waits for real presence)');
+  assert.strictEqual(lock.isUnlocked(), false, 'the ZK key stays purged across a resume');
+  assert.strictEqual(lock.resumes || 0, 0, 'a bare resume never calls resumeAccount');
+});
+
+test('reverse edge: an OS session unlock (real presence) auto-resumes an unattended lock', () => {
+  const lock = fakeLock();
+  const { al, power } = harness({ lock });
+  al.start();
+  power.emit('suspend');                              // unattended lock
+  assert.strictEqual(lock.isAccountUsable(), false);
+  power.emit('unlock-screen');                        // the user unlocked the OS session — real presence
+  assert.strictEqual(lock.isAccountUsable(), true, 'an OS unlock resumes account-tier sync');
+  assert.ok((lock.resumes || 0) >= 1, 'resumeAccount ran on the OS-unlock edge');
 });
 
 test('an unavailable OS idle clock surfaces a one-time degraded posture (not silent)', () => {
@@ -166,4 +194,31 @@ test('only unattended reasons escalate (a present-user manual lock never destroy
   // Guard the policy directly: manual is not in the unattended set that arms escalation.
   assert.ok(UNATTENDED.has('idle') && UNATTENDED.has('sleep') && UNATTENDED.has('os-lock'));
   assert.ok(!UNATTENDED.has('manual'), 'a present user manual lock stays soft');
+});
+
+test('input alone never un-pauses a SCREEN LOCK or a SLEEP: only the OS unlock does, while an idle lock still reverses on input', () => {
+  // A person presses the lock-screen shortcut, then types at the lock screen: the OS idle clock resets, but the
+  // session is still locked, so account-tier sync must stay paused (and its credential un-minted) until the unlock.
+  for (const reason of ['os-lock', 'sleep']) {
+    const { al, power, lock, captured } = harness();
+    al.start();
+    power.emit(reason === 'os-lock' ? 'lock-screen' : 'suspend');
+    assert.strictEqual(lock.isAccountUsable(), false, `${reason} pauses account-tier sync`);
+    power.idle = 0;                       // input at the lock screen / a wake-on-timer keystroke
+    captured.poll();
+    assert.strictEqual(lock.isAccountUsable(), false, `${reason} is NOT reversed by input alone`);
+    captured.poll();
+    assert.strictEqual(lock.isAccountUsable(), false, 'still paused after repeated input');
+    power.emit('unlock-screen');          // the authoritative return signal
+    assert.strictEqual(lock.isAccountUsable(), true, `${reason} is reversed by the OS unlock`);
+  }
+  // An idle lock is the one the idle clock armed, so returning input is exactly the right signal to reverse it.
+  const { al, power, lock, captured } = harness();
+  al.start();
+  power.idle = 999;
+  captured.poll();
+  assert.strictEqual(lock.isAccountUsable(), false, 'the idle lock paused account-tier sync');
+  power.idle = 0;
+  captured.poll();
+  assert.strictEqual(lock.isAccountUsable(), true, 'returning input reverses the idle lock');
 });

@@ -60,6 +60,37 @@ test('precedence order: problem > decision > paused > syncing > up-to-date', () 
   assert.strictEqual(computeStatus({ ...base, locked: true, vaults: [vault({ lastResult: 'conflict-keep-both' }), vault({ vault: 'w', lastResult: 'host-key-mismatch' })] }).state, STATE.SYNC_PROBLEM);
 });
 
+test('the app-lock is composed per vault by credential path (device keeps its real state, account/un-latched reads paused-locked, an unresolved item still outranks)', () => {
+  // A device vault keeps syncing under the lock; an account vault beside it is paused by the lock — never a stale green.
+  const mixed = computeStatus({ ...secure, locked: true, deviceLive: true, vaults: [
+    vault({ vault: 'd', via: 'device', transferring: true, lastResult: 'ok' }),
+    vault({ vault: 'a', via: 'account', lastResult: 'ok' }),
+  ] });
+  const d = mixed.vaults.find((v) => v.vault === 'd');
+  const a = mixed.vaults.find((v) => v.vault === 'a');
+  assert.strictEqual(d.state, STATE.SYNCING, 'the device vault keeps syncing under the lock');
+  assert.deepStrictEqual([a.state, a.reason], [STATE.PAUSED, 'locked'], 'the account vault reads paused-locked, not a stale up-to-date');
+  assert.deepStrictEqual([mixed.state, mixed.reason], [STATE.PAUSED, 'locked'], 'the aggregate leads with the lock');
+
+  // An un-latched vault (no via yet) is paused by the lock too — fail-closed.
+  const unlatched = computeStatus({ ...secure, locked: true, vaults: [vault({ vault: 'u', lastResult: 'ok' })] });
+  assert.deepStrictEqual([unlatched.vaults[0].state, unlatched.vaults[0].reason], [STATE.PAUSED, 'locked']);
+
+  // An unresolved item on an account vault still outranks the lock overlay — the lock never hides a decision.
+  const decision = computeStatus({ ...secure, locked: true, vaults: [vault({ vault: 'a', via: 'account', lastResult: 'conflict-keep-both' })] });
+  assert.strictEqual(decision.vaults[0].state, STATE.NEEDS_DECISION, 'a decision on an account vault stands under the lock');
+  assert.strictEqual(decision.state, STATE.NEEDS_DECISION, 'and it outranks the lock in the aggregate');
+
+  // A device vault up to date under the lock (identity live) reads up to date, not paused.
+  const dUp = computeStatus({ ...secure, locked: true, deviceLive: true, vaults: [vault({ vault: 'd', via: 'device', lastResult: 'ok' })] });
+  assert.strictEqual(dUp.vaults[0].state, STATE.UP_TO_DATE);
+
+  // L1: a device vault whose identity has gone (deviceLive false) reads paused-locked, not a stale green — the
+  // glance can never keep an "up to date" for an identity wiped since that vault's last device run.
+  const gone = computeStatus({ ...secure, locked: true, deviceLive: false, vaults: [vault({ vault: 'd', via: 'device', lastResult: 'ok' })] });
+  assert.deepStrictEqual([gone.vaults[0].state, gone.vaults[0].reason], [STATE.PAUSED, 'locked'], 'a device vault with a dead identity is paused-locked');
+});
+
 test('crash-loop latch => sync problem, and it outranks everything', () => {
   const r = computeStatus({ ...secure, crashLoopLatched: true, locked: true, vaults: [vault({ lastResult: 'ok' })] });
   assert.strictEqual(r.state, STATE.SYNC_PROBLEM);

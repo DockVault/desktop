@@ -27,16 +27,28 @@
  * Pure orchestration over injected IO, so every invariant is unit-testable with no Electron or network.
  */
 
+// The refusals that are SETTLED until a person acts here: re-running them on every routine tick cannot change
+// the answer, and for a changed server identity each attempt would mint a credential only to discard it.
+// States the SERVER may resolve on its own (a suspension lifted on the web, an account unlocked, a
+// credential limit freed as credentials expire) and transient waits (an unreadable store, details pending,
+// offline, a failing server) are deliberately NOT here — a later tick can genuinely succeed for those, and
+// a refused mint costs nothing.
+const HELD_REASONS = new Set([
+  'grant-needs-reproof', 'device-revoked', 'device-removed', 'device-expired', 'invalid-device-credential', 'device-secret-stale',
+  'no-grant', 'vault-not-standard', 'device-request-refused', 'host-key-mismatch',
+]);
+
 class SyncScheduler {
   /**
    * @param {object} io injected input/output surface (all side effects live in the caller)
    * @param {() => Array<{vaultId,vaultName,localFolder,remotePath,enabled}>} io.listConfigured
    * @param {(vaultId:string) => ({lastResult:(string|null),resyncRequired:boolean}|null)} io.runState  null => never-run
-   * @param {() => ({locked:boolean,online:boolean,accountLive:boolean})} io.session
+   * @param {() => ({locked:boolean,online:boolean,accountLive:boolean,deviceLive?:boolean})} io.session
    * @param {(vaultId:string) => Promise<{ok:true,remotePath:string,vaultName?:string}|{ok:false,reason:string}>} io.verifyEligible
    * @param {(localFolder:string) => (({ok:boolean,reason?:string})|Promise<{ok:boolean,reason?:string}>)} io.secureFolder  may be async (applies + reads back a real ACL); it is awaited
    * @param {(localFolder:string) => ({ok:boolean,reason?:string})} io.classify
    * @param {(vaultId:string) => Promise<{ok:boolean,reason?:string}>} io.refreshCred
+   * @param {(vaultId:string) => (string|null)} [io.credentialPath]  which credential path the vault's run took ('device' | 'account'), when known
    * @param {(vaultId:string) => Promise<boolean>} [io.confirmFirstUpload]  gate the first upload of a not-yet-consented config
    * @param {(spec:{vaultId,local,remotePath}) => Promise<object>} io.runSync    normal bidirectional run
    * @param {(spec:{vaultId,local,remotePath}) => Promise<object>} io.runResync  zero-loss resync (initial baseline / Repair)
@@ -48,9 +60,23 @@ class SyncScheduler {
     this._current = null;       // vaultId of the in-flight dispatch, or null
     this._queue = [];           // [{ vaultId, manual, repair }], at most one entry per vaultId
     this._authRetried = new Set(); // vaultIds that have already used their one auth-failed retry this episode
+    this._held = new Map();        // vaultId -> the settled device-side refusal that holds routine ticks (see HELD_REASONS)
   }
 
-  _emit(vaultId, ev) { try { if (this._io.onEvent) this._io.onEvent(vaultId, ev); } catch { /* consumer error is not ours */ } }
+  _emit(vaultId, ev) {
+    // A SETTLED refusal from this computer's sync identity holds the vault's routine ticks: re-dispatching every
+    // tick would only re-present the same refusal (and, for a credential cap, mint against it). A run that
+    // actually starts, or a deliberate press, lifts the hold — the person's action is what changes the answer.
+    if (ev && (ev.phase === 'refused' || ev.phase === 'paused') && HELD_REASONS.has(ev.reason)) this._held.set(vaultId, ev.reason);
+    else if (ev && (ev.phase === 'running' || ev.phase === 'done')) this._held.delete(vaultId);
+    try { if (this._io.onEvent) this._io.onEvent(vaultId, ev); } catch { /* consumer error is not ours */ }
+  }
+
+  /** The settled device-side refusal holding a vault's routine ticks, or null. */
+  held(vaultId) { return this._held.get(vaultId) || null; }
+
+  /** Lift every hold (a sign-in, an unlock, or a set-up change may have changed the server's answer). */
+  releaseHolds() { this._held.clear(); }
 
   // Enqueue a request, coalescing per vault. A request for the IN-FLIGHT vault is dropped (the running
   // dispatch already serves it). A manual request is ordered ahead of routine ticks and upgrades an
@@ -87,10 +113,14 @@ class SyncScheduler {
   }
 
   /** Request a routine or manual sync for one vault. Returns nothing; progress arrives via onEvent. */
-  requestSync(vaultId, { manual = false } = {}) { this._enqueue(vaultId, { manual }); this._pump(); }
+  requestSync(vaultId, { manual = false } = {}) {
+    if (manual) this._held.delete(vaultId); // a deliberate press always gets one fresh answer
+    else if (this._held.has(vaultId)) return; // a routine request for a held vault: the settled answer stands
+    this._enqueue(vaultId, { manual }); this._pump();
+  }
 
   /** The deliberate Repair action (the only thing that clears a blocked-after-run latch). */
-  requestRepair(vaultId) { this._enqueue(vaultId, { manual: true, repair: true }); this._pump(); }
+  requestRepair(vaultId) { this._held.delete(vaultId); this._enqueue(vaultId, { manual: true, repair: true }); this._pump(); }
 
   /**
    * The vaultId whose run is in flight right now, or null. It is the ONLY vault a per-step credential request
@@ -100,7 +130,7 @@ class SyncScheduler {
 
   /** A routine cadence tick: enqueue a run for every enabled configured vault (coalesced). */
   tickAll() {
-    for (const c of this._io.listConfigured() || []) if (c && c.enabled) this._enqueue(c.vaultId, { manual: false });
+    for (const c of this._io.listConfigured() || []) if (c && c.enabled && !this._held.has(c.vaultId)) this._enqueue(c.vaultId, { manual: false });
     this._pump();
   }
 
@@ -132,8 +162,15 @@ class SyncScheduler {
       if (!s || typeof s.locked !== 'boolean' || typeof s.online !== 'boolean' || typeof s.accountLive !== 'boolean') {
         this._emit(vaultId, { phase: 'skipped', reason: 'state-uncertain' }); return;
       }
-      if (s.locked) { this._emit(vaultId, { phase: 'skipped', reason: 'paused-locked' }); return; } // lock stops dispatch (Standard-gated)
-      if (!s.accountLive) { this._emit(vaultId, { phase: 'skipped', reason: 'no-session' }); return; }
+      // The account-tier lock splits by path: a vault synced on THIS computer's own device identity keeps
+      // running under the OS lock, while an account-path vault still pauses. The path is decided per run at the
+      // eligibility step below (which latches it), so here we can only refuse EARLY when there is no device
+      // identity that could carry a run — every vault is then account-path and the lock pauses it. With a device
+      // identity present we proceed and re-check the LATCHED path after eligibility (fail-closed, below).
+      if (s.locked && s.deviceLive !== true) { this._emit(vaultId, { phase: 'skipped', reason: 'paused-locked' }); return; }
+      // A run needs SOME principal: the account session, or this computer's own sync identity. Which one a vault
+      // uses is the eligibility step's decision; a vault that needs the one that is missing is refused there.
+      if (!s.accountLive && s.deviceLive !== true) { this._emit(vaultId, { phase: 'skipped', reason: 'no-session' }); return; }
       if (!s.online) { this._emit(vaultId, { phase: 'paused', reason: 'waiting-to-reconnect' }); return; } // offline
 
       // A vault BLOCKED after a completed run is never auto-resynced — cheap no-op, needs a deliberate Repair.
@@ -147,6 +184,10 @@ class SyncScheduler {
       // Run-time re-assertion (fail-closed): still a server-confirmed Standard vault; remote re-derived from the CURRENT name.
       const el = await io.verifyEligible(vaultId);
       if (!el || !el.ok) { this._emit(vaultId, { phase: 'refused', reason: (el && el.reason) || 'ineligible' }); return; }
+      // The eligibility step latched the credential path. Under the account-tier lock, ONLY the device path
+      // proceeds (this computer's own identity, no account session or zero-knowledge key); an account path — or an
+      // eligibility result that did not name the device path — pauses. Fail-closed: any doubt pauses under lock.
+      if (s.locked && el.via !== 'device') { this._emit(vaultId, { phase: 'skipped', reason: 'paused-locked' }); return; }
       const remotePath = el.remotePath;
 
       // Re-secure + re-classify the folder before any write (covers configs/folders created before these
@@ -231,6 +272,15 @@ class SyncScheduler {
       // Route it to the "needs unlock" must-act (re-enter the vault password), NOT the sign-in latch, by rewriting
       // the latching outcome to a distinct typed result the status model maps to that state. A vault with no
       // password still latches sign-in (its auth-failed can only be the account credential).
+      // On the DEVICE path an auth failure past its retry is never an account or vault-password matter: the
+      // device's own standing (revoked, suspended, a rotated vault password) is re-checked on the next pass and
+      // surfaces as its own state there. Record a calm, distinct outcome instead of the account remedies.
+      if (outcome && outcome.ran === true && outcome.result === 'auth-failed'
+          && typeof this._io.credentialPath === 'function' && this._io.credentialPath(vaultId) === 'device') {
+        this._authRetried.delete(vaultId);
+        this._emit(vaultId, { phase: 'done', outcome: { ...outcome, result: 'auth-failed-device' } });
+        return outcome;
+      }
       if (outcome && outcome.ran === true && outcome.result === 'auth-failed'
           && typeof this._io.vaultHasPassword === 'function' && this._io.vaultHasPassword(vaultId)) {
         this._authRetried.delete(vaultId);

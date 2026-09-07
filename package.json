@@ -1,18 +1,31 @@
 {
   "name": "dockvault-desktop",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "commonjs",
   "description": "DockVault desktop client — a tray-resident Electron shell that reuses the vault web UI and client-side crypto verbatim.",
   "license": "AGPL-3.0-only",
   "repository": "github:DockVault/desktop",
+  "homepage": "https://dockvault.io",
+  "author": {
+    "name": "DockVault",
+    "email": "support@dockvault.io"
+  },
   "main": "src/main/index.js",
+  "desktopName": "dockvault.desktop",
   "scripts": {
     "start": "electron .",
-    "test": "node --test \"test/**/*.test.js\""
+    "test": "node --test \"test/**/*.test.js\"",
+    "fetch-rclone": "node scripts/fetch-rclone.js",
+    "pack": "npm run fetch-rclone && electron-builder --dir",
+    "dist": "npm run fetch-rclone && electron-builder",
+    "dist:win": "npm run fetch-rclone -- win32-x64 && electron-builder --win --x64",
+    "dist:mac": "npm run fetch-rclone -- darwin-arm64 darwin-x64 && electron-builder --mac --arm64 --x64",
+    "dist:linux": "npm run fetch-rclone -- linux-x64 && electron-builder --linux --x64"
   },
   "devDependencies": {
-    "electron": "^44.1.0"
+    "electron": "^44.1.0",
+    "electron-builder": "26.15.3"
   },
   "dependencies": {
     "better-sqlite3-multiple-ciphers": "13.0.3"

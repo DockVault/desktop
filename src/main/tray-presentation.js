@@ -29,6 +29,12 @@ const REASON_DETAIL = Object.freeze({
   'cannot-verify-yet': 'cannot verify the server yet',
   'retrying': 'retrying',
   'consent-needed': 'approve syncing to start',
+  // Device sync, the calm waits: the OS secret store could not be read just now; the vault's details are
+  // still to be filled in from a signed-in session. Neither is a fault and neither needs an action yet.
+  'device-identity-unreadable': "this computer's sync identity can't be read right now",
+  'device-being-rechecked': "this computer's sync identity is being re-checked — sign in once to finish",
+  'grant-details-pending': 'sign in once to finish setting up this vault',
+  'device-access-check': "re-checking this computer's access",
   // The saved sync state exists but cannot be unlocked/opened on this machine. Lead with reassurance —
   // the person's actual files are never touched by this — because a bare "sync problem" over an unreadable
   // database could read as data loss. (The deliberate reset that clears it is a fast-follow.)
@@ -68,25 +74,85 @@ function progressDetail(progress) {
 // strings ONLY (never the raw message, path, or SHA). Every known sub gets a specific line; an unknown/null sub
 // falls through to an honest generic — NEVER a blank, never a misleading "blocked by antivirus" for a MISSING
 // binary (its own line), and never "couldn't verify" for a config/prepare failure.
-function helperDetail(sub, installed, pinned) {
+// Set ONCE by main at startup (app.isPackaged), so every surface that describes the helper — tooltip,
+// notification body, dialog — speaks the same way: an installed app's helper came with the installer.
+let PACKAGED = false;
+function setPackaged(v) { PACKAGED = v === true; }
+
+function helperDetail(sub, installed, pinned, packaged = PACKAGED) {
   switch (sub) {
     case 'version-mismatch': return `The sync helper (rclone) is version ${installed || 'unknown'}, but this app needs ${pinned || 'a different version'}.`;
     case 'checksum-mismatch': return "The sync helper failed a safety check — it doesn't match its expected version.";
-    case 'binary-missing': return 'The sync helper file is missing. Set it up again.';
+    // In a packaged app the helper came with the installer, so "set it up again" would point at nothing;
+    // the remedy line (helperRemedy) carries the fix there.
+    case 'binary-missing': return packaged ? 'The sync helper file is missing.' : 'The sync helper file is missing. Set it up again.';
     // Only a genuinely-blocked START (a present file that won't launch — SmartScreen / antivirus). A helper that
     // RAN and then failed (obscure-failed) is NOT a start-block, so it falls to the neutral default — asserting an
     // antivirus block for it would be a wrong-cause accusation, the same mistake removed from the missing case.
     case 'spawn-failed': return 'The sync helper was blocked from starting — this can be Windows SmartScreen or your antivirus.';
-    default: return "The sync helper couldn't be set up — check its setup."; // obscure-failed / config-format-failed / prepare-failed / null / any unknown
+    default: return packaged ? "The sync helper couldn't be started." : "The sync helper couldn't be set up — check its setup."; // obscure-failed / config-format-failed / prepare-failed / null / any unknown
   }
 }
 
-function tooltip(model, lockPhase, pinned) {
+// The REMEDY paragraph under the detail, for a packaged app whose helper came bundled and hash-pinned with the
+// installer (no fallback, no user-supplied binary). It follows the typed reason, because the honest fix differs:
+// a missing / altered / wrong-version helper IS a damaged installation and only a reinstall repairs it; a helper
+// that was BLOCKED from starting is not damaged and a reinstall would change nothing; a helper that ran and then
+// failed gets the calm remedy first. Never a path, a value, or a SHA. Development checkouts get their own text.
+function helperRemedy(sub, platform) {
+  switch (sub) {
+    case 'version-mismatch':
+    case 'checksum-mismatch':
+    case 'binary-missing':
+      return "DockVault's installation looks damaged: the sync helper that came with it is missing or has been altered. Reinstall DockVault by running the installer again to repair it. Your files and settings are not affected.";
+    case 'spawn-failed':
+      if (platform === 'win32') return "Windows SmartScreen or your antivirus stopped the sync helper from starting. Allow DockVault's sync helper (or restore it from quarantine), then restart DockVault. Your files and settings are not affected.";
+      if (platform === 'darwin') return 'macOS blocked the sync helper from starting. Allow it under System Settings → Privacy & Security, then restart DockVault. Your files and settings are not affected.';
+      return 'Your system stopped the sync helper from starting — a security policy or a missing execute permission. Allow it, then restart DockVault. Your files and settings are not affected.';
+    default:
+      return "DockVault couldn't start its sync helper. Restart DockVault; if this keeps happening, reinstall it by running the installer again to repair the helper. Your files and settings are not affected.";
+  }
+}
+
+// Under the app-lock the glance LEADS with "Locked" — the security state the person chose — and APPENDS the
+// sync truth from the per-vault breakdown, so it never reads a bare "Paused" implying sync stopped: a vault on
+// this computer's own device identity keeps syncing under the lock while the account path is paused. Faces:
+// "Locked · waiting to reconnect" when offline (nothing can sync); "Locked · syncing N vaults" while device
+// vaults transfer; "Locked · N vaults paused while locked" when the lock is holding account-path vaults;
+// "Locked · up to date" when every vault is up to date; plain "Locked" when every configured vault is paused
+// by the lock (or nothing more specific is true).
+function lockedGlance(model, lockReason) {
+  const vs = Array.isArray(model && model.vaults) ? model.vaults : [];
+  // A machine woken from sleep does NOT auto-resume the account tier on mere input (unlike an idle lock, and
+  // unlike an OS-screen lock which resumes on the unlock-screen): the desktop is unlocked but sync stays
+  // paused until Resume. Say exactly that — never a bare "Locked" glance on a visibly-unlocked desktop.
+  if (lockReason === 'sleep') return 'Sync paused since sleep — Resume sync to continue';
+  if (model && model.online === false) return 'Locked · waiting to reconnect';                     // offline: don't claim progress or up-to-date
+  const total = vs.length;
+  const syncing = vs.filter((v) => v.state === STATE.SYNCING).length;
+  if (syncing > 0) return `Locked · syncing ${syncing} ${syncing === 1 ? 'vault' : 'vaults'}`;
+  const pausedLocked = vs.filter((v) => v.state === STATE.PAUSED && v.reason === 'locked').length;
+  if (total > 0 && pausedLocked === total) return 'Locked';                                        // every vault paused by the lock
+  if (pausedLocked > 0) return `Locked · ${pausedLocked} ${pausedLocked === 1 ? 'vault' : 'vaults'} paused while locked`;
+  const upToDate = vs.filter((v) => v.state === STATE.UP_TO_DATE).length;
+  if (total > 0 && upToDate === total) return 'Locked · up to date';                              // device vaults, all up to date
+  return 'Locked';                                                                                 // mixed — lead with the lock, don't overclaim
+}
+
+// The glance has two extra inputs and they arrive in ONE options object, not a positional tail:
+// { server } is which server is in force (the installable build), { lockReason } is why the account tier
+// is paused (device sync). A fourth and fifth positional slot is exactly the shape that made this
+// function collide in the first place, so the object is deliberate — callers name what they pass.
+function tooltip(model, lockPhase, pinned, options = {}) {
+  const { server = null, lockReason = null } = options || {};
+  // With no server in force nothing below can be true — not even the lock — so the glance says that
+  // rather than a name with nothing behind it.
+  if (server && !server.origin) return 'DockVault — Not connected';
   if (lockPhase === 'locking') return 'DockVault — Locking…';
   if (lockPhase === 'lock-error') return 'DockVault — Lock error (retrying)';
   if (model.condition === 'unavailable') return 'DockVault — Sync unavailable';
   if (model.condition === 'not-configured') return 'DockVault';
-  if (model.state === STATE.PAUSED && model.reason === 'locked') return 'DockVault — Locked';
+  if (model.state === STATE.PAUSED && model.reason === 'locked') return 'DockVault — ' + lockedGlance(model, lockReason);
   // A persistent no-sync is a must-act, but its glance reads by duration, not alarm (it is usually a
   // connection or sign-in issue). Keep the calm phrasing rather than the bare "Sync problem" label.
   if (model.state === STATE.SYNC_PROBLEM && model.reason === 'not-syncing') return "DockVault — Sync hasn't run for a while";
@@ -103,30 +169,63 @@ function tooltip(model, lockPhase, pinned) {
   return 'DockVault — ' + model.label + (detail ? ' · ' + detail : '');
 }
 
-// One reachable action per unresolved item. `kind` is the stable action the tray layer wires to a
-// handler; `label` is the (provisional) menu text; `vault` names the affected vault where relevant.
-function itemForVault(v) {
+// The action kinds the app can actually perform today. Every item this module emits MUST use one of
+// these, so a label never promises a door the app cannot open: the first four have their own handler
+// (restart the helper, make the folder private again, a zero-loss repair, the helper how-to); the rest
+// open the app, where the person completes the step themselves. A device-sync step the app cannot yet
+// perform in-app (prove a vault password once more; set this computer up again) is therefore an 'open'
+// with copy that states the fact — a dedicated kind lands together with its flow.
+const HANDLED_ACTION_KINDS = Object.freeze([
+  'restart', 'recover-folder', 'repair', 'setup-helper',
+  'open', 'reopen', 'review', 'sign-in', 'unlock', 'check-identity', 'choose-folder', 'reset-device', 'set-up-again',
+]);
+
+// The vault's display NAME for a label, resolved from the caller's id→name map (the configured list). The
+// model is keyed by vault id, so without this every label would show the raw UUID; a missing name falls back
+// to the id, never blank or "undefined". nameById may be a function or a plain {id:name} object.
+function displayName(v, nameById) {
+  const n = typeof nameById === 'function' ? nameById(v.vault)
+    : (nameById && typeof nameById === 'object' ? nameById[v.vault] : undefined);
+  return (typeof n === 'string' && n) ? n : v.vault;
+}
+
+// One reachable action per unresolved item. `kind` is the stable action the tray layer wires to a handler;
+// `label` is the (provisional) menu text with the vault's NAME; `vault` stays the vault ID the handler acts on.
+function itemForVault(v, nameById) {
+  const name = displayName(v, nameById);
   switch (v.reason) {
-    case 'conflict-keep-both': return { kind: 'review', vault: v.vault, label: `Review conflicting copies in ${v.vault}` };
-    case 'sign-in-needed': return { kind: 'sign-in', vault: v.vault, label: `Sign in to keep ${v.vault} syncing` };
-    case 'needs-unlock': return { kind: 'unlock', vault: v.vault, label: `Unlock ${v.vault} to sync it` };
+    case 'conflict-keep-both': return { kind: 'review', vault: v.vault, label: `Review conflicting copies in ${name}` };
+    case 'sign-in-needed': return { kind: 'sign-in', vault: v.vault, label: `Sign in to keep ${name} syncing` };
+    case 'needs-unlock': return { kind: 'unlock', vault: v.vault, label: `Unlock ${name} to sync it` };
     case 'needs-repair':
-    case 'confirm-large-delete': return { kind: 'repair', vault: v.vault, label: `Repair sync for ${v.vault}` };
-    case 'path-too-long': return { kind: 'repair', vault: v.vault, label: `A file in ${v.vault} needs a shorter path` };
-    case 'host-key-mismatch': return { kind: 'check-identity', vault: v.vault, label: `Check ${v.vault}: the server identity changed` };
-    case 'vault-unavailable': return { kind: 'open', vault: v.vault, label: `${v.vault} can't sync right now — it may have been changed or removed` };
-    case 'not-syncing': return { kind: 'open', vault: v.vault, label: `${v.vault} hasn't synced for a while — check your connection` };
-    case 'folder-problem': return { kind: 'recover-folder', vault: v.vault, label: `The sync folder for ${v.vault} is shared again — make it private` };
+    case 'confirm-large-delete': return { kind: 'repair', vault: v.vault, label: `Repair sync for ${name}` };
+    case 'path-too-long': return { kind: 'repair', vault: v.vault, label: `A file in ${name} needs a shorter path` };
+    case 'host-key-mismatch': return { kind: 'check-identity', vault: v.vault, label: `Check ${name}: the server identity changed` };
+    case 'vault-unavailable': return { kind: 'open', vault: v.vault, label: `${name} can't sync right now — it may have been changed or removed` };
+    case 'not-syncing': return { kind: 'open', vault: v.vault, label: `${name} hasn't synced for a while — check your connection` };
+    case 'folder-problem': return { kind: 'recover-folder', vault: v.vault, label: `The sync folder for ${name} is shared again — make it private` };
     case 'folder-insecure':
-    case 'folder-rejected': return { kind: 'choose-folder', vault: v.vault, label: `The sync folder for ${v.vault} can't be used — choose a folder again` };
+    case 'folder-rejected': return { kind: 'choose-folder', vault: v.vault, label: `The sync folder for ${name} can't be used — choose a folder again` };
     // A code fault in our OWN sync path — own it plainly so the person doesn't go hunting their own
     // connection/sign-in/keychain for a fault only we can fix. (A "Report a problem" action is a follow-up.)
     case 'sync-error': return { kind: 'open', vault: v.vault, label: "Something in DockVault's own sync step failed — this is on our side, not your connection or sign-in." };
-    default: return { kind: 'open', vault: v.vault, label: `Sync problem with ${v.vault}` };
+    // Device sync: this computer's identity and its per-vault access. Each is its own line with its own next step;
+    // an account problem is named as the account's, never as this computer's fault. (Copy provisional.)
+    case 'grant-needs-reproof': return { kind: 'open', vault: v.vault, label: `${name}'s password changed — this computer needs it entered once more before it can keep syncing` };
+    case 'device-revoked': return { kind: 'set-up-again', vault: v.vault, label: `This computer was removed from your synced computers — set it up again to keep syncing here` };
+    case 'device-expired': return { kind: 'set-up-again', vault: v.vault, label: `This computer's sync access has expired — set it up again to keep syncing here` };
+    case 'device-suspended': return { kind: 'open', vault: v.vault, label: `Syncing on this computer is paused by your server pending the owner's review` };
+    case 'device-not-recognized': return { kind: 'set-up-again', vault: v.vault, label: `Your server no longer recognises this computer — set it up again to keep syncing here` };
+    case 'account-inactive': return { kind: 'open', vault: v.vault, label: `Your DockVault account is locked — syncing resumes when it's active again` };
+    case 'grant-withdrawn': return { kind: 'open', vault: v.vault, label: `This computer isn't set up to sync ${name} any more` };
+    case 'vault-not-standard': return { kind: 'open', vault: v.vault, label: `${name} is end-to-end encrypted, so it stays on the web — only Standard vaults sync here` };
+    case 'device-cred-cap': return { kind: 'open', vault: v.vault, label: `${name} can't sync yet: this computer has reached your server's sync-credential limit — try again in a while` };
+    case 'device-refused': return { kind: 'open', vault: v.vault, label: `${name} couldn't sync — your server refused this computer. Open DockVault.` };
+    default: return { kind: 'open', vault: v.vault, label: `Sync problem with ${name}` };
   }
 }
 
-function mustActItems(model) {
+function mustActItems(model, nameById) {
   const items = [];
   if (model.condition != null) return items; // unavailable / not-configured: nothing to act on here
   // A stuck helper (crash-looped OR a persistent per-vault down-helper escalation) is ONE global restart. Surface
@@ -150,9 +249,46 @@ function mustActItems(model) {
   for (const v of model.vaults) {
     if (v.reason === 'helper-not-ready') continue; // handled once, app-scoped, above
     if (v.reason === 'sync-stopped') continue; // a global down-helper condition — handled once as the restart above
-    if (v.state === STATE.NEEDS_DECISION || v.state === STATE.SYNC_PROBLEM) items.push(itemForVault(v));
+    if (v.state === STATE.NEEDS_DECISION || v.state === STATE.SYNC_PROBLEM) items.push(itemForVault(v, nameById));
   }
+  // The device-ended states are IDENTITY-wide (every configured vault reports the same removal/expiry), so
+  // their set-up-again offer collapses to a SINGLE line — one re-registration fixes them all — rather than
+  // one identical line per vault.
+  const firstSetupAgain = items.findIndex((it) => it.kind === 'set-up-again');
+  if (firstSetupAgain !== -1) return items.filter((it, i) => it.kind !== 'set-up-again' || i === firstSetupAgain);
   return items;
+}
+
+// Calm "finish setting up on this computer" to-dos for vaults whose device grant is pending — a deferred setup
+// (finish it) or a password re-proof after a change (keep syncing it), told apart by whether the vault was ever
+// granted. kind 'open': the door opens the app to that vault, where opening it proves the password once and the
+// resume sweep completes the grant. Suppressed for a vault that already has its own must-act line — a real sync
+// problem outranks a calm setup nudge — so the caller passes alreadyShown for the ids it already surfaced.
+function pendingSetupItems(pendingVaultIds, opts = {}) {
+  const nameById = opts.nameById;
+  const wasGranted = typeof opts.wasGranted === 'function' ? opts.wasGranted : () => false;
+  const alreadyShown = typeof opts.alreadyShown === 'function' ? opts.alreadyShown : () => false;
+  const out = [];
+  for (const vaultId of (Array.isArray(pendingVaultIds) ? pendingVaultIds : [])) {
+    if (!vaultId || alreadyShown(vaultId)) continue;
+    const name = displayName({ vault: vaultId }, nameById);
+    // A vault granted before is a re-proof: its password changed on the server, so the person must open it with
+    // the NEW password. A never-granted vault is a first setup: any open finishes it.
+    const label = wasGranted(vaultId)
+      ? `Open ${name} with its new password to keep syncing it on this computer`
+      : `Open ${name} once to finish setting it up on this computer`;
+    out.push({ kind: 'open', vault: vaultId, label });
+  }
+  return out;
+}
+
+// The escape hatch: a device identity that has read UNREADABLE (a locked/rotated keychain, a torn blob) for
+// long enough that it is not going to clear on its own. One global reset offer — forget this computer's
+// identity and set it up again — distinct from, and shown only after, the calm 'device-identity-unreadable'
+// paused glance that precedes it. kind 'reset-device' runs the forget itself (not an 'open'), so the caller
+// wires it to a confirmed reset; never auto-fires.
+function deviceResetItem() {
+  return { kind: 'reset-device', label: "This computer's sync identity can't be read — reset it to set this computer up again" };
 }
 
 // The per-vault "Sync now" affordance, honest about concurrency. While a run is actually in flight for
@@ -210,4 +346,52 @@ function vaultRows(configured, modelVaults, now) {
   });
 }
 
-module.exports = { tooltip, mustActItems, syncNowItem, lastSyncedLabel, vaultRows, formatBytes, progressDetail, helperDetail, REASON_DETAIL };
+// The one notification an installed app shows on its first launch: it is BOTH the "something happened"
+// after a silent one-click install and the disclosure that a login item now exists, with where to turn
+// it off. No promise about syncing — nothing is set up yet. (When a first-run server screen exists, the
+// body should instead point at it: "Set up your server to start syncing — click to begin.")
+// `registered` is the READ-BACK after registering, not the intent: a platform that refuses without
+// throwing (a policy blocking the Run key) gets the honest variant, which points at the switch instead.
+function installedNotification(platform, registered = true) {
+  const signIn = platform === 'win32' ? 'sign in to Windows' : platform === 'darwin' ? 'log in to your Mac' : 'log in';
+  const body = registered === true
+    ? `It starts when you ${signIn}. You can turn that off in the tray menu.`
+    : `Turn on Start at login in the tray menu if you want it to start when you ${signIn}.`;
+  return { title: 'DockVault is installed and running in the tray', body };
+}
+
+// The tray's "Start at login" checkbox. `enabled` MUST be the platform's real registration read at menu-build
+// time (login-item.js isEnabled), never a remembered preference, so the box can never disagree with the machine.
+function loginItemMenu(enabled) {
+  return { label: 'Start at login', type: 'checkbox', checked: enabled === true };
+}
+
+// The tray's view of which server is in force, from server-config's state: a saved setting that the
+// DOCKVAULT_SERVER variable silently overrode would be a lie, so when the two differ (or the saved one
+// cannot be read while the variable is set) the menu says so. "Change server…" is offered whenever a
+// server is in force; with none, the setup screen is what opening the app shows anyway.
+function serverMenuItems(state) {
+  const items = [];
+  if (!state) return items;
+  if (state.status === 'env') {
+    // The variable is a development override that wins over anything saved: a change made here would be
+    // saved and then ignored, so the menu only says what is in force.
+    if (state.envOverrides) items.push({ kind: 'server-note', label: 'Using DOCKVAULT_SERVER override', enabled: false });
+    return items;
+  }
+  if (state.origin) items.push({ kind: 'change-server', label: 'Change server…' });
+  else items.push({ kind: 'setup-server', label: 'Set up server…' }); // reopens the setup screen; never a blank state
+  return items;
+}
+
+// The consent before a server change: the device, the session, the grants, and the sync setup all
+// belong to the old server, so the change is a relationship end and says so. Files stay.
+function changeServerConsent(host) {
+  return {
+    title: 'Switch to a different server?',
+    message: `Switching servers signs you out and removes this computer from sync on ${host || 'the current server'}. Files already synced stay in their folders.`,
+    buttons: ['Cancel', 'Switch server'],
+  };
+}
+
+module.exports = { tooltip, lockedGlance, mustActItems, itemForVault, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, vaultRows, formatBytes, progressDetail, helperDetail, REASON_DETAIL, HANDLED_ACTION_KINDS, helperRemedy, setPackaged, installedNotification, loginItemMenu, serverMenuItems, changeServerConsent };

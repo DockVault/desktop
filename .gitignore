@@ -6,11 +6,18 @@ dist/
 out/
 build/*
 !build/icon.png
+!build/entitlements.mac.plist
+!build/installer.nsh
+!build/rclone.json
 release/
 *.asar
 
 # Local-only runtime data, scratch, captured evidence — never committed
 .local/
+
+# Git bundles and their drop dir — branch-history snapshots shared out-of-band, never committed
+*.bundle
+/results/
 
 # Environment / secrets
 .env

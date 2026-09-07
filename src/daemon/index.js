@@ -263,9 +263,12 @@ async function onSyncRun(m) {
     // the NEXT dispatch's gate re-verifies and refuses with the typed helper-not-ready(checksum-mismatch).
     if (rclone && !rclone.isVerified()) syncReady = null;
     // Never surface the raw run error — an rclone/engine exception message can carry a path. A bounded reason
-    // stands in; the class only is logged (leak-safe) for diagnosis.
-    try { console.error('[sync] run error:', (err && err.name) || 'Error'); } catch { /* ignore */ }
-    reply({ type: 'sync-run-result', id: m.id, ok: false, reason: 'run-error' });
+    // stands in; only the error's class and platform code (bare tokens, never a message) ride along for diagnosis.
+    const errorName = (err && typeof err.name === 'string' && /^[A-Za-z]{1,40}$/.test(err.name)) ? err.name : 'Error';
+    const errorCode = (err && typeof err.code === 'string' && /^[A-Z][A-Z0-9_]{1,31}$/.test(err.code)) ? err.code : null;
+    const errorSub = (err && typeof err.subReason === 'string' && /^[a-z-]{1,40}$/.test(err.subReason)) ? err.subReason : null;
+    try { console.error('[sync] run error:', errorName, errorCode || '', errorSub || ''); } catch { /* ignore */ }
+    reply({ type: 'sync-run-result', id: m.id, ok: false, reason: 'run-error', errorName, errorCode, errorSub });
   } finally {
     syncInFlight = false;
     sftpConfig = null; // a single-use credential is spent after its run — never leave one held between runs

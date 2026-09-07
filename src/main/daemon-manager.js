@@ -128,7 +128,10 @@ class DaemonManager {
         const e = this._syncPending.get(m.id);
         if (e) {
           this._syncPending.delete(m.id); clearTimeout(e.timer);
-          e.resolve({ ok: !!m.ok, ran: !!m.ran, result: m.result || null, reason: m.reason || null, resyncRequired: !!m.resyncRequired, needsAttention: !!m.needsAttention, code: typeof m.code === 'number' ? m.code : null, preserved: typeof m.preserved === 'number' ? m.preserved : null, refused: m.refused || null });
+          const tok = (v, re) => (typeof v === 'string' && re.test(v) ? v : null); // bounded bare tokens only — never a message or a path
+          const diag = {}; // a failed run's error class / platform code / typed sub — bounded bare tokens, only when present
+          for (const [k, re] of [['errorName', /^[A-Za-z]{1,40}$/], ['errorCode', /^[A-Z][A-Z0-9_]{1,31}$/], ['errorSub', /^[a-z-]{1,40}$/]]) { const v = tok(m[k], re); if (v) diag[k] = v; }
+          e.resolve({ ok: !!m.ok, ran: !!m.ran, result: m.result || null, reason: m.reason || null, resyncRequired: !!m.resyncRequired, needsAttention: !!m.needsAttention, code: typeof m.code === 'number' ? m.code : null, preserved: typeof m.preserved === 'number' ? m.preserved : null, refused: m.refused || null, ...diag });
         }
         break;
       }

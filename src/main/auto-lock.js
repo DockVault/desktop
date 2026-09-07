@@ -45,6 +45,7 @@ class AutoLock {
     this.lockState = deps.lockState;
     this.getWindow = deps.getWindow || (() => null);
     this.onDegraded = deps.onDegraded || (() => {}); // surfaced once if the OS idle clock is unavailable
+    this._onResume = deps.onResume || (() => {});    // kick a sync when the OS wakes — device-path only under lock; never resumes the account tier
     this._degraded = new Set();
     const t = deps.timers || {};
     this.idlePollMs = t.idlePollMs || DEFAULTS.idlePollMs;
@@ -67,9 +68,14 @@ class AutoLock {
       // The user has stepped away — drop the key immediately, then arm the unattended escalation.
       this.power.on('suspend', () => this._trigger('sleep'));
       this.power.on('lock-screen', () => this._trigger('os-lock'));
-      // OS input resumed — allow the idle timer to arm again, and auto-resume account-tier sync if it was paused by
-      // an OS/idle lock (never a manual "Lock now", which waits for the explicit Resume item).
-      this.power.on('resume', () => { this._idleLatched = false; this._maybeAutoResume(); });
+      // Waking from sleep is NOT proof the user is present (the machine may wake to a locked screen, or on a
+      // timer): the zero-knowledge key stays purged and the account tier stays paused until a real presence signal.
+      // Re-arm the idle timer and KICK a sync so a device-path vault — which keeps syncing under the lock on its
+      // own identity — catches up after the freeze; the kick runs through the same gate, so an account-path vault
+      // stays paused there. It never resumes the account tier or re-derives the ZK key.
+      this.power.on('resume', () => { this._idleLatched = false; this._onResume(); });
+      // The OS session was unlocked — the user IS present: re-arm the idle timer and auto-resume account-tier sync
+      // an OS/idle lock paused (never a manual "Lock now", which waits for the explicit Resume item).
       this.power.on('unlock-screen', () => { this._idleLatched = false; this._maybeAutoResume(); });
     }
     // The idle poll is installed only if the OS input-idle clock is actually usable. If it is not, the
@@ -106,17 +112,28 @@ class AutoLock {
       this._idleLatched = true; // don't re-fire until OS input resumes
     } else {
       this._idleLatched = false;
-      this._maybeAutoResume(); // input resumed below the idle threshold -> reverse an idle lock for the account tier
+      // Input is happening again. That reverses an IDLE lock — the idle clock is exactly what armed it. It must NOT
+      // reverse a screen lock or a sleep: input at a lock screen (a person typing their password, or anything else
+      // the OS counts while the session is still locked) resets the same clock, and reading that as "the user is
+      // back" would resume account-tier sync — and re-mint its credential — while the screen is still locked. Those
+      // two have their own authoritative return signal, the OS unlock, which calls the reverse edge with no filter.
+      this._maybeAutoResume('idle');
     }
   }
 
-  // Reverse edge for the account tier: re-enable Standard-vault sync once the user returns (input resumed / screen
-  // unlocked / system resumed), but ONLY for the auto (UNATTENDED) reasons — a manual "Lock now" is a deliberate pause
-  // and waits for the explicit "Resume sync" item, never auto-resumed here. Idempotent: acts only while sync is paused.
-  _maybeAutoResume() {
+  /**
+   * Reverse edge for the account tier: re-enable Standard-vault sync once the person is back. Never reverses a manual
+   * "Lock now" (a deliberate pause, waiting for the explicit Resume item). Idempotent: acts only while sync is paused.
+   * @param {'idle'} [only]  when given, reverse ONLY a lock with that reason. The idle poll passes it, because
+   *   returning input proves presence for an idle lock but says nothing about a locked screen or a sleeping machine;
+   *   the OS unlock calls this with no filter, being authoritative for every unattended lock.
+   */
+  _maybeAutoResume(only) {
     try {
       if (this.lockState.isAccountUsable()) return;                  // already active — nothing to resume
-      if (!UNATTENDED.has(this.lockState.snapshot().reason)) return; // a manual lock waits for the Resume item
+      const reason = this.lockState.snapshot().reason;
+      if (!UNATTENDED.has(reason)) return;                           // a manual lock waits for the Resume item
+      if (only && reason !== only) return;                           // input alone never reverses a screen lock or a sleep
       this.lockState.resumeAccount();
     } catch { /* the SoT surfaces its own errors; never break the poll */ }
   }
