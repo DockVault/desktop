@@ -31,13 +31,16 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
-            script: dist:win
+            rclone: win32-x64
+            eb: --win --x64
           - name: macOS
             os: macos-latest
-            script: dist:mac
+            rclone: darwin-arm64 darwin-x64
+            eb: --mac --arm64 --x64
           - name: Linux
             os: ubuntu-latest
-            script: dist:linux
+            rclone: linux-x64
+            eb: --linux --x64
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -67,6 +70,13 @@ jobs:
             echo "### ${{ matrix.name }}: signed build" >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      # Fetch and electron-builder run as SEPARATE steps, not chained with `&&` inside one npm
+      # script: on the Windows runner npm ran the script string through cmd.exe and dropped the
+      # command after `&&`, so electron-builder never started (mac/Linux, on bash, were fine).
+      - name: Fetch the rclone binary
+        shell: bash
+        run: node scripts/fetch-rclone.js ${{ matrix.rclone }}
+
       - name: Build installers
         shell: bash
         env:
@@ -77,7 +87,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: npm run ${{ matrix.script }}
+        run: npx electron-builder ${{ matrix.eb }} --publish never
 
       # Each leg records whether its installers are signed, so the release job can refuse to publish
       # unsigned ones. Linux has no code signing in this pipeline, so its record is "not-applicable".
