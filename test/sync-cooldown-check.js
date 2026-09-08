@@ -11,7 +11,13 @@
  *     once (the lapsed-at-connect race), then routine ticks inside the window mint NOTHING, a deliberate press
  *     gets one attempt per window and a second press is turned away with the wait; a Repair burst pressed WHILE a
  *     run is in flight still costs one credential — and once the door accepts a credential again the back-off
- *     clears and syncing resumes.
+ *     clears and syncing resumes;
+ *   - stepping AWAY from the computer and coming back: an idle auto-lock and the OS unlock that follows it must
+ *     not re-open any of that. The resume lifts the settled holds and opens the endpoint gate (a changed sync
+ *     address must be tried at once), but a door that ANSWERED and refused this computer's credential is a fact
+ *     about the server, and returning to the laptop cannot have changed it — so the back-off stands and the
+ *     resume mints NOTHING. Driven through the real idle poller, the real lock transaction and the real OS
+ *     unlock edge, with the shell's own handler wiring.
  *
  * The scheduler's clock is injected, so the windows (minutes to an hour) are stepped without waiting them out;
  * the server's per-address limit on sign-in attempts is real, so the phases are PACED against it with real pauses
@@ -30,7 +36,7 @@
  *
  *   node_modules/electron/dist/electron.exe test/sync-cooldown-check.js
  */
-const { app, safeStorage } = require('electron');
+const { app, safeStorage, powerMonitor } = require('electron');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -45,6 +51,8 @@ const deviceGrantStore = require('../src/main/device-grant-store');
 const { registerDevice, forgetDevice } = require('../src/main/device-register');
 const rcloneBundle = require('../src/main/rclone-bundle');
 const { SyncScheduler, MANUAL_SYNC_COOLDOWN_MS, REFUSAL_BACKOFF_BASE_MS } = require('../src/main/sync-scheduler');
+const { LockState } = require('../src/main/lock-state');
+const { AutoLock } = require('../src/main/auto-lock');
 const schedulerIo = require('../src/main/scheduler-io');
 const syncVaults = require('../src/main/sync-vaults');
 const syncConfig = require('../src/main/sync-config');
@@ -164,6 +172,7 @@ app.whenReady().then(async () => {
 
   // ---- the REAL scheduler over the production io wiring ------------------------------------------------------------
   let skew = 0; // the scheduler's injected clock: real time plus what the check has stepped forward
+  let lockState = null; // the REAL lock state, once the away-and-back phase builds it; until then the app is active
   const runState = { value: null, fresh: true };
   const events = [];
   const cfg = () => [{ vaultId: VID, vaultName: VAULT_NAME, localFolder: local, remotePath: syncConfig.remotePathForVault(VAULT_NAME), enabled: true, consented: true }];
@@ -174,7 +183,7 @@ app.whenReady().then(async () => {
     remotePathForVault: syncConfig.remotePathForVault,
     secureFolder: () => ({ ok: true }),
     classify: () => ({ ok: true }),
-    isAccountUsable: () => true,
+    isAccountUsable: () => (lockState ? lockState.isAccountUsable() : true), // once the lock state exists, the gate reads the REAL one
     hasAccount: () => true,
     hasDeviceIdentity: () => true,
     isOnline: () => true,
@@ -323,6 +332,66 @@ app.whenReady().then(async () => {
     row('inflight-repair-burst-answered', after.every((v) => v && v.accepted === false && v.reason === 'backing-off' && v.retryInMs > 0), after[0]);
   }
 
+  // ---- away, and back: an idle lock and the OS unlock must not re-open the flood ------------------------------------
+  // The door is still refusing and the window is shut (its one deliberate attempt is spent). Now the person walks
+  // away and comes back. This used to clear the back-off for every vault, so simply returning to the computer
+  // minted against a still-refusing door — twice per vault, because an emptied window also un-blocks the one-shot
+  // retry. Real idle poller over the real OS idle clock, the real lock transaction, the real OS unlock edge, and
+  // the shell's own handler. Costs the server NOTHING when it works, which is exactly the property being proven.
+  {
+    const stBefore = sch.refusalState(VID);
+    const m0 = mints; const q0 = credRequests.length; const e0 = events.length;
+    const signals = [];
+    lockState = new LockState({
+      getWindow: () => null,
+      getDaemon: () => null, // the zero-knowledge purge has nothing to purge here; this check owns the helper itself
+      onChange: (s) => {
+        signals.push(s);
+        // Wired exactly as the shell wires it: a lock drops the account-tier credential (main-side cache AND the
+        // helper's prepared config); a resume lifts the holds, opens the endpoint gate, and kicks a tick.
+        if (s === 'locked') { credCache.clear(); void mgr.clearSftpCred(5000).catch(() => null); }
+        if (s === 'account-active') { sch.releaseHolds(); sch.tickAll(); }
+      },
+      timeouts: { rendererTimeoutMs: 200, daemonTimeoutMs: 200, daemonAttempts: 1 },
+    });
+    const al = new AutoLock({
+      powerMonitor,                                  // the REAL OS input-idle clock
+      lockState,
+      getWindow: () => null,
+      idleThresholdMs: 1,                            // any idle fires on the first real poll (this run IS idle).
+                                                     // 1, not 0: the constructor takes `deps.idleThresholdMs ||
+                                                     // DEFAULT`, so a 0 would silently become the 15-minute policy
+                                                     // and this phase would measure nothing at all.
+      timers: { idlePollMs: 100, escalateAfterMs: 10 * 60 * 1000 },
+    });
+    al.start();
+    for (let i = 0; i < 60 && lockState.isAccountUsable(); i += 1) await sleep(100);
+    al.stop();                                       // the poll has done its job; the powerMonitor edges stay armed
+    row('away-idle-lock-fired', signals.includes('locked') && lockState.isAccountUsable() === false, { signals: signals.slice(), reason: lockState.snapshot().reason });
+
+    powerMonitor.emit('unlock-screen');               // the OS says the person is back — the real reverse edge
+    await sleep(300);
+    await settle(sch);
+    const stAfter = sch.refusalState(VID);
+    out.resume = { mints: mints - m0, credRequests: credRequests.length - q0, events: events.length - e0, before: stBefore, after: stAfter };
+    row('back-resume-fired', signals.includes('account-active') && lockState.isAccountUsable() === true, signals.slice());
+    row('resume-mints-nothing', mints - m0 === 0 && credRequests.length - q0 === 0, { mints: mints - m0, credRequests: credRequests.length - q0 });
+    row('resume-keeps-the-window', !!stBefore && !!stAfter && stAfter.until === stBefore.until && stAfter.failures === stBefore.failures && stAfter.reason === stBefore.reason, { before: stBefore, after: stAfter });
+    // releaseHolds still does its own job on the way through — a changed sync address is tried at once, not after
+    // the old one's back-off — so the endpoint gate is open even though the refusal window stands.
+    row('resume-still-opens-the-endpoint-gate', sch.endpointState().failures === 0, sch.endpointState());
+
+    // And it is not a one-off: a whole afternoon of stepping away and returning costs the server nothing either.
+    const m1 = mints; const q1 = credRequests.length;
+    for (let i = 0; i < 5; i += 1) {
+      await lockState.lock('idle');
+      powerMonitor.emit('unlock-screen');
+      await sleep(120);
+      await settle(sch);
+    }
+    row('repeated-resumes-mint-nothing', mints - m1 === 0 && credRequests.length - q1 === 0 && sch.refusalState(VID) !== null, { mints: mints - m1, credRequests: credRequests.length - q1, state: sch.refusalState(VID) });
+  }
+
   // The server's attempt window again, before the door is asked to accept a credential.
   await sleep(PACE_MS);
 
@@ -353,6 +422,6 @@ app.whenReady().then(async () => {
   out.ok = out.rows.every((r) => r.ok);
   clearTimeout(watchdog);
   dump();
-  process.stdout.write(`${out.ok ? 'PASS' : 'FAIL'} sync-cooldown-check (${out.rows.filter((r) => r.ok).length}/${out.rows.length}) storm=${JSON.stringify(out.storm && { presses: out.storm.presses, mints: out.storm.mints, refused: out.storm.refused })} refusal=${JSON.stringify(out.refusal && { mints: out.refusal.mints })} recovery=${JSON.stringify(out.recovery && { mints: out.recovery.mints, results: out.recovery.results })} totalMints=${out.totalMints}\n`);
+  process.stdout.write(`${out.ok ? 'PASS' : 'FAIL'} sync-cooldown-check (${out.rows.filter((r) => r.ok).length}/${out.rows.length}) storm=${JSON.stringify(out.storm && { presses: out.storm.presses, mints: out.storm.mints, refused: out.storm.refused })} refusal=${JSON.stringify(out.refusal && { mints: out.refusal.mints })} resume=${JSON.stringify(out.resume && { mints: out.resume.mints, credRequests: out.resume.credRequests })} recovery=${JSON.stringify(out.recovery && { mints: out.recovery.mints, results: out.recovery.results })} totalMints=${out.totalMints}\n`);
   app.exit(out.ok ? 0 : 1);
 }).catch(async (e) => { out.fatal = scrub(String((e && e.stack) || e)); await teardown(); dump(); app.exit(2); });

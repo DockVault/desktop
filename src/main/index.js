@@ -122,6 +122,9 @@ let uiSession = null;
 // session metadata. The bundle is re-validated against the server by the UI's own boot check.
 const SESSION_KEYS = ['authToken', 'currentUser', 'userPermissions', 'isScopedTemp'];
 let sessionBundle = null;
+// Whether the UI carried an account session at the LAST successful capture, so a sign-in can be told apart from
+// the steady state of being signed in. null until the first successful read; a read that throws leaves it alone.
+let hadAccountSession = null;
 let captureTimer = null;
 let restored = false; // the session is seeded once per run (on the first window); tray reopens keep it
 let daemon = null;    // the supervised background sync daemon (a forked utility child)
@@ -320,6 +323,10 @@ async function boot() {
       // can re-mint. Keyed on the account-tier signal, never the zero-knowledge 'unlocked' event, so the sync path
       // stays independent of the zero-knowledge key. 'account-active' asserts NO zero-knowledge key; the lock UI is
       // untouched.
+      // Note what this resume does NOT do: it lifts the holds and opens the endpoint gate, but it leaves the
+      // per-vault refusal back-off standing. Returning to the computer says nothing about a server that is
+      // actively turning this computer's credentials away, and clearing the window here re-minted against that
+      // still-refusing door on every idle resume — the credential flood, re-opened by walking away for a while.
       if (s === 'account-active') { deviceUnreadableStreak = 0; if (syncScheduler) syncScheduler.releaseHolds(); void maybeOfferSyncSetup(); void maybeOfferDeviceMigration(); void tickSync(); } // unlock resets the escape-hatch streak: a lock episode never counts toward the reset offer
       refreshTray();
     },
@@ -443,7 +450,22 @@ async function captureSession() {
     const bundle = await win.webContents.executeJavaScript(
       `(() => { const keys = ${JSON.stringify(SESSION_KEYS)}, o = {};`
       + ` for (const k of keys) { const v = localStorage.getItem(k); if (v != null) o[k] = v; } return o; })()`, true);
-    if (bundle && bundle.authToken) tokenStore.persistSession(safeStorage, dir, bundle);
+    const signedIn = !!(bundle && bundle.authToken);
+    // A genuine sign-IN — there was no account session a moment ago and now there is. Where the door turned the
+    // CREDENTIAL away, it was answering about one minted from a session that has since ended, so it says nothing
+    // about the one being presented now: forget those windows and let the next tick actually try. This is the
+    // "signing in lets it try at once" our own status sentence promises; without it that sentence was simply
+    // untrue, and a person told to sign in would watch nothing happen.
+    //
+    // Only the credential refusals, though — a server that is limiting attempts is left alone, because a fresh
+    // sign-in does not change its mind and the retry would just spend another credential against the limit
+    // doing the refusing (which is, word for word, what we tell the person in that state). And only the EDGE
+    // acts: the steady state of being signed in changes nothing, so a poll every half minute cannot walk
+    // credentials out through it. A read that failed leaves `hadAccountSession` untouched (the catch below), so
+    // a window in which the page could not be asked never reads as a sign-out and then a sign-in.
+    if (signedIn && hadAccountSession === false && syncScheduler) syncScheduler.clearCredentialRefusals();
+    hadAccountSession = signedIn;
+    if (signedIn) tokenStore.persistSession(safeStorage, dir, bundle);
     else {
       // Sign-out: the account session ended, so the SFTP credential derived from it is now invalid — clear
       // the persisted session AND the sync credential (main cache + the helper's prepared config), and drop
@@ -793,6 +815,7 @@ async function resetDeviceIdentity() {
     invalidateMigrationView();
     deviceUnreadableStreak = 0;    // the identity is gone; the streak starts fresh if a new one later turns unreadable
     deviceIdentityStale = false;   // nothing to present any more
+    syncIdentityChanged();         // the refusals on record were about the identity just removed
     try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ }
     refreshTray();
     void tickSync();
@@ -861,6 +884,9 @@ async function runDeviceSetupAgain() {
     }, recorded);
     deviceUnreadableStreak = 0;
     deviceIdentityStale = false;
+    // A brand-new identity with brand-new grants. Without this the tick below is silently swallowed by the OLD
+    // identity's refusal window — for up to an hour — while the dialog underneath says it is syncing now.
+    syncIdentityChanged();
     try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ }
     refreshTray();
     void tickSync();
@@ -1186,6 +1212,21 @@ function deviceIdentityStatus() {
 const DEVICE_UNREADABLE_RESET_THRESHOLD = 3; // ~15 min at the 5-min tick, so a transient lock clears first
 let deviceUnreadableStreak = 0;
 
+// This computer's sync identity has CHANGED — it went stale, the server ended it, it was dropped here, or a
+// FRESH one was just registered in its place. Every answer the door gave about the old credential is spent
+// history: it was about a secret this computer can no longer present, and holding the new one to it would make
+// the app's own remedy ("set this computer up again") appear to do nothing for up to an hour. So lift the
+// settled holds, open the endpoint gate, and forget the refusal back-off.
+//
+// Deliberately ONE function rather than the two calls written out at each site: the failure mode here is a new
+// identity path that quietly clears NEITHER, which is invisible in review because it looks like no code at all.
+// A mere presence resume is NOT this — it gets releaseHolds() alone (see sync-scheduler.js).
+function syncIdentityChanged() {
+  if (!syncScheduler) return;
+  syncScheduler.releaseHolds();
+  syncScheduler.clearRefusalBackoff();
+}
+
 // One sync pass: refresh the run-state view from the helper, drop any expired credentials (clearing the
 // helper's now-stale slot too), then let the scheduler decide each configured vault. A manual pass
 // ("Sync now") asks for each enabled vault ahead of the routine queue; a routine pass ticks them all. The
@@ -1193,6 +1234,7 @@ let deviceUnreadableStreak = 0;
 // but only enabled vaults are dispatched — matching the routine tick. Every dispatch is still gated
 // (locked / offline / signed-out / uncertain → a calm skip), so this is safe to run on a timer regardless
 // of state — and a no-config tick is simply a no-op.
+
 async function tickSync({ manual = false } = {}) {
   if (!syncScheduler || !runStateSnapshot) return;
   // Feed the online signal to the STATUS hub, not only the scheduler's dispatch gate, from the one source —
@@ -1485,6 +1527,11 @@ function startSyncScheduler() {
       // The server has ended this computer's identity (removed by the owner, or expired): the local secret can
       // never be presented again, so it is wiped now — the state database is left alone, and the recorded grant
       // details stay for the next set-up. The refusal itself is still recorded and held below.
+      // Deliberately NOT syncIdentityChanged() even though the identity has ended: this runs inside the
+      // scheduler's own event sink, and the hold that carries this very reason was set as the event was
+      // emitted — lifting it here would erase it and re-dispatch the vault on every tick from now on. The
+      // refusal is recorded and held below; the person's next action (setting this computer up again) is what
+      // clears it, and that path does call it.
       if (ev && (ev.phase === 'refused' || ev.phase === 'paused' || ev.phase === 'skipped') && identityEndedBy(ev.reason)) {
         try { deviceSecretStore.clearDeviceSecret(dir); } catch { /* best effort; the next read re-decides */ }
         deviceIdentityStale = false;
@@ -1638,7 +1685,7 @@ async function tickDeviceRefresh() {
     if (identityIsStaleAfter(r)) {
       deviceIdentityStale = true;
       deviceSecretStore.markDeviceSecretStale(dir); // durable: survives a restart, so the boot kick never presents the retired secret
-      if (syncScheduler) syncScheduler.releaseHolds();
+      syncIdentityChanged();
       void tickSync(); // let the next pass show the honest state rather than wait for the routine tick
     }
   } catch { /* a rotation never throws; belt-and-suspenders */ }
@@ -1676,12 +1723,12 @@ async function reconcileSurvivedRotation(dir, origin) {
     deviceSecretStore.markDeviceSecretStale(dir);              // the server rotated and this side lost the answer → retired
     deviceSecretStore.clearDeviceSecretRotating(dir);          // drop the rotating mark so the state is unambiguously stale (no longer "being re-checked")
     deviceIdentityStale = true;
-    if (syncScheduler) syncScheduler.releaseHolds();
+    syncIdentityChanged();
     changed = true;
   } else if (decision === 'revoked') {
     deviceSecretStore.clearDeviceSecret(dir);                  // the device row is GONE → wipe the identity so it reads as REMOVED ("set it up again"), not merely "not recognised"
     deviceIdentityStale = false;                               // nothing to present; the blob is gone
-    if (syncScheduler) syncScheduler.releaseHolds();
+    syncIdentityChanged();
     changed = true;
   } // 'keep' → leave the mark untouched; retry next pass (no state change → no tick, so the sign-in kick can't loop)
   if (changed) { try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ } void tickSync(); }
@@ -1854,6 +1901,10 @@ function buildDeviceEnableIo(vault) {
       const accountToken = await resolveAccountToken();
       try { await deviceRegister.forgetDevice({ serverOrigin: origin, accountToken, dir, safeStorage }, { fetchFn: mainHttpJson }); }
       catch { /* forgetDevice never throws; belt-and-suspenders */ }
+      // Stated HERE rather than left to the caller: the identity is gone the moment this returns, whether or not
+      // the registration that usually follows goes on to succeed. A switch whose register then fails would
+      // otherwise keep the old server's refusals holding vaults it can no longer say anything about.
+      syncIdentityChanged();
       try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* the identity is now absent → refresh the glance */ }
     },
     promptLabel: async () => {
@@ -1876,7 +1927,7 @@ function buildDeviceEnableIo(vault) {
       // registerDevice runs the fail-safe order itself (pre-check store → POST → store → orphan-clean the
       // server row on ANY post-POST failure), so there is no second revoke path to add here.
       const r = await deviceRegister.registerDevice({ serverOrigin: origin, accountToken, label, dir, safeStorage }, { fetchFn: mainHttpJson });
-      if (r && r.ok) { deviceId = r.deviceId; try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* now present → refresh */ } }
+      if (r && r.ok) { deviceId = r.deviceId; syncIdentityChanged(); try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* now present → refresh */ } }
       return r;
     },
     grantVault: async ({ vaultId, vaultName, hasPassword }) => {
@@ -2572,7 +2623,7 @@ function buildManageIo() {
       try { if (credCache) credCache.clear(); } catch { /* best-effort */ }
       deviceIdentityStale = false;
       deviceUnreadableStreak = 0;
-      if (syncScheduler) syncScheduler.releaseHolds(); // a hold from an earlier device reason must not outlive the identity
+      syncIdentityChanged();
     },
     syncNow: (vaultId) => syncVaultNow(vaultId),
     afterChange: () => {
@@ -2595,6 +2646,10 @@ function buildWizardIo(win) {
   const base = buildEnableIo();
   const dev = buildDeviceEnableIo(null);
   let existingLabels = [];
+  // NOT syncIdentityChanged(): the wizard signals this at the end of its grant-only flows too, where this
+  // computer's identity did not change at all. Clearing the back-off there would let anyone empty a
+  // rate-limited server's wait at will, just by adding another folder — the flood, through a wider door.
+  // The one place the wizard DOES create an identity is register(), which calls it there.
   const reflect = () => {
     try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ }
     invalidateMigrationView();
@@ -3181,4 +3236,7 @@ async function forgetServerRelationship(origin) {
   // The saved address goes too, so a quit and relaunch mid-switch lands on the setup screen with the
   // tray reading "Not connected", never back on the old server's sign-in.
   try { serverConfig.removeServerOrigin(dir); } catch { /* best effort */ }
+  // Everything this computer synced through that server is gone, identity included. Whatever its door said
+  // about a credential belongs to it, so it must not hold a vault set up against whatever comes next.
+  syncIdentityChanged();
 }

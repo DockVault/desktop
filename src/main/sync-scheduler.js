@@ -67,6 +67,9 @@ const ENDPOINT_BACKOFF_MAX_MS = 60 * 60 * 1000;
 // The refusal class that backs off PER VAULT: the door answered, and turned this computer's credential away.
 // (A connect-class failure is the shared endpoint gate above; a settled device-side refusal is a hold.)
 const REFUSAL_RESULTS = new Set(['auth-failed', 'channel-refused']);
+// The run results that are this computer's OWN safety guard stopping the run, not the server's answer to a
+// credential. They teach the refusal back-off nothing either way, so they must neither open it nor clear it.
+const SELF_ABORT_RESULTS = new Set(['abort-excessive-delete', 'abort-all-changed']);
 // The run results that MIGHT be the vault running out of room, and are worth one read of the vault's own
 // record to find out. The SFTP door decides at close whether to keep an upload and the protocol gives a close
 // no way to say no, so the client sees only that the file is not there ('upload-not-stored'), or a bare
@@ -145,6 +148,15 @@ class SyncScheduler {
     r.reason = reason;
     r.until = this._now() + Math.min(REFUSAL_BACKOFF_BASE_MS * (2 ** (r.failures - 1)), REFUSAL_BACKOFF_MAX_MS);
     r.manualAllowed = !manual;
+    // Whether SIGNING IN could plausibly change this particular answer — decided here, while the two facts that
+    // settle it are still to hand, because the refusal outlives the run. Only a plain account-session refusal
+    // qualifies. A door refusing this computer's DEVICE identity is never an account matter (the app does not
+    // even ask for a sign-in there, it re-checks the device's own standing), and a vault whose password may have
+    // rotated wants that password, not a session. Recorded alongside the reason rather than folded into it, so
+    // every existing reader of `reason` — the glance, the card, the answer a press earns — is untouched.
+    r.signInMayHelp = reason === 'auth-failed'
+      && !(typeof this._io.credentialPath === 'function' && this._io.credentialPath(vaultId) === 'device')
+      && !(typeof this._io.vaultHasPassword === 'function' && this._io.vaultHasPassword(vaultId));
     this._refusal.set(vaultId, r);
   }
 
@@ -203,10 +215,57 @@ class SyncScheduler {
   held(vaultId) { return this._held.get(vaultId) || null; }
 
   /**
-   * Lift every hold (a sign-in, an unlock, or a set-up change may have changed the server's answer) — and open
-   * the endpoint gate: a changed SFTP address must be tried at once, not after the old address's back-off.
+   * Lift every settled hold and open the endpoint gate. This is what coming BACK to the computer — an unlock, a
+   * resume from an idle lock, a set-up change — is entitled to change: a held reason may have been dealt with
+   * while the screen was locked, and a changed SFTP address must be tried at once rather than waiting out the
+   * old address's back-off.
+   *
+   * What it deliberately does NOT touch is the per-vault refusal back-off. That window records a door that
+   * ANSWERED and turned this computer's credential away — a fact about the server, and one that walking back to
+   * the laptop cannot have changed. Clearing it here re-minted against a still-refusing server on EVERY idle
+   * resume (twice per vault, in fact: an emptied back-off also un-blocks the one-shot auth retry), which is
+   * exactly the credential burst the back-off exists to stop. The window still ends on its own, a deliberate
+   * press still gets the one attempt it holds, and a run the door ACCEPTS clears it outright; only a genuine
+   * identity change forgets it early, through clearRefusalBackoff().
    */
-  releaseHolds() { this._held.clear(); this._clearConnectFailures(); this._refusal.clear(); }
+  releaseHolds() { this._held.clear(); this._clearConnectFailures(); }
+
+  /**
+   * Forget every per-vault refusal back-off. For the case where the refusals on record were the door's answers
+   * about a credential this computer can no longer present — a sign-in under a different session, or an identity
+   * that went stale, was revoked, was dropped here, or was just replaced by a fresh registration: what the server
+   * said about the old one teaches nothing about the next. NOT for a mere presence resume; see releaseHolds().
+   *
+   * The one-shot auth retry (`_authRetried`) is deliberately NOT cleared here. That retry exists for one narrow
+   * thing — a credential that lapsed or was spent in the instant it was presented — and not for a fresh identity,
+   * which has no such race to lose, so handing it back would only widen the burst that follows: each caller of
+   * this kicks a tick across every configured vault, against the very per-computer cap the back-off protects.
+   * On the account path that holds the vault to one credential here. On the DEVICE path it does not, because a
+   * device auth refusal already forgets the one-shot as it is routed to its own state — so those vaults still
+   * cost two. Not clearing it is what keeps that from being two everywhere.
+   */
+  clearRefusalBackoff() { this._refusal.clear(); }
+
+  /**
+   * Forget only the refusal back-offs a NEW ACCOUNT SESSION could plausibly change — the ones where the door
+   * turned the CREDENTIAL away ('auth-failed'), which a dead or replaced session genuinely explains. This is
+   * what a sign-in is entitled to; it is not an identity change, so it is deliberately narrower than
+   * clearRefusalBackoff().
+   *
+   * Which refusals those are is decided when each one is recorded (see `signInMayHelp` in _noteRefusal): a
+   * device identity refused at the door, and a vault whose password may have rotated, are both left standing
+   * too — a new account session says nothing about either, and the app never offers a sign-in for them.
+   *
+   * A refused session CHANNEL is left standing, and that is the whole point of separating them. There the
+   * server ANSWERED and is limiting what it will accept from this computer — no session slot free, an attempt
+   * cap — and a fresh sign-in changes nothing about that: the next attempt is refused too, having spent one
+   * more credential against the very limit doing the refusing. It is also exactly what the app tells the
+   * person in that state ("signing in again won't help — the wait is what clears it"), so clearing it here
+   * would both re-open the flood and make our own sentence a lie.
+   */
+  clearCredentialRefusals() {
+    for (const [vaultId, r] of this._refusal) if (r && r.signInMayHelp === true) this._refusal.delete(vaultId);
+  }
 
   // Enqueue a request, coalescing per vault. A request for the IN-FLIGHT vault is dropped (the running
   // dispatch already serves it). A manual request is ordered ahead of routine ticks and upgrades an
@@ -494,7 +553,11 @@ class SyncScheduler {
       // connect-class result closes it (the next dispatch probes instead of minting); any run that actually
       // reached the server — refused or not — opens it again.
       if (refused) this._noteRefusal(vaultId, !!item.manual, outcome.result);
-      else if (outcome && outcome.ran === true) this._refusal.delete(vaultId);
+      // A data-safety abort is NOT the door accepting a credential — it is this computer's own guard refusing to
+      // carry the run out. Since a refused run whose log also carries an abort is named for the abort (the more
+      // serious event), tearing the window down here would let each deliberate Repair press mint afresh at the
+      // bottom of the schedule, against a door that is still refusing.
+      else if (outcome && outcome.ran === true && !SELF_ABORT_RESULTS.has(outcome.result)) this._refusal.delete(vaultId);
       if (outcome && CONNECT_RESULTS.has(outcome.result)) this._noteConnectFailure(outcome.result === 'host-key-mismatch' ? 'host-key-mismatch' : 'sync-server-unreachable');
       else if (outcome && outcome.ran === true) this._clearConnectFailures();
       // a persistent auth-failed (past its one retry) for a PASSWORD-PROTECTED vault is far more likely a

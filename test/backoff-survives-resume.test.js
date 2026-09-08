@@ -1,0 +1,425 @@
+'use strict';
+
+/*
+ * A refusal back-off must outlive walking away from the computer.
+ *
+ * The per-vault refusal back-off records a door that ANSWERED and turned this computer's credential away. That
+ * is a fact about the SERVER. Returning to the laptop after an idle lock cannot have changed it — yet the resume
+ * used to wipe the back-off for every vault, so each time the screen woke up the scheduler minted against the
+ * still-refusing door again (twice per vault, in fact: an emptied window also un-blocks the one-shot auth retry).
+ * A person who left their laptop for lunch came back to a fresh burst of spent credentials, counting against the
+ * very limit that was refusing them.
+ *
+ * The whole real chain is exercised here — the real idle poller, the real lock state, the real scheduler — and
+ * the shell's own wiring is checked against its source, so the behavioural proof below cannot pass while
+ * index.js quietly goes back to clearing the window on a resume.
+ *
+ * The second half covers the fail-closed ordering in the outcome classifier: a data-safety abort carries a latch
+ * that holds the vault until a person deliberately repairs it, and no connection phrase in the same output may
+ * take the result and drop that latch with it.
+ */
+
+const test = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const { SyncScheduler, REFUSAL_BACKOFF_BASE_MS } = require('../src/main/sync-scheduler');
+const { LockState } = require('../src/main/lock-state');
+const { AutoLock } = require('../src/main/auto-lock');
+const { classifyBisyncOutcome, classifyConnectionFailure, RESULT } = require('../src/daemon/bisync-outcome');
+const { turnedAwayBody } = require('../src/main/manual-sync-copy');
+
+const vault = (id) => ({ vaultId: id, vaultName: id.toUpperCase(), localFolder: `/folders/${id}`, remotePath: id.toUpperCase(), enabled: true });
+const CHANNEL_REFUSED = async () => ({ result: 'channel-refused', ran: true, resyncRequired: null, needsAttention: true });
+
+// The scheduler over injected IO, with the account-tier session gate reading a REAL LockState.
+function harness(lockState, over = {}) {
+  const log = [];
+  const calls = { refreshCred: [], runSync: [] };
+  let clock = 1_000_000;
+  const sch = new SyncScheduler({
+    listConfigured: () => [vault('a')],
+    runState: () => ({ lastResult: 'ok', resyncRequired: false }),
+    session: () => ({ locked: !lockState.isAccountUsable(), online: true, accountLive: true }),
+    verifyEligible: async (v) => ({ ok: true, remotePath: v.toUpperCase() }),
+    secureFolder: () => ({ ok: true }),
+    classify: () => ({ ok: true }),
+    helperReady: async () => ({ ok: true }),
+    refreshCred: async (v) => { calls.refreshCred.push(v); return { ok: true }; },
+    runSync: over.runSync || CHANNEL_REFUSED,
+    runResync: async () => ({ result: 'resync-ok', ran: true }),
+    credentialPath: over.credentialPath === null ? undefined : (over.credentialPath || (() => 'device')),
+    vaultHasPassword: over.vaultHasPassword,
+    now: () => clock,
+    onEvent: (vaultId, ev) => { log.push({ vaultId, ...ev }); },
+  });
+  return { sch, log, calls, advance: (ms) => { clock += ms; }, now: () => clock };
+}
+async function settle(sch) { for (let i = 0; i < 300 && (sch._busy || sch._queue.length); i += 1) await new Promise((r) => setTimeout(r, 2)); }
+const last = (log, id) => log.filter((e) => e.vaultId === id).pop();
+
+// The real idle poller over the real lock state, with the poll and escalation timers handed to the test so an
+// idle stretch and the return of input can be driven exactly.
+function idlePoller(lockState) {
+  const captured = { poll: null };
+  const power = {
+    idle: 0,
+    _h: {},
+    on(ev, cb) { (this._h[ev] = this._h[ev] || []).push(cb); },
+    getSystemIdleTime() { return this.idle; },
+  };
+  const al = new AutoLock({
+    powerMonitor: power,
+    lockState,
+    getWindow: () => null,
+    idleThresholdMs: 1000,
+    timers: { idlePollMs: 10, escalateAfterMs: 100_000 },
+    setIntervalFn: (fn) => { captured.poll = fn; return { id: 'poll' }; },
+    clearIntervalFn: () => {},
+    setTimeoutFn: () => ({ id: 'esc' }),
+    clearTimeoutFn: () => {},
+  });
+  al.start();
+  return { power, poll: () => captured.poll() };
+}
+
+test('a vault on a refusal back-off survives an idle auto-resume: the real lock/resume chain re-mints NOTHING', async () => {
+  const signals = [];
+  const lockState = new LockState({
+    getWindow: () => null,
+    getDaemon: () => null,
+    onChange: (s) => {
+      signals.push(s);
+      // The shell's own handler, wired exactly as index.js wires it: a resume lifts the holds and opens the
+      // endpoint gate, then kicks a tick. It does NOT touch the refusal back-off.
+      if (s === 'account-active') { sch.releaseHolds(); sch.tickAll(); }
+    },
+    timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 },
+  });
+  const h = harness(lockState);
+  const { sch } = h;
+  const { power, poll } = idlePoller(lockState);
+
+  // The door refuses. One run, one race retry, and then the window is on record.
+  sch.requestSync('a'); await settle(sch);
+  assert.strictEqual(last(h.log, 'a').outcome.result, 'channel-refused');
+  const beforeIdle = h.calls.refreshCred.length;
+  const eventsBeforeIdle = h.log.length;
+  assert.strictEqual(beforeIdle, 2, 'the refused run and its one race retry — and no more');
+  const window = sch.refusalState('a');
+  assert.ok(window && window.until > h.now(), 'the refusing door is on record with a live window');
+
+  // AWAY: the idle clock crosses the threshold and the real lock transaction runs.
+  power.idle = 2; poll();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(signals.includes('locked'), 'the idle stretch locked, through the real lock state');
+  assert.strictEqual(lockState.isAccountUsable(), false);
+
+  // BACK: input returns, the poller reverses the idle lock, and the shell handler runs for real.
+  power.idle = 0; poll();
+  await new Promise((r) => setTimeout(r, 20));
+  await settle(sch);
+  assert.ok(signals.includes('account-active'), 'the return of input resumed the account tier');
+  assert.strictEqual(lockState.isAccountUsable(), true);
+
+  // THE POINT: nothing was minted by coming back, and the window is intact.
+  assert.strictEqual(h.calls.refreshCred.length, beforeIdle, 'the resume minted NOT ONE credential against the refusing door');
+  const after = sch.refusalState('a');
+  assert.deepStrictEqual(
+    { failures: after.failures, until: after.until, reason: after.reason },
+    { failures: window.failures, until: window.until, reason: window.reason },
+    'the window survived the resume unchanged — same count, same end, same cause',
+  );
+  assert.strictEqual(h.log.length, eventsBeforeIdle, 'the post-resume tick emitted nothing at all: a vault inside its window is passed over before it is even queued');
+  assert.deepStrictEqual({ phase: last(h.log, 'a').phase, result: last(h.log, 'a').outcome.result }, { phase: 'done', result: 'channel-refused' }, 'so the glance still carries the refusal, which IS the honest current answer');
+
+  // And a whole afternoon of leaving and returning is still nothing: the old behaviour minted twice EACH time.
+  for (let i = 0; i < 8; i += 1) {
+    power.idle = 2; poll(); await new Promise((r) => setTimeout(r, 15));
+    power.idle = 0; poll(); await new Promise((r) => setTimeout(r, 15));
+    await settle(sch);
+  }
+  assert.strictEqual(h.calls.refreshCred.length, beforeIdle, 'eight more lock/resume cycles: still not one credential');
+});
+
+test('the window still ends on its own, and the ONE attempt it holds is still there for a person who presses', async () => {
+  let refuse = true;
+  const lockState = new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+  const h = harness(lockState, { runSync: async (spec) => (refuse ? CHANNEL_REFUSED(spec) : { result: 'ok', ran: true }) });
+  const { sch } = h;
+  sch.requestSync('a'); await settle(sch);
+  const mints = () => h.calls.refreshCred.length;
+  const opened = mints();
+
+  // A deliberate press inside the window still gets through once (the window was opened by a routine tick).
+  sch.releaseHolds(); // a resume, mid-window, changes none of this
+  assert.deepStrictEqual(sch.requestSync('a', { manual: true }), { accepted: true }, 'the window keeps its one deliberate attempt across a resume');
+  await settle(sch);
+  assert.strictEqual(mints(), opened + 1);
+  assert.strictEqual(sch.requestSync('a', { manual: true }).accepted, false, 'and only the one');
+
+  // The window lapses on its own and a routine tick tries again — the back-off was a wait, never a wall.
+  refuse = false;
+  h.advance(REFUSAL_BACKOFF_BASE_MS * 4 + 1);
+  sch.tickAll(); await settle(sch);
+  assert.strictEqual(last(h.log, 'a').outcome.result, 'ok');
+  assert.strictEqual(sch.refusalState('a'), null, 'a run the door ACCEPTED clears the record — the one answer that does');
+});
+
+test('releaseHolds still does its own job: settled holds lift and the endpoint gate opens (a changed address is tried at once)', async () => {
+  const lockState = new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+  const h = harness(lockState, { runSync: async () => ({ result: 'connect-failed', ran: true, resyncRequired: null, needsAttention: true }) });
+  const { sch } = h;
+  sch.requestSync('a'); await settle(sch);
+  assert.ok(sch.endpointState().failures > 0, 'the door could not be reached: the endpoint gate closed');
+  sch._held.set('a', 'device-revoked');
+
+  sch.releaseHolds();
+  assert.strictEqual(sch.held('a'), null, 'the settled hold lifted');
+  assert.deepStrictEqual(sch.endpointState(), { failures: 0, reason: null, until: 0 }, 'and the endpoint gate opened, so a changed address is tried at once');
+});
+
+test('clearRefusalBackoff re-opens the door without also handing back the spent race retry', async () => {
+  const authFailed = async () => ({ result: 'auth-failed', ran: true, resyncRequired: null, needsAttention: true });
+  const lockState = () => new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+
+  // ACCOUNT path: the episode KEEPS its spent one-shot across the refusal, so not clearing it is what holds
+  // the re-opened door to a single credential.
+  const acct = harness(lockState(), { runSync: authFailed, credentialPath: null });
+  acct.sch.requestSync('a'); await settle(acct.sch);
+  assert.strictEqual(acct.calls.refreshCred.length, 2, 'the refused run and its one race retry');
+  assert.ok(acct.sch._authRetried.has('a'), 'this episode has spent its race retry');
+  acct.sch.clearRefusalBackoff();
+  assert.strictEqual(acct.sch.refusalState('a'), null, 'the window is forgotten: the next attempt is not held by it');
+  assert.deepStrictEqual(acct.sch.requestSync('a'), { accepted: true });
+  await settle(acct.sch);
+  assert.strictEqual(acct.calls.refreshCred.length, 3, 'ONE credential for the re-opened door, not two');
+  assert.ok(acct.sch.refusalState('a'), 'and a door still refusing goes straight back on record');
+
+  // DEVICE path: the honest limit of that. A device auth refusal is routed to its own state and forgets the
+  // one-shot on the way, so this vault DOES cost two. Not clearing `_authRetried` is what keeps two from being
+  // the number everywhere — it is not a claim that one is the number here.
+  const dev = harness(lockState(), { runSync: authFailed });
+  dev.sch.requestSync('a'); await settle(dev.sch);
+  assert.strictEqual(dev.calls.refreshCred.length, 2);
+  assert.strictEqual(dev.sch._authRetried.has('a'), false, 'the device path already forgot the one-shot itself');
+  dev.sch.clearRefusalBackoff();
+  dev.sch.requestSync('a'); await settle(dev.sch);
+  assert.strictEqual(dev.calls.refreshCred.length, 4, 'so the device path costs a run plus its retry — stated, not hidden');
+});
+
+test('the shell wires it that way: the presence resume releases holds only, and EVERY identity change goes through the one helper', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.js'), 'utf8');
+
+  // The presence resume: holds lifted, endpoint gate opened, back-off untouched. Checked over the WHOLE
+  // handler statement, not one line, so moving the wipe onto the next line cannot slip past.
+  const resumeAt = src.indexOf("if (s === 'account-active')");
+  assert.ok(resumeAt > 0, 'the account-active branch is there');
+  const resumeStmt = src.slice(resumeAt, src.indexOf('\n', src.indexOf('refreshTray();', resumeAt)));
+  assert.match(resumeStmt, /releaseHolds\(\)/, 'the resume lifts the holds and opens the endpoint gate');
+  assert.doesNotMatch(resumeStmt, /clearRefusalBackoff|syncIdentityChanged/, 'and never wipes the refusal back-off — the bug this fixes');
+
+  // Everything that CHANGES this computer's sync identity goes through the one named helper. Naming each
+  // function is the point: the regression this guards against is a new identity path that quietly calls
+  // NEITHER method, which no grep for an existing call can ever see — it looks like no code at all.
+  const identityChanges = [
+    'async function resetDeviceIdentity() {',      // "reset this computer's sync identity"
+    'async function runDeviceSetupAgain() {',      // "set this computer up again" — a FRESH identity + grants
+    'async function tickDeviceRefresh() {',        // the held secret turned out to be retired
+    'async function reconcileSurvivedRotation(',   // a rotation this side lost the answer to: stale or revoked
+    '    register: async (label) => {',            // the wizard registering this computer for the first time
+    '    dropLocalIdentity: () => {',              // the server ended the identity; the Computers window drops it
+    'async function forgetServerRelationship(',    // the whole relationship with a server, identity included
+    '    forget: async () => {',                   // the identity is gone whether or not a re-register follows
+  ];
+  for (const anchor of identityChanges) {
+    const at = src.indexOf(anchor);
+    assert.ok(at > 0, `still present: ${anchor.trim()}`);
+    // The body runs to the closing brace at the anchor's own indentation.
+    const indent = anchor.slice(0, anchor.search(/\S/));
+    const end = src.indexOf(`\n${indent}}`, at);
+    const body = src.slice(at, end === -1 ? src.length : end);
+    assert.match(body, /syncIdentityChanged\(\)/, `an identity change clears holds AND the back-off: ${anchor.trim()}`);
+  }
+
+  // A genuine sign-IN clears the back-off — the refusals were answers about a credential from a session that
+  // has ended — but it is NOT an identity change, so it must not lift the settled holds along with it.
+  const signIn = src.split(/\r?\n/).find((l) => l.includes('hadAccountSession === false'));
+  assert.ok(signIn, 'the sign-in edge is wired');
+  assert.match(signIn, /clearCredentialRefusals\(\)/, 'signing in lets it try at once — which is what the status sentence promises');
+  assert.doesNotMatch(signIn, /clearRefusalBackoff|releaseHolds|syncIdentityChanged/, 'but narrowly: a sign-in is not an identity change, lifts no settled hold, and never clears a server that is limiting attempts');
+
+  // Outside those, the primitives are reached only through the helper, so no site can half-wire itself by
+  // calling one of them directly and forgetting the other.
+  const direct = src.split(/\r?\n/)
+    .filter((l) => !l.trim().startsWith('//'))
+    .filter((l) => /releaseHolds\(\)|clearRefusalBackoff\(\)/.test(l));
+  assert.strictEqual(direct.length, 3, 'the resume, and the helper’s own two calls — nothing else');
+});
+
+test("a run stopped by this computer's OWN safety guard neither opens the refusal window nor tears it down", async () => {
+  // Naming the abort (the more serious event) must not cost the refusing door its place on record. Otherwise
+  // each deliberate Repair press starts the wait again from the bottom of the schedule and mints against a
+  // server that is still refusing — the flood, re-entered through the repair button.
+  const lockState = new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+  let result = 'channel-refused';
+  const h = harness(lockState, { runSync: async () => ({ result, ran: true, resyncRequired: result.startsWith('abort') ? true : null, needsAttention: true }) });
+  const { sch } = h;
+  sch.requestSync('a'); await settle(sch);
+  const opened = sch.refusalState('a');
+  assert.ok(opened, 'the refusing door is on record');
+
+  // The next run is refused AND trips the delete guard, so it is named for the abort.
+  result = 'abort-excessive-delete';
+  h.advance(REFUSAL_BACKOFF_BASE_MS * 8);
+  sch.tickAll(); await settle(sch);
+  assert.strictEqual(last(h.log, 'a').outcome.result, 'abort-excessive-delete', 'the mass delete is what the person is told about');
+  const after = sch.refusalState('a');
+  assert.ok(after, 'and the door is still on record — an abort is not the server accepting a credential');
+  assert.strictEqual(after.failures, opened.failures, 'neither lengthened by it nor reset to the bottom of the schedule');
+
+  // A run the door actually serves still clears it, exactly as before.
+  result = 'ok';
+  h.advance(REFUSAL_BACKOFF_BASE_MS * 8);
+  sch.tickAll(); await settle(sch);
+  assert.strictEqual(sch.refusalState('a'), null, 'the one answer that does clear it');
+});
+
+test('a green run is never given a repair it did not earn', () => {
+  // The data-safety latch is carried through a connection verdict, but only off a FAILED run: a run that
+  // exited green established its own baseline, and latching there would put a vault behind a Repair for nothing.
+  const both = `${HOST_KEY}\n${DELETE_ABORT}`;
+  assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: both }).resyncRequired, true, 'a failed run keeps the abort it owes');
+  assert.strictEqual(classifyBisyncOutcome({ code: 0, stderr: both }).resyncRequired, null, 'a green one demands nothing new');
+});
+
+test('a sign-in clears ONLY the refusals a sign-in could actually fix', async () => {
+  const ls = () => new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+
+  // The one a new account session genuinely explains: the account's own credential was refused. No device
+  // identity in play, no vault password that could have rotated underneath it.
+  const account = harness(ls(), { credentialPath: null });
+  account.sch._noteRefusal('a', false, 'auth-failed');
+  account.sch.clearCredentialRefusals();
+  assert.strictEqual(account.sch.refusalState('a'), null, 'a plain account-session refusal: signing in may well fix it');
+
+  // The three that it cannot, each left exactly where it was. Getting any of these wrong re-opens the flood at
+  // every sign-in — and against the very limit doing the refusing.
+  const cases = [
+    ['a server limiting attempts', harness(ls()), 'channel-refused', 'the wait is what clears it — we say so in as many words'],
+    ["this computer's device identity", harness(ls()), 'auth-failed', 'a refused device secret is not an account matter; the app never asks for a sign-in there'],
+    ['a vault whose password may have rotated', harness(ls(), { credentialPath: null, vaultHasPassword: () => true }), 'auth-failed', 'that wants the vault password, not a session'],
+  ];
+  for (const [what, h, reason, why] of cases) {
+    h.sch._noteRefusal('a', false, reason);
+    const before = h.sch.refusalState('a');
+    h.sch.clearCredentialRefusals();
+    const after = h.sch.refusalState('a');
+    assert.ok(after, `${what}: survives a sign-in — ${why}`);
+    assert.deepStrictEqual(
+      { failures: after.failures, until: after.until, reason: after.reason },
+      { failures: before.failures, until: before.until, reason: before.reason },
+      `${what}: and survives it untouched, not merely present`,
+    );
+    // An identity change is the broader event and still forgets all of them.
+    h.sch.clearRefusalBackoff();
+    assert.strictEqual(h.sch.refusalState('a'), null, `${what}: a changed identity does clear it`);
+  }
+
+  // The words the person is shown for the rate-limited door, and the behaviour, have to agree.
+  const said = turnedAwayBody({ accepted: false, reason: 'backing-off', retryInMs: 240_000, cause: 'channel-refused' }, 'Photos');
+  assert.match(said, /won't help/, 'we tell them signing in will not help');
+});
+
+// --- fail-closed ordering in the classifier -----------------------------------------------------------------
+
+// The verbatim shapes: a door refusing the session channel, and the two data-safety aborts bisync raises.
+const REJECTED = 'Failed to create file system for "vault:/x": NewFs: couldn\'t connect SSH: ssh: rejected: administratively prohibited (open failed)';
+const DELETE_ABORT = 'ERROR : Safety abort: too many deletes (>50%, 7 of 9). Run with --force if desired. Bisync aborted.';
+const ALL_CHANGED = 'ERROR : Safety abort: all files were changed on Path2 "vault:v/". Run with --force if desired. Bisync aborted.';
+const NEEDS_RESYNC = 'ERROR : Bisync critical error: cannot find prior Path1 listing. Bisync aborted. Must run --resync to recover.';
+const AUTH_REFUSED = 'ssh: unable to authenticate, attempted methods [none password]';
+const CONN_RESET = 'NOTICE : connection reset by peer during an earlier list';
+const HOST_KEY = 'knownhosts: key mismatch';
+
+test('NO connection verdict can drop a repair the run also owes — every combination keeps the latch', () => {
+  // The latch (resyncRequired: true) is what holds a vault until a person deliberately repairs it. Losing it
+  // means a later automatic run is free to carry out the very mass delete that was aborted. Three signatures
+  // could once take the result and answer `null` — "leave the baseline alone" — throwing away a resync the same
+  // run had asked for. rclone keeps a head AND a rolling tail of its log, so an early recovered connection error
+  // and the terminal abort line genuinely do arrive in one haystack; this is not a contrived pairing.
+  const ABORTS = { 'excessive-delete': DELETE_ABORT, 'all-changed': ALL_CHANGED };
+  const CONNECTION = { 'auth-failed': AUTH_REFUSED, 'channel-refused': REJECTED, 'connect-failed': CONN_RESET, 'host-key-mismatch': HOST_KEY };
+  for (const [abortName, abort] of Object.entries(ABORTS)) {
+    for (const [connName, conn] of Object.entries(CONNECTION)) {
+      for (const text of [`${abort}\n${conn}`, `${conn}\n${abort}`]) {
+        const o = classifyBisyncOutcome({ code: 1, stderr: text });
+        assert.strictEqual(o.resyncRequired, true, `${abortName} + ${connName}: the repair the abort owes survives`);
+        assert.strictEqual(o.needsAttention, true, `${abortName} + ${connName}: and it is never silent`);
+      }
+    }
+  }
+
+  // The latch that is carried is the DATA-SAFETY one, and deliberately not bisync's generic critical-error line.
+  // bisync frames every failure that way — including an ordinary dropped connection — so latching on it would
+  // answer a network blip with "this needs a repair": the wrong cause, and work that cannot help. A genuinely
+  // lost baseline still surfaces on the next run, which meets the same missing listing and latches honestly.
+  for (const [connName, conn] of Object.entries(CONNECTION)) {
+    const o = classifyBisyncOutcome({ code: 1, stderr: `${NEEDS_RESYNC}\n${conn}` });
+    assert.strictEqual(o.resyncRequired, null, `${connName} + a generic critical error: no repair is demanded for a connection that failed`);
+  }
+  const blip = classifyBisyncOutcome({ code: 1, stderr: 'ERROR : Bisync critical error: dial tcp: i/o timeout\nERROR : Bisync aborted. Must run --resync to recover.' });
+  assert.strictEqual(blip.result, RESULT.CONNECT_FAILED, 'a dropped connection is named as one');
+  assert.strictEqual(blip.resyncRequired, null, 'and it does not send the person to do a repair');
+  // A changed server identity still WINS the name whatever else the run said — it may not be the vault at the
+  // other end at all — but it no longer costs the latch to say so.
+  const mitm = classifyBisyncOutcome({ code: 1, stderr: `${DELETE_ABORT}\n${HOST_KEY}` });
+  assert.strictEqual(mitm.result, RESULT.HOST_KEY_MISMATCH, 'the loudest signal is still the one a person is shown');
+  assert.strictEqual(mitm.resyncRequired, true, 'and the mass-delete abort keeps its repair');
+  // With nothing owing a resync, a connection verdict still decides nothing about the baseline — exactly what
+  // it did before. baseline() only ever ADDS the latch back; it never invents one.
+  for (const conn of Object.values(CONNECTION)) {
+    assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: conn }).resyncRequired, null, 'a bare connection failure establishes no baseline either way');
+  }
+});
+
+test('a refused channel can never shadow a data-safety abort: the abort wins and keeps its repair latch', () => {
+  // Both traces in one run's output. The delete-safety latch is the thing that must not be lost: it is what
+  // holds the vault until a person deliberately repairs it, and dropping it would let a >50% delete through on
+  // a later automatic run.
+  for (const order of [`${REJECTED}\n${DELETE_ABORT}`, `${DELETE_ABORT}\n${REJECTED}`]) {
+    const o = classifyBisyncOutcome({ code: 1, stderr: order });
+    assert.strictEqual(o.result, RESULT.ABORT_EXCESSIVE_DELETE, 'the mass delete is the more serious event, whichever line came first');
+    assert.strictEqual(o.resyncRequired, true, 'and its latch is kept');
+  }
+  const allChanged = classifyBisyncOutcome({ code: 1, stderr: `${REJECTED}\n${ALL_CHANGED}` });
+  assert.strictEqual(allChanged.result, RESULT.ABORT_ALL_CHANGED);
+  assert.strictEqual(allChanged.resyncRequired, true, 'the other safety abort keeps its latch too');
+
+  // The same rule the connect-class verdict already follows, now stated for both of them together.
+  const connect = classifyBisyncOutcome({ code: 1, stderr: `${DELETE_ABORT}\nNOTICE : connection reset by peer during an earlier list` });
+  assert.strictEqual(connect.result, RESULT.ABORT_EXCESSIVE_DELETE);
+  assert.strictEqual(connect.resyncRequired, true);
+});
+
+test('a refused channel is still named on its own, and a run that exited green is never dressed up as one', () => {
+  const alone = classifyBisyncOutcome({ code: 1, stderr: REJECTED });
+  assert.strictEqual(alone.result, RESULT.CHANNEL_REFUSED, 'with no abort over it, the refusal is the honest cause');
+  assert.strictEqual(alone.resyncRequired, null, 'and it establishes no baseline either way');
+  // rclone retries at a low level, so a run that ultimately SUCCEEDED can still carry the phrase in its output.
+  // Reading that as a refusal would put a vault on a back-off — and a wait in front of a person — for a sync
+  // that actually worked.
+  assert.strictEqual(classifyBisyncOutcome({ code: 0, stderr: `${REJECTED}\nNOTICE : retried and succeeded` }).result, RESULT.OK);
+  // A changed server identity still outranks it, and a real auth refusal keeps its own account remedies —
+  // and, being the narrower claim of the two doors, outranks a refused channel in the same output.
+  assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: `${HOST_KEY}\n${REJECTED}` }).result, RESULT.HOST_KEY_MISMATCH);
+  assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: AUTH_REFUSED }).result, RESULT.AUTH_FAILED);
+  assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: `${REJECTED}\n${AUTH_REFUSED}` }).result, RESULT.AUTH_FAILED, 'the credential itself being refused is the more specific answer');
+  // A credential refusal is held to the same exit check as the other two: a run that ultimately exited green
+  // carrying a retried-then-recovered auth line is not a failure, and must not be shown as one.
+  assert.strictEqual(classifyBisyncOutcome({ code: 0, stderr: `${AUTH_REFUSED}\nNOTICE : retried and succeeded` }).result, RESULT.OK);
+  // The connection-level classifier the resync's first step uses is unchanged: it is only ever asked about a
+  // process that already failed, so it keeps naming the refusal with no exit code of its own to consult.
+  assert.strictEqual(classifyConnectionFailure('', REJECTED), RESULT.CHANNEL_REFUSED);
+});

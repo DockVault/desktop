@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const nodeCrypto = require('node:crypto');
-const { buildBisyncArgs, runBisync, bisyncWorkdir, MAX_DELETE_PERCENT, credPrepareOutcome } = require('../src/daemon/sync-engine');
+const { buildBisyncArgs, runBisync, bisyncWorkdir, MAX_DELETE_PERCENT, credPrepareOutcome, BISYNC_MAX_STDOUT_BYTES } = require('../src/daemon/sync-engine');
 const { openStateDb, getRunState } = require('../src/main/state-db');
 
 test('credPrepareOutcome: a code-fault cred reason (provider-error / internal-error) is a distinct non-retrying sync-error outcome', () => {
@@ -95,6 +95,10 @@ test('runBisync: an explicit resync runs, records run-state, and clears the resy
   assert.strictEqual(r.result, 'resync-ok');
   assert.strictEqual(r.resyncRequired, false);
   assert.ok(rec.args.includes('--resync') && rec.opts.config === '/cfg', 'ran a resync with the ephemeral config');
+  // The stdout cap is DELIVERED to the runner, not merely declared: a run that prints forever must not be able
+  // to grow the helper without limit, and a constant nobody passes bounds nothing. Asserted on the run itself.
+  assert.strictEqual(rec.opts.maxStdoutBytes, BISYNC_MAX_STDOUT_BYTES, 'runBisync hands the runner its stdout ceiling');
+  assert.ok(Number.isInteger(BISYNC_MAX_STDOUT_BYTES) && BISYNC_MAX_STDOUT_BYTES > 0, 'and that ceiling is a real bound');
   assert.ok(fs.existsSync(wd), 'the workdir was created');
   const st = getRunState(db, 'v1');
   assert.deepStrictEqual([st.resyncRequired, st.lastResult, st.lastRunUtc], [false, 'resync-ok', 4242]);
@@ -109,6 +113,7 @@ test('runBisync: after the block clears, a normal run proceeds; a plain error le
   // A normal run now proceeds (gate cleared) and a transient error must not silently force a resync.
   const rec = {};
   const r = await runBisync({ runner: fakeRunner({ code: 7 }, rec), db, vault: 'v1', local: 'l', remote: 'vault:p', workdir: path.join(dir, 'wd'), config: '/c', now: () => 2 });
+  assert.strictEqual(rec.opts.maxStdoutBytes, BISYNC_MAX_STDOUT_BYTES, 'the ordinary bidirectional run is capped too, not just the resync');
   assert.strictEqual(r.ran, true);
   assert.ok(rec.args && !rec.args.includes('--resync'), 'a normal (non-resync) bisync ran');
   assert.strictEqual(r.result, 'error');

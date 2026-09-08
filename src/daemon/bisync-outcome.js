@@ -243,27 +243,52 @@ function classifyBisyncOutcome(o) {
   // naming the real cause must never quietly drop that latch.
   const owesResync = SIG.needsResync.test(text) || SIG.excessiveDelete.test(text) || SIG.allChanged.test(text);
   const baseline = () => (owesResync ? true : (o.code === 0 ? false : null));
+  // What a CONNECTION verdict must carry through instead of a flat `null`. A data-safety abort — a >50% delete,
+  // or every file on one side reading as changed — latches the vault until a person deliberately repairs it, and
+  // no connection phrase in the same output may take the result and drop that latch with it.
+  //
+  // Deliberately NARROWER than baseline(): it does NOT latch on bisync's generic critical-error line. bisync
+  // frames every failure that way, including an ordinary dropped connection, so latching on it would answer a
+  // network blip with "this needs a repair" — the wrong-cause answer, and one that sends someone to do work that
+  // will not help. A genuine lost baseline still surfaces: the next run meets the same missing listing and
+  // classifies as needs-resync on its own, which latches honestly.
+  // Only on a FAILED run: a run that exited green established its own baseline, and inventing a repair for it
+  // would put a vault behind a manual Repair it never needed.
+  const safetyLatch = () => ((o.code !== 0 && (SIG.excessiveDelete.test(text) || SIG.allChanged.test(text))) ? true : null);
 
-  // Most serious first: an identity-change (MITM) signal and a data-safety abort outrank a plain error.
-  if (SIG.hostKeyMismatch.test(text)) return { result: RESULT.HOST_KEY_MISMATCH, resyncRequired: null, needsAttention: true };
-  // A connection-level auth failure (e.g. a credential that lapsed mid-run): surface it as its own state so
-  // the status layer can prompt sign-in, and leave the resync baseline untouched. Fail-closed, never silent.
-  if (SIG.authFailed.test(text)) return { result: RESULT.AUTH_FAILED, resyncRequired: null, needsAttention: true };
-  // The door answered and refused the channel — a refusal, but never an account matter: its own typed result.
-  if (SIG.channelRefused.test(text)) return { result: RESULT.CHANNEL_REFUSED, resyncRequired: null, needsAttention: true };
+  // Most serious first: a changed server identity is the one signal that outranks even a data-safety abort —
+  // it says the machine on the other end may not be the vault at all, and it must be the loud answer whatever
+  // else the run also said. It carries the baseline rather than discarding it, so a run that ALSO aborted on a
+  // mass delete keeps the repair that abort owes (see below: no verdict here may quietly drop that latch).
+  if (SIG.hostKeyMismatch.test(text)) return { result: RESULT.HOST_KEY_MISMATCH, resyncRequired: safetyLatch(), needsAttention: true };
   if (SIG.excessiveDelete.test(text)) return { result: RESULT.ABORT_EXCESSIVE_DELETE, resyncRequired: true, needsAttention: true };
   // A different safety abort than the delete cap — all files on one side read as changed. Must NOT be labelled as
   // a large DELETE (its own honest status); still a fail-closed abort requiring a deliberate resync.
   if (SIG.allChanged.test(text)) return { result: RESULT.ABORT_ALL_CHANGED, resyncRequired: true, needsAttention: true };
 
-  // A DOOR that could not be reached outranks anything about a file. A connection dropping mid-transfer
-  // leaves both kinds of trace in one log, and reading it as "the server refused your file" would be a
-  // specific claim about the server's behaviour when the truth is that nothing reached it — and, worse, it
-  // would tell the credential bounds that the server ANSWERED, re-opening the gate that stops this computer
-  // minting a credential every tick against a door that is down. Tested after the safety aborts above (a
-  // genuine abort whose output also mentions a transient network phrase keeps its latch) and, as before,
-  // only on a non-zero exit, since the signature is deliberately narrow.
-  if (o.code !== 0 && SIG.connectFailed.test(text)) return { result: RESULT.CONNECT_FAILED, resyncRequired: null, needsAttention: true };
+  // A DOOR that refused the credential, refused the connection, or could not be reached at all, outranks
+  // anything about a file. A connection dropping mid-transfer leaves both kinds of trace in one log, and reading
+  // that as "the server refused your file" would be a specific claim about the server's behaviour when the truth
+  // is that nothing reached it — and, worse, it would tell the credential bounds that the server ANSWERED,
+  // re-opening the gate that stops this computer minting a credential every tick against a door that is down.
+  //
+  // All THREE connection verdicts sit HERE, below the data-safety aborts and only on a non-zero exit, and for
+  // one reason: a >50%-delete or all-files-changed abort carries a latch that holds the vault until a person
+  // deliberately repairs it, and no connection phrase appearing in the same output may take the result and drop
+  // that latch with it. rclone retries at a low level and keeps both a head and a rolling tail of the log, so an
+  // early recovered connection error and the terminal abort line genuinely do arrive together. They run from the
+  // narrowest claim to the widest: the credential itself was refused, then the session channel was refused (the
+  // door answered either way), then the door could not be reached at all. Each signature is deliberately narrow,
+  // and none may turn a run that ultimately exited green into a failure — hence the exit check on all three.
+  //
+  // They carry safetyLatch() rather than a flat null. Below this point the ordering has ALREADY settled it —
+  // an abort would have returned above — so for these three it can only answer null today, and it is here as
+  // belt-and-braces should that order ever be changed back. Where it genuinely does the work is the identity
+  // check at the top, which must outrank even an abort to be the loud answer, and which without it would take
+  // the verdict and drop the abort's repair with it.
+  if (o.code !== 0 && SIG.authFailed.test(text)) return { result: RESULT.AUTH_FAILED, resyncRequired: safetyLatch(), needsAttention: true };
+  if (o.code !== 0 && SIG.channelRefused.test(text)) return { result: RESULT.CHANNEL_REFUSED, resyncRequired: safetyLatch(), needsAttention: true };
+  if (o.code !== 0 && SIG.connectFailed.test(text)) return { result: RESULT.CONNECT_FAILED, resyncRequired: safetyLatch(), needsAttention: true };
 
   // A file the server would not take. Two orderings matter here.
   //

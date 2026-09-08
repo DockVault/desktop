@@ -15,7 +15,7 @@ const { conditionForReason, streakFailureReason } = require('../src/main/schedul
 const { classifyBisyncOutcome, classifyConnectionFailure, RESULT } = require('../src/daemon/bisync-outcome');
 const { OUTCOME_STATE, STATE } = require('../src/main/sync-status-model');
 const { createManageView } = require('../src/main/manage-view');
-const { turnedAwayBody, waitWords } = require('../src/main/manual-sync-copy');
+const { manualCompletionBody, turnedAwayBody, waitWords } = require('../src/main/manual-sync-copy');
 
 const vault = (id) => ({ vaultId: id, vaultName: id.toUpperCase(), localFolder: `/folders/${id}`, remotePath: id.toUpperCase(), enabled: true });
 
@@ -216,7 +216,7 @@ test('a deliberate press against a refusing door gets ONE attempt per window; a 
   assert.strictEqual(h2.sch.requestSync('a', { manual: true }).reason, 'sync-cooldown');
 });
 
-test('the door taking a credential again clears the back-off; releaseHolds (a sign-in, an unlock, a set-up change) opens it at once', async () => {
+test('the door taking a credential again clears the back-off; a presence resume does NOT, and an identity change does', async () => {
   let refuse = true;
   const h = harness({ runSync: async (spec) => (refuse ? authFailed(spec) : { result: 'ok', ran: true }), credentialPath: () => 'device' });
   h.sch.requestSync('a'); await settle(h.sch);
@@ -232,10 +232,23 @@ test('the door taking a credential again clears the back-off; releaseHolds (a si
   assert.strictEqual(h.sch.refusalState('a').failures, 1);
   assert.strictEqual(h.calls.refreshCred.filter((v) => v === 'a').length, 2 + 1 + 2, 'the fresh episode retried its first refusal once');
 
+  // Coming back to the computer lifts the holds and opens the endpoint gate, but it is NOT an answer from the
+  // door: the refusal window stands, and a routine request is still turned away with the honest wait.
+  const mintsBefore = h.calls.refreshCred.length;
   h.sch.releaseHolds();
+  assert.ok(h.sch.refusalState('a'), 'a presence resume leaves the refusing door on record');
+  assert.strictEqual(h.sch.requestSync('a').accepted, false, 'and a routine request is still held by it');
+  await settle(h.sch);
+  assert.strictEqual(h.calls.refreshCred.length, mintsBefore, 'nothing was minted against the still-refusing door');
+
+  // A genuine identity change is different: the refusals answered a credential this computer can no longer
+  // present, so they are forgotten and the next request goes through.
+  h.sch.clearRefusalBackoff();
   assert.strictEqual(h.sch.refusalState('a'), null);
   assert.deepStrictEqual(h.sch.requestSync('a'), { accepted: true }, 'a routine request goes through again');
   await settle(h.sch);
+  assert.strictEqual(h.calls.refreshCred.length, mintsBefore + 2, 'and it mints as a fresh episode does: the run plus its one race retry, then the window is back');
+  assert.strictEqual(h.sch.refusalState('a').failures, 1, 'the new window counts from one, not from the old identity\u2019s tally');
 });
 
 test('the account path backs off the same way: a persistent sign-in refusal no longer mints every tick while it waits for the person', async () => {
@@ -437,4 +450,83 @@ test('the manage page: a turned-away "Sync now" resolves with the reason and a w
   assert.deepStrictEqual(await view.act({ kind: 'sync-now', vaultId: V1 }), { ok: false, reason: 'cooldown', retryInSec: 1 }, 'never a 0 that reads as "try now"');
   answers.push(undefined); // a legacy caller that returns nothing is an accepted press
   assert.deepStrictEqual(await view.act({ kind: 'sync-now', vaultId: V1 }), { ok: true });
+});
+
+// ---- the sentence a turned-away press actually earns ----------------------------------------------------------
+// The bounds above are only half the answer: a press that mints nothing still has to TELL the person something
+// true. These drive the real copy — the same functions index.js calls — off the scheduler's real verdicts.
+
+test('the wait is said the same way either side of the minute-and-a-half boundary, and never as a zero', () => {
+  // Under a minute and a half, whole seconds: precise enough to be worth waiting out.
+  assert.strictEqual(waitWords(1000), '1 second', 'singular, not "1 seconds"');
+  assert.strictEqual(waitWords(2000), '2 seconds');
+  assert.strictEqual(waitWords(89_000), '89 seconds', 'the last instant that is still counted in seconds');
+  // Past it, whole minutes rounded UP — a promise the next attempt can keep.
+  assert.strictEqual(waitWords(89_001), 'about 2 minutes', 'one millisecond later it is minutes, because 90 seconds rounds up');
+  assert.strictEqual(waitWords(90_000), 'about 2 minutes');
+  assert.strictEqual(waitWords(240_000), 'about 4 minutes');
+  assert.strictEqual(waitWords(REFUSAL_BACKOFF_MAX_MS), 'about 60 minutes');
+  // A lapsed or missing wait is never rendered as "0 seconds" — that reads as "try now" when nothing will.
+  assert.strictEqual(waitWords(0), '1 second');
+  assert.strictEqual(waitWords(-5000), '1 second');
+  assert.strictEqual(waitWords(undefined), '1 second');
+});
+
+test("a press turned away by the cooldown says when to ask again, and doesn't imply the changes are lost", async () => {
+  const h = harness();
+  h.sch.requestSync('a', { manual: true }); await settle(h.sch);
+  h.advance(1000);
+  const verdict = h.sch.requestSync('a', { manual: true });
+  assert.strictEqual(verdict.reason, 'sync-cooldown');
+  const body = turnedAwayBody(verdict, 'Photos');
+  assert.match(body, /Photos/, 'the vault by name');
+  assert.match(body, new RegExp(waitWords(verdict.retryInMs)), 'the wait, in the one phrasing every surface uses');
+  assert.match(body, /still picked up on the regular schedule/, 'and the reassurance that nothing is being dropped');
+  // An accepted press has nothing to say yet — the run's own outcome is the answer.
+  assert.strictEqual(turnedAwayBody({ accepted: true }, 'Photos'), null);
+  assert.strictEqual(turnedAwayBody(null, 'Photos'), null);
+});
+
+test('a press against a refusing door names the RIGHT refusal: a server limiting attempts is never answered with "sign in"', async () => {
+  const channelRefused = async () => ({ result: 'channel-refused', ran: true, resyncRequired: null, needsAttention: true });
+  const h = harness({ runSync: channelRefused, credentialPath: () => 'device' });
+  h.sch.requestSync('a'); await settle(h.sch);
+  h.sch.requestSync('a', { manual: true }); await settle(h.sch); // the window's one deliberate attempt, spent
+  h.advance(MANUAL_SYNC_COOLDOWN_MS); // past the press cooldown, so the REFUSAL is what answers, not the sooner truth
+  const verdict = h.sch.requestSync('a', { manual: true });
+  assert.deepStrictEqual({ accepted: verdict.accepted, reason: verdict.reason, cause: verdict.cause }, { accepted: false, reason: 'backing-off', cause: 'channel-refused' });
+
+  const body = turnedAwayBody(verdict, 'Photos');
+  assert.match(body, /limiting sync attempts/, 'the real cause, in plain words');
+  assert.ok(body.includes(waitWords(verdict.retryInMs)), 'with the wait, in the one phrasing every surface uses');
+  assert.match(body, /won't help/, 'and it says outright that the two things people reach for do not');
+  assert.doesNotMatch(body, /If its status asks you to sign in/, 'no offer of a sign-in that cannot help');
+
+  // The other door — a credential the server refused — DOES keep the sign-in offer, because there it may work.
+  const authBody = turnedAwayBody({ accepted: false, reason: 'backing-off', retryInMs: 240_000, cause: 'auth-failed' }, 'Photos');
+  assert.match(authBody, /refusing this computer's sync credentials/);
+  assert.match(authBody, /sign in or enter the vault password/, 'the remedy that genuinely may unblock it');
+  assert.notStrictEqual(authBody, body, 'two doors, two answers');
+  // An unknown cause falls to the same, safer, sign-in-offering sentence rather than promising a wait clears it.
+  assert.strictEqual(turnedAwayBody({ accepted: false, reason: 'backing-off', retryInMs: 240_000 }, 'Photos'), authBody);
+});
+
+test('a press whose DISPATCH is stopped by the back-off gets the identical sentence — one source, one story', async () => {
+  const channelRefused = async () => ({ result: 'channel-refused', ran: true, resyncRequired: null, needsAttention: true });
+  const h = harness({ runSync: channelRefused, credentialPath: () => 'device' });
+  h.sch.requestSync('a', { manual: true }); await settle(h.sch); // a deliberate run refused: the window opens with its attempt already spent
+  // A request accepted BEFORE the window opened, dispatched after it did: stopped at the mint, not at the door.
+  h.sch._queue.push({ vaultId: 'a', manual: true, repair: false, press: true });
+  h.sch._pump(); await settle(h.sch);
+  const ev = last(h.log, 'a');
+  assert.deepStrictEqual({ phase: ev.phase, reason: ev.reason, cause: ev.cause }, { phase: 'skipped', reason: 'backing-off', cause: 'channel-refused' });
+
+  const fromEvent = manualCompletionBody(ev, 'Photos');
+  const fromVerdict = turnedAwayBody({ accepted: false, reason: 'backing-off', retryInMs: ev.retryInMs, cause: ev.cause }, 'Photos');
+  assert.strictEqual(fromEvent.body, fromVerdict, 'the same wait, told the same way, whether the press was stopped at the request or at the dispatch');
+  assert.match(fromEvent.body, /limiting sync attempts/);
+  assert.ok(!fromEvent.silent, 'and a press that cost the person a click is always answered');
+
+  // A choice the person made themselves earns no toast at all.
+  assert.deepStrictEqual(manualCompletionBody({ phase: 'skipped', reason: 'consent-declined' }, 'Photos'), { silent: true });
 });
