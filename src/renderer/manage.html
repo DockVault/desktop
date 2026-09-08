@@ -46,6 +46,24 @@
     .state { display: inline-flex; align-items: center; gap: .4rem; }
     .dot { width: .55rem; height: .55rem; border-radius: 50%; background: #3a4a63; display: inline-block; }
     .dot.ok { background: #3ecf7a; } .dot.warn { background: #d9b24a; } .dot.bad { background: #ef6a5e; } .dot.run { background: #4c8dff; }
+    /* The state icon: a tick when idle, an arrow that climbs while transferring, a spinner while checking, a mark for a problem. */
+    .ico { display: inline-flex; align-items: center; justify-content: center; width: 1.1rem; height: 1.1rem; border-radius: 50%; font-size: .75rem; font-weight: 700; line-height: 1; }
+    .ico.ok { color: #3ecf7a; } .ico.idle { color: #6f849f; } .ico.pause, .ico.ask { color: #d9b24a; } .ico.bad { color: #ef6a5e; background: #2a1412; }
+    .ico.xfer { color: #cfe0ff; background: #1c3d80; animation: climb 1.1s ease-in-out infinite; }
+    .ico.busy { color: #4c8dff; animation: spin 1.2s linear infinite; }
+    @keyframes climb { 0%, 100% { transform: translateY(1px); } 50% { transform: translateY(-2px); } }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { .ico.xfer, .ico.busy, .xfer .bar .fill.indeterminate { animation: none; } .xfer .bar .fill, .xfer .mini .fill { transition: none; } }
+    /* The transfer strip: an overall bar plus a small bar per file in flight (no names — numbers only). */
+    .xfer { display: grid; gap: .3rem; }
+    .xfer .bar { height: .35rem; border-radius: 999px; background: #1a2538; overflow: hidden; }
+    .xfer .bar .fill { height: 100%; background: #4c8dff; border-radius: 999px; transition: width .6s ease; }
+    .xfer .bar .fill.indeterminate { width: 30% !important; animation: slide 1.4s ease-in-out infinite; }
+    @keyframes slide { 0% { margin-left: 0; } 50% { margin-left: 70%; } 100% { margin-left: 0; } }
+    .xfer-line { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+    .xfer .files { display: inline-flex; align-items: center; gap: .3rem; }
+    .xfer .mini { width: 2rem; height: .3rem; border-radius: 999px; background: #1a2538; overflow: hidden; display: inline-block; }
+    .xfer .mini .fill { display: block; height: 100%; background: #7fb0ff; transition: width .6s ease; }
     .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .25rem; }
     .note { padding: .6rem 1rem 1rem; color: #8aa0bd; font-size: .9rem; }
     .btn {

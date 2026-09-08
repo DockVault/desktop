@@ -100,7 +100,7 @@ test('applySchedulerEvent: a dispatched run is quiet until it transfers; a trans
   assert.notStrictEqual(vaultOf(hub).state, STATE.SYNCING, 'a dispatched-but-scanning run does NOT read syncing — quiet until bytes move');
   hub.recordProgress('v1', { files: 2, bytes: 1048576 });
   assert.strictEqual(vaultOf(hub).state, STATE.SYNCING, 'once real bytes move, it reads syncing');
-  assert.deepStrictEqual(vaultOf(hub).progress, { files: 2, bytes: 1048576 }, 'carrying the two aggregate counts');
+  assert.deepStrictEqual({ files: vaultOf(hub).progress.files, bytes: vaultOf(hub).progress.bytes }, { files: 2, bytes: 1048576 }, 'carrying the two aggregate counts');
   applySchedulerEvent(hub, 'v1', { phase: 'done', outcome: { result: 'ok', resyncRequired: false } });
   assert.strictEqual(vaultOf(hub).state, STATE.UP_TO_DATE);
   assert.strictEqual(vaultOf(hub).running, false);
@@ -383,7 +383,7 @@ test('StatusSink: a noop (already-running refusal) leaves the in-flight, transfe
   sink.apply('v1', { phase: 'noop', reason: 'already-running' });
   assert.strictEqual(vaultOf(hub).state, STATE.SYNCING, 'still syncing — the guard refusal did not disturb the live run');
   assert.strictEqual(vaultOf(hub).running, true);
-  assert.deepStrictEqual(vaultOf(hub).progress, { files: 1, bytes: 2048 }, 'progress preserved across the noop');
+  assert.deepStrictEqual({ files: vaultOf(hub).progress.files, bytes: vaultOf(hub).progress.bytes }, { files: 1, bytes: 2048 }, 'progress preserved across the noop');
 });
 
 test('StatusSink: a noop neither increments nor resets the failure streak', () => {

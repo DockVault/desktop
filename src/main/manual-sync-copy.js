@@ -44,6 +44,10 @@ function bodyForConditionReason(reason, name) {
     case 'vault-unavailable': return `${name} can't be synced any more. Open DockVault for details.`;
     case 'conflict-keep-both': return `${name} has conflicting copies — open DockVault to review them.`;
     case 'not-syncing': return `${name} hasn't synced for a while. Open DockVault to check your connection.`;
+    // The SYNC SERVER (the SFTP address), not the account or the network in general — named as such, with the
+    // one thing that helps: Troubleshoot checks the saved server and SFTP address separately.
+    case 'sync-server-unreachable': return `${name} can't sync: the sync server can't be reached right now. Open DockVault and run Troubleshoot to check the address.`;
+    case 'sync-server-unverified': return `${name} can't sync: what's at the sync server address isn't answering as a sync server. Open DockVault and run Troubleshoot to check it.`;
     case 'helper-not-ready':
       // The sync helper (rclone) isn't ready — a NON-retrying must-act (a wrong/missing/blocked binary, or one
       // that won't start), so NEVER the calm "try again in a moment" that would tell a different story than the

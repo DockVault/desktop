@@ -207,3 +207,12 @@ test('carryListings re-keys every listing file of the old pair to the new one, n
   assert.strictEqual(carryListings(path.join(wd, 'nope'), { from, to }), 0, 'no workdir: nothing, no throw');
   fs.rmSync(wd, { recursive: true, force: true });
 });
+
+test('the CONNECTION is bounded so a door that will not talk fails fast rather than hanging the run', () => {
+  const { buildBisyncArgs, CONNECT_BOUND_ARGS } = require('../src/daemon/sync-engine');
+  assert.deepStrictEqual(CONNECT_BOUND_ARGS, ['--contimeout', '20s', '--timeout', '90s', '--low-level-retries', '3']);
+  const args = buildBisyncArgs({ local: '/l', remote: 'vault:V', workdir: '/w' });
+  for (const flag of ['--contimeout', '--timeout', '--low-level-retries']) assert.ok(args.includes(flag), `bisync carries ${flag}`);
+  // The bound sits before the stats args, and low-level-retries caps rclone's own retry loop (default 10).
+  assert.strictEqual(args[args.indexOf('--low-level-retries') + 1], '3');
+});

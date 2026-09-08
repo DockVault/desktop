@@ -99,6 +99,10 @@ const OUTCOME_STATE = Object.freeze({
   // becomes its own honest state there (revoked, suspended, prove-once-more) — calm meanwhile.
   'auth-failed-device': { state: STATE.PAUSED, reason: 'device-access-check' },
   'path-too-long': { state: STATE.NEEDS_DECISION, reason: 'path-too-long' },
+  // The SFTP door could not be reached (refused, timed out, no such host). Calm at first — a laptop that woke up
+  // before its network did — and the scheduler stops minting credentials until the door answers a credential-free
+  // probe; persisting, the status sink escalates it to a problem that still names the real cause.
+  'connect-failed': { state: STATE.PAUSED, reason: 'sync-server-unreachable' },
   'host-key-unverified': { state: STATE.PAUSED, reason: 'cannot-verify-yet' },
   'host-key-mismatch': { state: STATE.SYNC_PROBLEM, reason: 'host-key-mismatch' },
   'error': { state: STATE.SYNC_PROBLEM, reason: 'error' },
@@ -118,8 +122,9 @@ const OUTCOME_STATE = Object.freeze({
  *   "Sync now" affordance's honest-concurrency state, NOT the glance; a run may be scanning without transferring.
  * @param {boolean} [v.transferring]  the run is actually moving bytes right now — THIS drives the "syncing"
  *   glance, so a routine no-op check (running but not transferring) stays quiet at its last real state.
- * @param {{files:(number|null), bytes:(number|null)}|null} [v.progress] the two aggregate transfer counts for
- *   the "Syncing… N files / X" detail; carried through untouched, numbers only, never a path.
+ * @param {{files, filesTotal, bytes, bytesTotal, percent, transferring, fileProgress}|null} [v.progress] the
+ *   transfer numbers for the "Syncing…" detail — counts, totals, rclone's percentage, how many files are in
+ *   flight and each one's percentage; carried through untouched, numbers only, never a path.
  * @param {string|null} [v.lastResult] the last typed outcome, or null if it has never completed a run
  * @param {boolean} [v.resyncRequired] a resync is owed (a blocked latch)
  * @param {{state:string, reason:(string|null)}|null} [v.condition] a live reason the vault cannot run
@@ -143,9 +148,10 @@ function vaultStateCore(v) {
   const out = (cond && RANK[cond.state] >= RANK[base.state])
     ? { vault: v.vault, state: cond.state, reason: cond.reason || null, sub: cond.sub || null, installed: cond.installed || null, running, resyncRequired }
     : base;
-  // progress rides along ONLY while the vault is actually syncing; any other state clears it so a stale
-  // count never trails a finished or paused vault.
-  const progress = out.state === STATE.SYNCING && v.progress ? v.progress : null;
+  // progress rides along ONLY while the run in flight is actually transferring — whatever face the vault wears
+  // (a Repair's transfer still shows its numbers under "needs your decision"); once nothing moves it is cleared,
+  // so a stale count never trails a finished or paused vault.
+  const progress = transferring && running && v.progress ? v.progress : null;
   return { ...out, running, progress, lastSyncedAt: v.lastSyncedAt != null ? v.lastSyncedAt : null };
 }
 

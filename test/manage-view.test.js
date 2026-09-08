@@ -55,7 +55,7 @@ test('the model: this computer first with its vault cards (local side shown), ot
   assert.deepEqual(me.vaults.map((v) => [v.name, v.granted, !!v.local, v.standing]), [['Photos', true, true, 'device'], ['A vault', true, false, 'device'], ['Work', false, true, 'account']]);
   const photos = me.vaults[0];
   assert.equal(photos.remote, `files.example.com:2200/vault_${V1}`);
-  assert.deepEqual(photos.local, { folder: '/home/u/Photos', enabled: true, state: 'up-to-date', reason: null, running: false, lastSyncedAt: 1700000000000, via: 'device', reasonText: null });
+  assert.deepEqual(photos.local, { folder: '/home/u/Photos', enabled: true, state: 'up-to-date', reason: null, running: false, lastSyncedAt: 1700000000000, progress: null, via: 'device', reasonText: null });
   const work = me.vaults[2];
   assert.equal(work.granted, false, 'configured but never recorded here: syncs through the sign-in');
   assert.equal(work.remote, 'files.example.com:2200/Work');
@@ -202,4 +202,13 @@ test('relocate-folder asks main for the offer, only for a vault configured here,
   assert.deepEqual(await view.act({ kind: 'relocate-folder', vaultId: '99999999-9999-4999-8999-999999999999' }), { ok: false, reason: 'not-found' });
   assert.deepEqual(await view.act({ kind: 'relocate-folder', vaultId: 'C:\\x' }), { ok: false, reason: 'bad-request' });
   assert.equal(calls.length, 1);
+});
+
+test('the model: a transfer in flight rides on the card as numbers only (counts, totals, percentages), never a name', async () => {
+  const progress = { files: 1, filesTotal: 3, bytes: 2048, bytesTotal: 8192, percent: 25, transferring: 2, fileProgress: [40, 10] };
+  const h = harness({ liveStatus: () => ({ vaults: [{ vault: V1, state: 'syncing', reason: null, running: true, lastSyncedAt: null, via: 'device', progress }] }) });
+  const m = await h.view.model();
+  const photos = m.computers[0].vaults.find((v) => v.vaultId === V1);
+  assert.deepEqual(photos.local.progress, progress, 'the progress numbers are carried through untouched');
+  assert.doesNotMatch(JSON.stringify(photos.local.progress), /Photos|home/, 'nothing but numbers');
 });

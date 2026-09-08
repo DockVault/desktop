@@ -65,7 +65,7 @@ function standingOf({ granted, recorded, identityStatus }) {
  *   myGrants()                 -> Promise<{ ok, grants?: [{vaultId, grantedAt, name, metaKnown}], reason? }>  (device route; only when status is ok)
  *   grantRecord()              -> { status: 'ok'|'absent'|'unreadable', has: (vaultId) => boolean }  (the local grant record)
  *   configured()               -> [{ vaultId, vaultName, localFolder, enabled }]
- *   liveStatus()               -> { vaults: [{ vault, state, reason, running, lastSyncedAt, via }] }
+ *   liveStatus()               -> { vaults: [{ vault, state, reason, running, lastSyncedAt, via, progress }] }
  *   reasonText(live, name)     -> a plain sentence for a vault's live reason, or null
  *   endpoint()                 -> { serverHost, sftp: {host, port}|null }
  *   remotePathFor(vaultId, via, vaultName) -> the remote directory a run uses
@@ -184,6 +184,7 @@ function createManageView(io) {
       local: cfg ? {
         folder: cfg.localFolder, enabled: cfg.enabled !== false,
         state: live ? live.state : null, reason: live ? live.reason : null, running: !!(live && live.running), lastSyncedAt: live ? live.lastSyncedAt : null,
+        progress: live && live.progress ? live.progress : null, // the transfer in flight, numbers only (counts, totals, percentages — never a name)
         via: remoteVia,
         reasonText: live && live.reason ? safe(() => o.reasonText(live, name || (cfg && cfg.vaultName) || null), null) : null,
       } : null,

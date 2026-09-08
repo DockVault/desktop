@@ -52,6 +52,15 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 // tunable up to 10s if a rendered pass shows flicker — and it is DECOUPLED from the inactivity window below
 // (a shorter period only widens the margin). The flags are fixed here — never caller/renderer-supplied.
 const SYNC_STATS_ARGS = Object.freeze(['--stats', '5s', '--stats-log-level', 'NOTICE']);
+// Bound the CONNECTION itself so a door that won't talk fails FAST with a definitive, classifiable error rather
+// than hanging the run. rclone's defaults are generous (a 5-minute IO idle timeout, ten low-level retries), so a
+// server that completes the SSH transport but then refuses or stalls the SFTP channel — exactly what the server's
+// per-computer credential cap looks like at the door — can otherwise keep an operation alive for many minutes,
+// and the periodic --stats heartbeat keeps the daemon's own inactivity watchdog from noticing (the heartbeat is
+// output even while nothing moves). These make rclone give up in bounded time so the failure is caught and named
+// (unreachable / can't-verify / connect-failed) instead of reading as an endless "syncing". A healthy transfer
+// never idles 90s (data is flowing), so this never false-trips real work.
+const CONNECT_BOUND_ARGS = Object.freeze(['--contimeout', '20s', '--timeout', '90s', '--low-level-retries', '3']);
 // The folder's identity marker (main/folder-marker.js) lives in the synced folder's root and is LOCAL ONLY: it
 // is excluded from every transfer, listing, and compare, so it is never uploaded to the vault, never deleted
 // from the folder by a sync, and never counted as a difference. The name is fixed here, not caller-supplied.
@@ -96,6 +105,7 @@ function buildBisyncArgs({ local, remote, workdir, resync = false }) {
     // server's per-source login limiter. It also means a safety abort (excessive delete) is never
     // re-attempted. A transient failure simply re-ticks on the next scheduled sweep.
     '--retries', '1',
+    ...CONNECT_BOUND_ARGS, // a door that won't talk fails fast, never hangs the run
     ...MARKER_FILTER_ARGS, // the folder's own identity marker stays home
     ...SYNC_STATS_ARGS]; // periodic progress so the inactivity timeout can tell a long run from a hung one
   if (resync) args.push('--resync'); // a deliberate resync, or the one automatic empty-baseline refresh (see runBisync)
@@ -148,21 +158,31 @@ function emptyPairBaseline({ local, remote, workdir }) {
   return priorListingEmpty(workdir, local, remote) && localHasNoFiles(local);
 }
 
-// bisync keys its prior listings by the two paths: a synced folder that was moved or renamed would otherwise
-// read as "no prior listings" and demand a repair, though nothing in it changed. When main reports where the
-// folder came from, its listing files are renamed to the new key first, so the run continues from the same
-// baseline. The name is rclone's own canonical form of a path (whitespace, separators, ':', '?', '*' become
-// '_'; leading/trailing separators dropped). The carried listing is the LIVE baseline (the folder was just
-// followed from `from`), so a listing already sitting under the new name — left by an earlier pairing of that
-// path — is stale and is set aside, never used; any mismatch simply leaves bisync to ask for its repair.
+// bisync keys its prior listings by the two paths — "<local>..<remote>" in rclone's canonical form. Either side
+// can change while nothing in the vault does: the synced folder is moved or renamed (the local key), or the
+// vault's run switches between the account path (the vault's name) and this computer's own device path (its
+// id form) — the same server directory under another name (the remote key). Either would otherwise read as "no
+// prior listings" and demand a repair. When main reports the old side(s), the listing files are renamed to the
+// new key first, so the run continues from the same baseline. The name is rclone's own canonical form of a
+// path (whitespace, separators, ':', '?', '*' become '_'; leading/trailing separators dropped). The carried
+// listing is the LIVE baseline (the folder was just followed, or the path just switched), so a listing already
+// sitting under the new name — left by an earlier pairing — is stale and is set aside, never used; any mismatch
+// simply leaves bisync to ask for its repair.
 const NON_CANONICAL = /[\s\\/:?*]/g;
 function canonicalPath(p) {
   return String(p).replace(/^[\\/]+|[\\/]+$/g, '').replace(NON_CANONICAL, '_');
 }
+// The listing-file prefix of one pair. A bare string is the local side alone (every remote of that local); a
+// { local, remote } names one exact pair.
+function pairKey(side) {
+  if (side && typeof side === 'object') return `${canonicalPath(side.local)}..${side.remote != null ? canonicalPath(side.remote) : ''}`;
+  return `${canonicalPath(side)}..`;
+}
 function carryListings(workdir, { from, to }) {
-  const oldKey = `${canonicalPath(from)}..`;
-  const newKey = `${canonicalPath(to)}..`;
-  if (!from || !to || oldKey === newKey) return 0;
+  const oldKey = pairKey(from);
+  const newKey = pairKey(to);
+  const named = (s) => (s && typeof s === 'object' ? !!s.local : !!s);
+  if (!named(from) || !named(to) || oldKey === newKey) return 0;
   let names;
   try { names = fs.readdirSync(workdir); } catch { return 0; }
   let moved = 0;
@@ -213,8 +233,12 @@ const CRED_REASON_RESULT = Object.freeze({
 // problem. A NOT-RUN shape (result null + the reason) signals the caller to emit a skip that keeps the last
 // state. An invariant violation ('not-in-flight' / 'cap-exceeded') is NOT transient — it stays a plain error.
 const CRED_REASON_TRANSIENT = new Set(['paused-locked', 'waiting-to-reconnect']);
+// A refusal the status layer already names on its own (the server's per-computer credential cap): carried as the
+// same NOT-RUN shape so the caller surfaces THAT reason rather than a generic error. It is not transient (the
+// cap frees only as credentials expire), so it is kept apart from CRED_REASON_TRANSIENT in name and intent.
+const CRED_REASON_NAMED = new Set(['device-cred-cap']);
 function credPrepareOutcome(reason, resyncRequired) {
-  if (CRED_REASON_TRANSIENT.has(reason)) {
+  if (CRED_REASON_TRANSIENT.has(reason) || CRED_REASON_NAMED.has(reason)) {
     return { ran: false, result: null, reason, resyncRequired: !!resyncRequired, needsAttention: false, preserved: 0 };
   }
   const result = CRED_REASON_RESULT[reason] || 'error';
@@ -265,4 +289,4 @@ async function runBisync(o) {
   return { ran: true, code, result: outcome.result, resyncRequired, needsAttention: outcome.needsAttention, stdout, stderr };
 }
 
-module.exports = { buildBisyncArgs, runBisync, credPrepareOutcome, bisyncWorkdir, emptyPairBaseline, needsZeroLossBaseline, localHasNoFiles, priorListingEmpty, canonicalPath, carryListings, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS };
+module.exports = { CONNECT_BOUND_ARGS, buildBisyncArgs, runBisync, credPrepareOutcome, bisyncWorkdir, emptyPairBaseline, needsZeroLossBaseline, localHasNoFiles, priorListingEmpty, canonicalPath, carryListings, pairKey, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS };

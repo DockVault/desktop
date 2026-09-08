@@ -22,7 +22,7 @@
  *                     { type: 'run-state', id, vaults }    query each vault's run-state (operational
  *                        metadata only — last result + resync-owed; never a credential)
  *                     { type: 'sync-run', id, spec }       run one bisync; spec = { vault, local, movedFrom?,
- *                        remotePath, resync? }. Uses the prepared config from the last sftp-cred.
+ *                        remotePath, remoteMovedFrom?, resync? }. Uses the prepared config from the last sftp-cred.
  *   child  -> parent : { type: 'hello' }          sent once the child is up, before init
  *                     { type: 'ready', encrypted, reason? }
  *                     { type: 'pong', t }         { type: 'sync-status', id, ok, version?, error? }
@@ -31,8 +31,10 @@
  *                       (a real missing row = never-run), or 'unknown' (unreadable / no state DB — not never-run)
  *                     { type: 'sync-run-result', id, ok, ran?, result?, resyncRequired?, needsAttention?,
  *                        code?, error? }  (a summarized, typed outcome only — never raw output or the cred)
- *                     { type: 'sync-progress', vault, files, bytes }  (in-flight; the TWO aggregate integers
- *                        only — never a line, never a file path; unsolicited, no id, fired as a transfer moves)
+ *                     { type: 'sync-progress', vault, files, filesTotal, bytes, bytesTotal, percent, transferring,
+ *                        fileProgress }  (in-flight; integers only — counts, totals, rclone's percentage, how many
+ *                        files are in flight and the percentage of each — never a line, never a file path;
+ *                        unsolicited, no id, fired as a transfer moves)
  *                     { type: 'bye' }             { type: 'error', op }   (op only — never a raw message)
  *
  * The key is used only to open the database and is then zeroized in this process; it is never logged.
@@ -232,6 +234,24 @@ function onRunState(m) {
   reply({ type: 'run-state-result', id: m.id, states });
 }
 
+// Only numbers leave the helper as progress: each field re-coerced to an integer or null, the per-file list to
+// a short list of integers. Whatever shape the parser handed over, nothing else can ride on this message.
+function progressNumbers(c) {
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const list = Array.isArray(c && c.fileProgress) ? c.fileProgress.filter((x) => Number.isInteger(x) && x >= 0 && x <= 100).slice(0, 8) : [];
+  return {
+    files: num(c && c.files), filesTotal: num(c && c.filesTotal),
+    bytes: num(c && c.bytes), bytesTotal: num(c && c.bytesTotal),
+    percent: num(c && c.percent), transferring: num(c && c.transferring) || 0,
+    fileProgress: list,
+  };
+}
+
+// A remote path is one safe directory segment (the vault's name, or its id form) — the same rule main applies
+// before it is ever sent. It is used here only to build a listing-file key, never a filesystem path.
+const REMOTE_SEGMENT_RE = /^[^\\/\u0000-\u001f]{1,255}$/;
+function isRemoteSegment(s) { return typeof s === 'string' && REMOTE_SEGMENT_RE.test(s) && s !== '.' && s !== '..'; }
+
 // Run one vault sync using the config prepared by the last sftp-cred. Delete-safety, the first-run/blocked
 // resync gate, and the rule that a resync goes ONLY through the zero-loss (keep-both) path live in the
 // engine + its router; this handler just supplies the ephemeral config + workdir and relays a SUMMARIZED
@@ -260,6 +280,12 @@ async function onSyncRun(m) {
     const remote = 'vault:' + b.remotePath;
     // A folder that was moved or renamed keeps its baseline: the prior listings are re-keyed to the new path.
     if (typeof b.movedFrom === 'string' && b.movedFrom) { try { syncEngine.carryListings(workdir, { from: b.movedFrom, to: b.local }); } catch { /* bisync will ask for a repair if it cannot continue */ } }
+    // A vault whose run switched between the account path and this computer's own device path (the same server
+    // directory under another name) keeps its baseline too: the pair's listings are re-keyed to the new remote.
+    // After the local carry, so a move and a switch in the same run compose.
+    if (isRemoteSegment(b.remoteMovedFrom) && b.remoteMovedFrom !== b.remotePath) {
+      try { syncEngine.carryListings(workdir, { from: { local: b.local, remote: 'vault:' + b.remoteMovedFrom }, to: { local: b.local, remote } }); } catch { /* as above */ }
+    }
     // A baseline that recorded an empty side cannot be run normally by bisync; with files now on the local side
     // the fresh baseline goes through the zero-loss path (sync-engine.js explains why nothing is lost).
     let resync = !!b.resync;
@@ -271,10 +297,11 @@ async function onSyncRun(m) {
       runVaultSync({
         runner: rclone, db, vault: b.vault, local: b.local, remote, workdir, config: cfgPath, resync,
         prepareCred: resync ? (() => prepareFreshCred(b.vault, cfgPath)) : undefined,
-        // Progress: the runner extracts the two aggregate {files,bytes} integers from rclone's stats and calls
-        // this as a transfer moves. Forward ONLY those numbers + the vault id on the existing parent channel —
-        // never a line, never a path (the path-bearing stats lines die in the daemon's stats parser).
-        onProgress: (c) => reply({ type: 'sync-progress', vault: b.vault, files: (c && c.files != null) ? c.files : null, bytes: (c && c.bytes != null) ? c.bytes : null }),
+        // Progress: the runner extracts integers from rclone's stats (counts, totals, the percentage, the
+        // in-flight files' percentages) and calls this as they advance; forward them to main as an unsolicited
+        // progress event for the status hub — never a line, never a path (the path-bearing stats lines die in
+        // the daemon's stats parser).
+        onProgress: (c) => reply({ type: 'sync-progress', vault: b.vault, ...progressNumbers(c) }),
       }));
     reply({ type: 'sync-run-result', id: m.id, ok: true, ran: r.ran, result: r.result, reason: r.reason, resyncRequired: r.resyncRequired, needsAttention: r.needsAttention, code: r.code, preserved: r.preserved });
   } catch (err) {

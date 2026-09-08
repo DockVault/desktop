@@ -24,7 +24,7 @@
 const path = require('node:path');
 
 // The only fields the persisted config may carry. Anything credential-adjacent is rejected outright.
-const CONFIG_FIELDS = Object.freeze(['vaultId', 'vaultName', 'localFolder', 'remotePath', 'enabled', 'consented', 'syncId', 'movedFrom', 'markerId']);
+const CONFIG_FIELDS = Object.freeze(['vaultId', 'vaultName', 'localFolder', 'remotePath', 'enabled', 'consented', 'syncId', 'movedFrom', 'markerId', 'lastRemotePath']);
 // The marker file's identity on its volume (folder-marker.js markerIdentity): two integers.
 const MARKER_ID_RE = /^\d{1,40}:\d{1,40}$/;
 // The sync id ties the entry to the marker in the folder's root (folder-marker.js): a UUID the app made.
@@ -191,6 +191,14 @@ function makeConfigEntry(o = {}) {
   if (o.markerId != null) {
     if (typeof o.markerId !== 'string' || !MARKER_ID_RE.test(o.markerId)) throw new Error('config markerId must be a well-formed identity');
     entry.markerId = o.markerId;
+  }
+  // `lastRemotePath` is the server-side path the vault's last COMPLETED run used — the vault's name on the account
+  // path, its id form on this computer's own device path. When the next run takes the other path, the engine
+  // carries the prior listings over to the new remote key, so the switch never demands a repair. Validated with
+  // the same single-segment rule as any remote path.
+  if (o.lastRemotePath != null) {
+    if (typeof o.lastRemotePath !== 'string') throw new Error('config lastRemotePath must be a remote path');
+    entry.lastRemotePath = remotePathForVault(o.lastRemotePath);
   }
   return entry;
 }

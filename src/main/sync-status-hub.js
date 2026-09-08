@@ -71,9 +71,10 @@ class SyncStatusHub {
     this._daemon.on('crash-loop', () => { this._sig.daemon = 'crash-looped'; this._sig.crashLoopLatched = true; this._recompute(); });
     this._daemon.on('resume', () => { this._sig.daemon = 'starting'; this._sig.crashLoopLatched = false; this._recompute(); });
     this._daemon.on('error', () => { this._recompute(); });
-    // In-flight transfer progress from the helper: the two aggregate integers only (files, bytes) for a
-    // vault, never a path. Drives the "syncing" glance so it shows only while bytes actually move.
-    this._daemon.on('sync-progress', (p) => { if (p && p.vault) this.recordProgress(p.vault, { files: p.files, bytes: p.bytes }); });
+    // In-flight transfer progress from the helper: integers only (counts, totals, the percentage, the in-flight
+    // files' percentages) for a vault, never a path. Drives the "syncing" glance so it shows only while bytes
+    // actually move.
+    this._daemon.on('sync-progress', (p) => { if (p && p.vault) this.recordProgress(p.vault, p); });
   }
 
   // ---- signal setters (the app + the scheduler drive these) ----
@@ -111,18 +112,27 @@ class SyncStatusHub {
   }
 
   /**
-   * Record in-flight transfer progress for a vault: the two aggregate integers the daemon extracted from
-   * rclone's stats (files + bytes transferred — never a path). Motion, and so the "syncing" glance, is
-   * shown ONLY when real bytes are moving (a positive count); a run that is merely scanning reports nothing
-   * and keeps the vault quiet at its last real state.
+   * Record in-flight transfer progress for a vault: the integers the daemon extracted from rclone's stats
+   * (files + bytes transferred, their totals, rclone's percentage, how many files are in flight and the
+   * percentage of each — never a path). Motion, and so the "syncing" glance, is shown ONLY when something is
+   * really moving (a positive count, or a file in flight); a run that is merely scanning reports nothing and
+   * keeps the vault quiet at its last real state.
    */
-  recordProgress(vault, { files, bytes } = {}) {
+  recordProgress(vault, p = {}) {
     const e = this._vaults.get(vault); if (!e || !e.running) return; // only the run in flight has progress
-    const f = typeof files === 'number' ? files : null;
-    const b = typeof bytes === 'number' ? bytes : null;
-    if (!((f != null && f > 0) || (b != null && b > 0))) return; // a zero/empty report is not motion — stay quiet
+    const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+    const f = num(p.files);
+    const b = num(p.bytes);
+    const inFlight = num(p.transferring) || 0;
+    if (!((f != null && f > 0) || (b != null && b > 0) || inFlight > 0)) return; // a zero/empty report is not motion — stay quiet
     e.transferring = true;
-    e.progress = { files: f, bytes: b };
+    e.progress = {
+      files: f, filesTotal: num(p.filesTotal),
+      bytes: b, bytesTotal: num(p.bytesTotal),
+      percent: num(p.percent),
+      transferring: inFlight,
+      fileProgress: Array.isArray(p.fileProgress) ? p.fileProgress.filter((x) => Number.isInteger(x) && x >= 0 && x <= 100).slice(0, 8) : [],
+    };
     this._recompute();
   }
 

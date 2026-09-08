@@ -29,6 +29,18 @@ const CRASH_WINDOW_MS = 3 * 60 * 1000;
 // stopping a looping helper from minting without bound (each mint is a server credential row + an audit line).
 const MAX_CRED_REQUESTS_PER_RUN = 512;
 
+// The progress fields, each re-coerced: a finite number or null; the per-file list to at most 8 integers 0..100.
+function progressFields(m) {
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const list = Array.isArray(m && m.fileProgress) ? m.fileProgress.filter((x) => Number.isInteger(x) && x >= 0 && x <= 100).slice(0, 8) : [];
+  return {
+    files: num(m && m.files), filesTotal: num(m && m.filesTotal),
+    bytes: num(m && m.bytes), bytesTotal: num(m && m.bytesTotal),
+    percent: num(m && m.percent), transferring: num(m && m.transferring) || 0,
+    fileProgress: list,
+  };
+}
+
 class DaemonManager {
   constructor(userDataDir, rcloneConfig = null, opts = {}) {
     this.dir = userDataDir;
@@ -135,10 +147,11 @@ class DaemonManager {
         }
         break;
       }
-      // Unsolicited in-flight progress: the two aggregate integers only (files, bytes) for a vault. Emitted as
-      // an event for the status hub. It is not a reply (no id) and carries no path — the numbers are re-coerced
-      // here so nothing but a number or null can pass on, whatever the helper sent.
-      case 'sync-progress': this._emit('sync-progress', { vault: m.vault, files: typeof m.files === 'number' ? m.files : null, bytes: typeof m.bytes === 'number' ? m.bytes : null }); break;
+      // Unsolicited in-flight progress: integers only (counts, totals, the percentage, the in-flight files'
+      // percentages) for a vault. Emitted as an event for the status hub. It is not a reply (no id) and carries no
+      // path — every field is re-coerced here so nothing but a number, null, or a short list of integers can pass
+      // on, whatever the helper sent.
+      case 'sync-progress': this._emit('sync-progress', { vault: m.vault, ...progressFields(m) }); break;
       // The helper asks main to mint+send a fresh single-use credential for the CURRENT resync's next process.
       case 'need-sftp-cred': void this._onNeedSftpCred(m); break;
       case 'run-state-result': {

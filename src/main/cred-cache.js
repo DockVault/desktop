@@ -65,7 +65,14 @@ class CredCache {
     this._epoch = typeof io.epoch === 'function' ? io.epoch : null;
     this._now = io.now || (() => Date.now());
     this._pins = new Map(); // host -> pinnedHostKeys  (SESSION pin: carried unchanged; a restart re-fetches)
+    this._endpoint = null;  // { host, port } of the last mint — the address the runs connect to (no secret)
   }
+
+  /** The SFTP address the last minted credential pointed at ({ host, port }), or null before any mint. */
+  lastEndpoint() { return this._endpoint ? { ...this._endpoint } : null; }
+
+  /** The session's pinned host key line(s) for `host` (comma-joined OpenSSH public-key lines), or null. */
+  pinnedHostKeys(host) { return (host != null && this._pins.has(host)) ? this._pins.get(host) : null; }
 
   /**
    * Mint a FRESH single-use credential for `vaultId`, resolve the session host-key pin, and send it to the
@@ -82,6 +89,7 @@ class CredCache {
     let access;
     try { access = await this._mint(vaultId); }
     catch (e) { return { ok: false, reason: classifyMintError(e) }; }
+    if (access && typeof access.host === 'string' && Number.isInteger(access.port)) this._endpoint = { host: access.host, port: access.port };
     // Resolve the SESSION pin for this server: pin once, carry it unchanged, mismatch on a changed re-fetch.
     const pin = this._resolvePin(access && access.host, (access && access.hostKeys) || null);
     if (!pin.ok) { this._zeroize(access); return { ok: false, reason: pin.reason }; }

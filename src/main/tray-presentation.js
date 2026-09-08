@@ -35,6 +35,10 @@ const REASON_DETAIL = Object.freeze({
   'device-being-rechecked': "this computer's sync identity is being re-checked — sign in once to finish",
   'grant-details-pending': 'sign in once to finish setting up this vault',
   'device-access-check': "re-checking this computer's access",
+  // The sync server (the SFTP address) can't be reached, or what answers there isn't a sync server. Worded so it
+  // reads honestly whether calm (a laptop that woke before its network) or, once it persists, a must-act.
+  'sync-server-unreachable': "the sync server can't be reached right now",
+  'sync-server-unverified': "what's at that address isn't answering as a sync server",
   // The saved sync state exists but cannot be unlocked/opened on this machine. Lead with reassurance —
   // the person's actual files are never touched by this — because a bare "sync problem" over an unreadable
   // database could read as data loss. (The deliberate reset that clears it is a fast-follow.)
@@ -70,14 +74,19 @@ function formatBytes(n) {
   return `${val} ${units[i]}`;
 }
 
-// The honest, percentage-free transfer detail from the two aggregate counts: "3 files", "4.2 MB", or both.
-// Never a total (the size-compare can't know total work ahead), never a path — just what has moved so far.
+// The transfer detail from the numbers the helper parsed out of rclone's stats: the percentage when rclone
+// states one, what has moved of what is queued ("4.2 MB of 9.1 MB", "3 of 8 files"), or just what has moved so
+// far when no total is known yet. Numbers only — never a path.
 function progressDetail(progress) {
   if (!progress) return null;
   const parts = [];
-  if (typeof progress.files === 'number' && progress.files > 0) parts.push(progress.files === 1 ? '1 file' : `${progress.files} files`);
+  if (Number.isInteger(progress.percent) && progress.percent >= 0 && progress.percent <= 100) parts.push(`${progress.percent}%`);
+  const f = progress.files; const ft = progress.filesTotal;
+  if (typeof f === 'number' && typeof ft === 'number' && ft > 0) parts.push(`${f} of ${ft} ${ft === 1 ? 'file' : 'files'}`);
+  else if (typeof f === 'number' && f > 0) parts.push(f === 1 ? '1 file' : `${f} files`);
   const b = formatBytes(progress.bytes);
-  if (b) parts.push(b);
+  const t = formatBytes(progress.bytesTotal);
+  if (b && t) parts.push(`${b} of ${t}`); else if (b) parts.push(b);
   return parts.length ? parts.join(' · ') : null;
 }
 
@@ -189,7 +198,7 @@ function tooltip(model, lockPhase, pinned, options = {}) {
 const HANDLED_ACTION_KINDS = Object.freeze([
   'restart', 'recover-folder', 'repair', 'setup-helper',
   'open', 'reopen', 'review', 'sign-in', 'unlock', 'check-identity', 'choose-folder', 'reset-device', 'set-up-again',
-  'relocate-folder',
+  'relocate-folder', 'troubleshoot',
 ]);
 
 // The vault's display NAME for a label, resolved from the caller's id→name map (the configured list). The
@@ -215,6 +224,10 @@ function itemForVault(v, nameById) {
     case 'host-key-mismatch': return { kind: 'check-identity', vault: v.vault, label: `Check ${name}: the server identity changed` };
     case 'vault-unavailable': return { kind: 'open', vault: v.vault, label: `${name} can't sync right now — it may have been changed or removed` };
     case 'not-syncing': return { kind: 'open', vault: v.vault, label: `${name} hasn't synced for a while — check your connection` };
+    // The sync server itself, not the account: the address can't be reached, or what answers there is not a sync
+    // server. Both open Troubleshoot, whose connection check tests the saved server and SFTP address separately.
+    case 'sync-server-unreachable': return { kind: 'troubleshoot', vault: v.vault, label: `${name} can't sync — the sync server can't be reached` };
+    case 'sync-server-unverified': return { kind: 'troubleshoot', vault: v.vault, label: `${name} can't sync — what's at the sync server address isn't a sync server` };
     case 'folder-problem': return { kind: 'recover-folder', vault: v.vault, label: `The sync folder for ${name} is shared again — make it private` };
     case 'folder-insecure':
     case 'folder-rejected': return { kind: 'choose-folder', vault: v.vault, label: `The sync folder for ${name} can't be used — choose a folder again` };

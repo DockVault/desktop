@@ -28,8 +28,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { planPreservation } = require('./resync-plan');
 const { keepBothName } = require('./keepboth-name');
-const { runBisync, credPrepareOutcome, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS } = require('./sync-engine');
-const { RESULT } = require('./bisync-outcome');
+const { runBisync, credPrepareOutcome, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS, CONNECT_BOUND_ARGS } = require('./sync-engine');
+const { RESULT, classifyConnectionFailure } = require('./bisync-outcome');
 const { recordRun } = require('../main/state-db');
 
 // `rclone lsf -R --files-only` -> sorted rel paths (forward slashes, rclone's form).
@@ -138,8 +138,16 @@ async function zeroLossResync(o) {
 
   // 1. FAIL-CLOSED enumeration of the server side.
   { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved: 0 }; }
-  const ls = await o.runner.run(['lsf', '-R', '--files-only', o.remote, ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts);
-  if (ls.code !== 0) throw new Error('zero-loss resync: could not enumerate the server — refusing to resync');
+  const ls = await o.runner.run(['lsf', '-R', '--files-only', o.remote, ...CONNECT_BOUND_ARGS, ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts);
+  if (ls.code !== 0) {
+    // A connection-level failure gets its typed outcome (nothing ran against the vault, so the baseline question is
+    // left as it was — never a "repair owed" for a door that did not open) —
+    // an unreachable door or a changed server identity must read as exactly that, not as a generic error that
+    // is retried with a fresh credential every tick. Anything else stays the fail-closed refusal.
+    const conn = classifyConnectionFailure(ls.stdout, ls.stderr);
+    if (conn) return { ran: true, result: conn, preserved: 0, resyncRequired: null, needsAttention: true };
+    throw new Error('zero-loss resync: could not enumerate the server — refusing to resync');
+  }
   const serverList = parseLsf(ls.stdout);
   const localList = walkLocal(o.local);
   const localSet = new Set(localList);
@@ -151,7 +159,7 @@ async function zeroLossResync(o) {
   let differing = [];
   if (onBoth.length) {
     { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved: 0 }; }
-    const chk = await o.runner.run(['check', o.local, o.remote, '--download', '--combined', '-', ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts)
+    const chk = await o.runner.run(['check', o.local, o.remote, '--download', '--combined', '-', ...CONNECT_BOUND_ARGS, ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts)
       .catch((e) => ({ code: -1, stdout: '', stderr: String(e) }));
     const parsed = parseCheckDiffering(chk.stdout, onBoth);
     if (parsed.compareError || parsed.covered.size !== onBoth.length) {
@@ -166,7 +174,7 @@ async function zeroLossResync(o) {
   for (const action of plan) {
     { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved }; }
     const { full, rel } = reserveLocalPath(o.local, action, source, at);
-    const cp = await o.runner.run(['copyto', `${o.remote}/${action.from}`, full, ...SYNC_STATS_ARGS], scanOpts)
+    const cp = await o.runner.run(['copyto', `${o.remote}/${action.from}`, full, ...CONNECT_BOUND_ARGS, ...SYNC_STATS_ARGS], scanOpts)
       .catch((e) => ({ code: -1, stderr: String(e) }));
     if (cp.code !== 0) { try { fs.rmSync(full, { force: true }); } catch { /* best effort */ } throw new Error(`zero-loss resync: failed to preserve ${action.from} -> ${rel}`); }
     preserved += 1;

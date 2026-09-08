@@ -46,22 +46,66 @@
     return { text, exact: d.toLocaleString() };
   }
 
-  // The live state of a vault synced here, as one plain phrase and a colour.
-  function stateOf(local) {
-    if (!local) return { text: '', tone: '' };
-    if (local.running) return { text: 'Syncing now', tone: 'run' };
-    switch (local.state) {
-      case 'up-to-date': return { text: 'Up to date', tone: 'ok' };
-      case 'waiting': return { text: 'Waiting to start', tone: '' };
-      case 'syncing': return { text: 'Syncing', tone: 'run' };
-      case 'paused': return { text: 'Paused', tone: 'warn' };
-      case 'needs-decision': return { text: 'Needs your decision', tone: 'warn' };
-      case 'sync-problem': return { text: 'Problem', tone: 'bad' };
-      case 'unavailable': return { text: 'Unavailable', tone: 'bad' };
-      case null: case undefined: return { text: 'Not run yet', tone: '' };
-      default: return { text: String(local.state), tone: '' };
+  // Sizes for the transfer detail: binary steps, a round number below 10 of a unit, one decimal otherwise.
+  function fmtBytes(n) {
+    if (typeof n !== 'number' || !(n > 0)) return null;
+    const units = ['B', 'KB', 'MB', 'GB', 'TB']; let v = n; let i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+    return `${(i === 0 || v >= 10) ? Math.round(v) : Math.round(v * 10) / 10} ${units[i]}`;
+  }
+  // The transfer in flight, as numbers only (main hands over counts, totals and percentages — never a name):
+  // the headline percentage, a one-line detail for the hover, and how many files are moving.
+  function transferOf(p) {
+    if (!p || typeof p !== 'object') return null;
+    const pct = Number.isInteger(p.percent) && p.percent >= 0 && p.percent <= 100 ? p.percent : null;
+    const parts = [];
+    if (pct != null) parts.push(`${pct}%`);
+    const moved = fmtBytes(p.bytes); const total = fmtBytes(p.bytesTotal);
+    if (moved && total) parts.push(`${moved} of ${total}`); else if (moved) parts.push(moved);
+    if (typeof p.files === 'number' && typeof p.filesTotal === 'number' && p.filesTotal > 0) parts.push(`${p.files} of ${p.filesTotal} ${p.filesTotal === 1 ? 'file' : 'files'} done`);
+    else if (typeof p.files === 'number' && p.files > 0) parts.push(`${p.files} ${p.files === 1 ? 'file' : 'files'} done`);
+    const inFlight = Number.isInteger(p.transferring) && p.transferring > 0 ? p.transferring : 0;
+    const bars = Array.isArray(p.fileProgress) ? p.fileProgress.filter((x) => Number.isInteger(x) && x >= 0 && x <= 100).slice(0, 8) : [];
+    return { pct, detail: parts.join(' · ') || 'Transferring…', inFlight, bars };
+  }
+
+  // The live state of a vault synced here: one plain phrase, a colour, an icon, and what the hover says. Three
+  // faces are kept distinct on purpose — idle (a tick), syncing (an animated arrow; the percentage on hover),
+  // and a problem (a mark) — so a glance at the card tells them apart without reading.
+  // Faces that outrank a plain "syncing": a run may be moving bytes under one of these (a Repair transfers while
+  // it still "needs your decision"). Then the face stays, and the transfer strip shows the numbers underneath —
+  // so the window never reads a bare "Syncing" while the tray reads "Needs your decision" for the same vault.
+  const OUTRANKS_SYNCING = new Set(['paused', 'needs-decision', 'sync-problem', 'unavailable']);
+  function faceOf(state) {
+    switch (state) {
+      case 'up-to-date': return { text: 'Up to date', tone: 'ok', icon: 'ok', title: 'Everything in this folder matches the vault.' };
+      case 'waiting': return { text: 'Waiting to start', tone: '', icon: 'idle', title: 'Set up, but it has not synced yet.' };
+      case 'syncing': return { text: 'Syncing', tone: 'run', icon: 'xfer', title: 'Transferring…' };
+      case 'paused': return { text: 'Paused', tone: 'warn', icon: 'pause', title: 'Syncing is paused for now; it resumes on its own when it can.' };
+      case 'needs-decision': return { text: 'Needs your decision', tone: 'warn', icon: 'ask', title: 'Syncing is waiting for a choice from you.' };
+      case 'sync-problem': return { text: 'Problem', tone: 'bad', icon: 'bad', title: 'Syncing is not working right now.' };
+      case 'unavailable': return { text: 'Unavailable', tone: 'bad', icon: 'bad', title: 'Syncing cannot run on this computer right now.' };
+      case null: case undefined: return { text: 'Not run yet', tone: '', icon: 'idle', title: '' };
+      default: return { text: 'Checking…', tone: '', icon: 'idle', title: '' }; // an unknown state never shows a raw token
     }
   }
+  function stateOf(local) {
+    if (!local) return { text: '', tone: '', icon: '', title: '' };
+    const t = local.running ? transferOf(local.progress) : null;
+    if (t) {
+      // Bytes are moving. If nothing higher-ranked is outstanding, this is the plain syncing face; otherwise the
+      // higher face (a Repair, say) stays and the strip carries the numbers.
+      const higher = OUTRANKS_SYNCING.has(local.state) ? faceOf(local.state) : { text: 'Syncing', tone: 'run', icon: 'xfer' };
+      return { ...higher, title: `Transferring — ${t.detail}${t.inFlight ? ` · ${t.inFlight} ${t.inFlight === 1 ? 'file' : 'files'} at once` : ''}`, transfer: t };
+    }
+    if (local.running && local.state !== 'syncing' && !OUTRANKS_SYNCING.has(local.state)) {
+      // A run in flight that is only scanning (no bytes yet), and nothing higher outstanding: an honest "Checking…".
+      // A state the model already calls 'syncing' keeps the syncing face below (it means bytes are, or were just, moving).
+      return { text: 'Checking…', tone: 'run', icon: 'busy', title: 'Checking for changes…' };
+    }
+    return faceOf(local.state);
+  }
+  const ICON_GLYPH = { ok: '\u2713', xfer: '\u2191', busy: '\u21bb', pause: '\u2016', ask: '?', bad: '!', idle: '\u00b7' };
 
   // How a configured vault stands with this computer (the scheduler's own rule), as a badge and a sentence.
   function standingOf(v) {
@@ -128,7 +172,7 @@
   function syncNow(card, v, btn) {
     if (!api) return;
     btn.disabled = true; btn.textContent = 'Syncing…';
-    setChip(card, { text: 'Syncing now', tone: 'run' });
+    setChip(card, { text: 'Checking…', tone: 'run', icon: 'busy', title: 'Checking for changes…' });
     api.act({ kind: 'sync-now', vaultId: v.vaultId }).then((r) => {
       if (r && r.ok) return;
       btn.disabled = false; btn.textContent = 'Sync now';
@@ -138,9 +182,32 @@
     }).catch(() => { btn.disabled = false; btn.textContent = 'Sync now'; });
   }
   function setChip(card, s) {
-    const dot = card.querySelector('.state .dot'); const txt = card.querySelector('.state .meta');
+    const st = card.querySelector('.state');
+    const dot = card.querySelector('.state .dot'); const txt = card.querySelector('.state .meta'); const ico = card.querySelector('.state .ico');
     if (dot) dot.className = `dot ${s.tone}`;
     if (txt) txt.textContent = s.text;
+    if (ico) { ico.className = `ico ${s.icon || 'idle'}`; ico.textContent = ICON_GLYPH[s.icon] || ''; }
+    if (st) st.title = s.title || '';
+    setTransfer(card, s.transfer || null);
+  }
+  // The transfer strip under the title while bytes move: an overall bar, how many files are in flight, and a
+  // small bar per file (numbers only — the files are not named here). Removed the moment nothing is moving.
+  function setTransfer(card, t) {
+    let strip = card.querySelector('.xfer');
+    if (!t) { if (strip) strip.remove(); return; }
+    if (!strip) { strip = el('div', 'xfer'); const title = card.querySelector('.title'); if (title && title.nextSibling) card.insertBefore(strip, title.nextSibling); else card.appendChild(strip); }
+    strip.replaceChildren();
+    const bar = el('div', 'bar'); const fill = el('div', 'fill'); fill.style.width = `${t.pct != null ? t.pct : 0}%`; if (t.pct == null) fill.classList.add('indeterminate'); bar.appendChild(fill); bar.title = t.detail;
+    strip.appendChild(bar);
+    const line = el('div', 'xfer-line');
+    line.appendChild(el('span', 'meta', t.detail));
+    if (t.inFlight) {
+      const files = el('span', 'files'); files.appendChild(el('span', 'meta', `${t.inFlight} ${t.inFlight === 1 ? 'file' : 'files'} at once`));
+      for (const pct of t.bars) { const mini = el('span', 'mini'); mini.title = `${pct}%`; const f = el('span', 'fill'); f.style.width = `${pct}%`; mini.appendChild(f); files.appendChild(mini); }
+      if (t.inFlight > t.bars.length && t.bars.length) files.appendChild(el('span', 'meta', `+${t.inFlight - t.bars.length}`));
+      line.appendChild(files);
+    }
+    strip.appendChild(line);
   }
 
   function vaultCard(computer, v) {
@@ -149,8 +216,9 @@
     t.appendChild(el('span', 'vault', v.name));
     const standing = standingOf(v);
     if (standing) t.appendChild(el('span', `badge ${standing.tone}`, standing.badge));
-    if (v.local) { const s = stateOf(v.local); const st = el('span', 'state'); st.appendChild(el('span', `dot ${s.tone}`)); st.appendChild(el('span', 'meta', s.text)); t.appendChild(el('span', 'spacer')); t.appendChild(st); }
+    if (v.local) { const st = el('span', 'state'); st.appendChild(el('span', 'dot')); st.appendChild(el('span', 'ico')); st.appendChild(el('span', 'meta')); t.appendChild(el('span', 'spacer')); t.appendChild(st); }
     c.appendChild(t);
+    if (v.local) setChip(c, stateOf(v.local));
     if (standing) c.appendChild(el('p', 'standing', standing.text));
     if (v.local && v.local.reasonText) c.appendChild(el('p', 'reason', v.local.reasonText));
     c.appendChild(row('On server', v.remote, true));
@@ -270,7 +338,7 @@
     for (const live of status.vaults) {
       const card = body.querySelector(`.card[data-vault="${cssEscape(live.vault)}"]`);
       if (!card) continue;
-      const local = { state: live.state, reason: live.reason, running: !!live.running, lastSyncedAt: live.lastSyncedAt };
+      const local = { state: live.state, reason: live.reason, running: !!live.running, lastSyncedAt: live.lastSyncedAt, progress: live.progress || null };
       setChip(card, stateOf(local));
       const syncBtn = card.querySelector('button[data-role="sync-now"]');
       if (syncBtn && !card.querySelector('.confirm')) { syncBtn.disabled = !!live.running; if (!live.running) syncBtn.textContent = 'Sync now'; }

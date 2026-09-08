@@ -217,7 +217,7 @@ app.whenReady().then(async () => {
       const after = await ev(win, snapshot);
       return { before: before.sections[0].cards[0].state, after: after.sections[0].cards[0].state, syncNowDisabled: await ev(win, `[...document.querySelectorAll('.card .actions > button')].find(b => b.textContent === 'Sync now').disabled`), lists, listsAfter: ctx.log.filter((l) => l[0] === 'listDevices').length };
     } });
-    out.H_pass = r.before === 'Up to date' && r.after === 'Syncing now' && r.syncNowDisabled === true && r.lists === r.listsAfter;
+    out.H_pass = r.before === 'Up to date' && r.after === 'Syncing' && r.syncNowDisabled === true && r.lists === r.listsAfter;
   }
 
   // I) a folder that cannot be found: the card says so and offers "Find the folder…", which asks main for the offer

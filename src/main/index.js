@@ -721,6 +721,9 @@ function handleMustAct(item) {
   if (item && item.kind === 'recover-folder' && item.vault) { void recoverSharedFolder(item.vault); return; }
   // The folder is known by its marker and cannot be found (or is not the one at its path): the relocate-or-stop offer.
   if (item && item.kind === 'relocate-folder' && item.vault) { void relocateFolder(item.vault); return; }
+  // The sync server can't be reached or isn't answering as one: Troubleshoot's connection check tests the saved
+  // server and SFTP address separately and says which leg fails.
+  if (item && item.kind === 'troubleshoot') { void openTroubleshoot(); return; }
   // The deliberate Repair: the ONLY thing that clears a blocked-after-run latch (a resync owed, or a
   // >50%-delete abort). It enqueues a manual repair run; the dispatch then asks the keep-both confirm
   // (confirmFirstUpload kind 'repair') before doing a zero-loss resync — nothing is auto-resynced.
@@ -1359,12 +1362,18 @@ function startSyncScheduler() {
       // Stamp the run with the credential path it took, so the glance can say which kind of sync ran; and
       // once the run has ended in any way, forget the run's latched path so the next run decides afresh.
       if (ev && ev.phase === 'running') ev = { ...ev, via: mintPath.current(vaultId) };
-      // A run COMPLETED after a move (a clean run, a resync, or a kept-both run — not an abort or a missing-listing
-      // outcome): the engine has carried its listings over, so the old path is forgotten.
+      // A run COMPLETED (a clean run, a resync, or a kept-both run — not an abort or a missing-listing outcome):
+      // the engine has carried any listings over, so a move's old path is forgotten, and the server-side path this
+      // run used is remembered for the next run's carry-over should it take the other credential path.
       if (ev && ev.phase === 'done' && ev.outcome && ev.outcome.ran === true && ['ok', 'resync-ok', 'conflict-keep-both'].includes(ev.outcome.result)) {
         try {
           const cur = storedConfig().find((e) => e.vaultId === vaultId);
-          if (cur && cur.movedFrom) { const { movedFrom, ...rest } = cur; syncConfigStore.saveConfig(safeStorage, dir, syncConfig.upsertEntry(storedConfig(), syncConfig.makeConfigEntry(rest))); }
+          const usedRemote = typeof ev.remotePath === 'string' && ev.remotePath ? ev.remotePath : null;
+          if (cur && (cur.movedFrom || (usedRemote && cur.lastRemotePath !== usedRemote))) {
+            const { movedFrom, ...rest } = cur;
+            if (usedRemote) rest.lastRemotePath = usedRemote;
+            syncConfigStore.saveConfig(safeStorage, dir, syncConfig.upsertEntry(storedConfig(), syncConfig.makeConfigEntry(rest)));
+          }
         } catch { /* best-effort; the carry-over is idempotent and runs again next time */ }
       }
       // The server has ended this computer's identity (removed by the owner, or expired): the local secret can
@@ -1414,6 +1423,25 @@ function startSyncScheduler() {
   // among this computer's active grants with a recorded Standard tier, and the remote path is the vault's
   // rename-proof id form; on the account path the existing fresh vault-list re-assert runs as before.
   io.credentialPath = (vaultId) => mintPath.current(vaultId); // which path this vault's run took, for the auth-failure routing
+  // The endpoint gate's credential-free probe (see sync-scheduler.js): after a connect failure the scheduler asks
+  // this INSTEAD of minting. It connects to the SFTP address the runs use — the one verified at set-up when there
+  // is one, else the address of the last mint — performs a from-scratch SSH key exchange (no credential is sent;
+  // the server signs, the probe verifies) and compares the presented host key with the session's pin. Typed
+  // answers only: unreachable, not an SSH server this app can talk to, a changed identity, or ok. No address to
+  // probe (a set-up from before the address was asked for, and no mint yet) => ok, and the scheduler's back-off
+  // alone bounds the minting.
+  io.probeEndpoint = async () => {
+    const saved = serverConfig.readSftpEndpoint(dir);
+    const at = (saved && saved.host && Number.isInteger(saved.port)) ? { host: saved.host, port: saved.port } : (credCache ? credCache.lastEndpoint() : null);
+    if (!at) return { ok: true };
+    let r;
+    try { r = await probeSftp(at); } catch { r = { kind: 'unreachable' }; }
+    if (!r || r.kind === 'unreachable') return { ok: false, reason: 'sync-server-unreachable' };
+    if (r.kind !== 'ok') return { ok: false, reason: 'sync-server-unverified' }; // not-ssh / ssh-unsupported
+    const pinned = credCache ? credCache.pinnedHostKeys(at.host) : null;
+    if (pinned && typeof r.hostKey === 'string' && !pinAccepts(pinned, r.hostKey)) return { ok: false, reason: 'host-key-mismatch' };
+    return { ok: true };
+  };
   const accountEligible = io.verifyEligible;
   io.verifyEligible = async (vaultId) => {
     const d = await mintPath.begin(vaultId);
@@ -2192,6 +2220,14 @@ function forgetVaultHistory(vaultId) {
   try { if (daemon) daemon.forgetVault(vaultId); } catch { /* best-effort */ }
 }
 
+// Whether a presented host key line ("<type> <base64>") is one of the pinned lines (comma-joined OpenSSH public
+// key lines, each possibly carrying a trailing comment). Compared on type + key material only.
+function pinAccepts(pinned, presented) {
+  const norm = (line) => String(line).trim().split(/\s+/).slice(0, 2).join(' ');
+  const want = norm(presented);
+  return String(pinned).split(',').some((k) => norm(k) === want);
+}
+
 function infoBox(title, detail) {
   try { return dialog.showMessageBox(mainWindow, { type: 'info', title, noLink: true, message: title, detail, buttons: ['OK'] }).then(() => undefined).catch(() => undefined); } catch { return Promise.resolve(); }
 }
@@ -2364,9 +2400,14 @@ function buildManageIo() {
       return { status: gm.status === 'absent' ? 'absent' : 'ok', has: (id) => Object.prototype.hasOwnProperty.call(meta, id) };
     },
     reasonText: (live, name) => {
+      // A decision or a problem: lead with the actionable must-act line (what to do), so the card never leaves the
+      // person with only a calm restatement while the tray offers the next step. Calmer states keep the short detail.
+      if (live.state === 'needs-decision' || live.state === 'sync-problem') {
+        const item = trayPresentation.itemForVault({ vault: live.vault, reason: live.reason }, name ? { [live.vault]: name } : {});
+        if (item && item.label) return item.label;
+      }
       const detail = trayPresentation.REASON_DETAIL[live.reason];
       if (detail) return detail.charAt(0).toUpperCase() + detail.slice(1) + '.';
-      if (live.state === 'needs-decision' || live.state === 'sync-problem') return trayPresentation.itemForVault({ vault: live.vault, reason: live.reason }, name ? { [live.vault]: name } : {}).label;
       return null;
     },
     myGrants: async () => {

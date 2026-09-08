@@ -26,6 +26,7 @@ const RESULT = Object.freeze({
   NEEDS_RESYNC: 'needs-resync',                      // missing prior listing / critical error; resync required
   HOST_KEY_MISMATCH: 'host-key-mismatch',            // pinned != presented (MITM signal) — block, no auto-TOFU
   AUTH_FAILED: 'auth-failed',                        // SFTP auth refused (e.g. a lapsed credential) — sign-in-needed
+  CONNECT_FAILED: 'connect-failed',                  // the SFTP door could not be reached at all (refused / timed out / no such host)
   PATH_TOO_LONG: 'path-too-long',                    // a file skipped for OS path length — surface which one
   ERROR: 'error',                                    // any other non-zero exit
 });
@@ -51,6 +52,10 @@ const SIG = Object.freeze({
   // SFTP authentication refused — the ssh handshake got past host-key verification but auth failed (e.g. a
   // lapsed/rotated temp-cred): "ssh: unable to authenticate, attempted methods [none password] ...".
   authFailed: /unable to authenticate|no supported methods remain|permission denied \(publickey,?password/i,
+  // The door could not be reached: "NewFs: couldn't connect SSH: dial tcp host:port: connectex: … actively refused
+  // it." / "… i/o timeout" / "dial tcp: lookup host: no such host". Tested AFTER the mismatch and auth signatures:
+  // rclone wraps both of those in the same "couldn't connect SSH" prefix, and each has its own honest state.
+  connectFailed: /couldn't connect ssh|dial tcp|connection refused|actively refused|i\/o timeout|no such host|network is unreachable|no route to host|connection reset by peer/i,
   // An individual file rejected for path/name length (Windows and POSIX wordings).
   pathTooLong: /path too long|file ?name too long|filename or extension is too long|name too long/i,
   // A keep-both conflict rename (bisync's safe default): both copies preserved, neither overwritten.
@@ -58,6 +63,21 @@ const SIG = Object.freeze({
 });
 
 function haystack(stdout, stderr) { return String(stdout == null ? '' : stdout) + '\n' + String(stderr == null ? '' : stderr); }
+
+/**
+ * The connection-level verdict of ANY failed rclone process against the vault (not only bisync): a changed
+ * server identity, an auth refusal, or an unreachable door — or null when the failure is something else. Used by
+ * the zero-loss resync's first step, so a server that cannot be reached during a first sync gets the same typed
+ * state (and the same stop on minting) as it does on a routine run.
+ * @returns {string|null} a RESULT value, or null
+ */
+function classifyConnectionFailure(stdout, stderr) {
+  const text = haystack(stdout, stderr);
+  if (SIG.hostKeyMismatch.test(text)) return RESULT.HOST_KEY_MISMATCH;
+  if (SIG.authFailed.test(text)) return RESULT.AUTH_FAILED;
+  if (SIG.connectFailed.test(text)) return RESULT.CONNECT_FAILED;
+  return null;
+}
 
 /**
  * @param {{code:number, stdout?:string, stderr?:string, resync?:boolean}} o
@@ -80,6 +100,12 @@ function classifyBisyncOutcome(o) {
   if (SIG.needsResync.test(text)) return { result: RESULT.NEEDS_RESYNC, resyncRequired: true, needsAttention: true };
 
   if (o.code !== 0) {
+    // The door could not be reached: nothing ran against the vault, so the baseline is untouched. Its own typed
+    // state — the scheduler stops minting credentials against a door that does not answer, and the person is told
+    // the sync server can't be reached rather than shown a credential-limit message. Tested AFTER the safety
+    // aborts above (a genuine >50%-delete / all-changed abort whose stderr also mentions a transient network
+    // phrase keeps its needs-repair latch), and its signature is deliberately narrow.
+    if (SIG.connectFailed.test(text)) return { result: RESULT.CONNECT_FAILED, resyncRequired: null, needsAttention: true };
     // A non-zero exit with no recognized safety signature: name path-too-long distinctly if that is the
     // cause, else a generic error. Neither changes the resync block (no new baseline was established).
     if (SIG.pathTooLong.test(text)) return { result: RESULT.PATH_TOO_LONG, resyncRequired: null, needsAttention: true };
@@ -93,4 +119,4 @@ function classifyBisyncOutcome(o) {
   return { result: o.resync ? RESULT.RESYNC_OK : RESULT.OK, resyncRequired: false, needsAttention: false };
 }
 
-module.exports = { classifyBisyncOutcome, RESULT, HOST_KEY_UNVERIFIED, SIG };
+module.exports = { classifyBisyncOutcome, classifyConnectionFailure, RESULT, HOST_KEY_UNVERIFIED, SIG };

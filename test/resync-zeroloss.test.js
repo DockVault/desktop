@@ -60,6 +60,8 @@ test('reserveLocalPath: exclusive-create (never clobbers), path-contained, keep-
 function fakeRunner(responses, rec) {
   return {
     run: async (args) => {
+      if (rec) rec.args = (rec.args || []); // every rclone op the resync launches, for the connection-bound assertion
+      if (rec && args[0] !== 'obscure') rec.args.push(args);
       if (args[0] === 'lsf') return responses.lsf || { code: 0, stdout: '' };
       if (args[0] === 'check') return responses.check || { code: 0, stdout: '' };
       if (args[0] === 'copyto') { rec.push({ from: args[1], to: args[2] }); return { code: 0, stdout: '' }; }
@@ -141,4 +143,37 @@ test('walkLocal: the folder\'s identity marker at the root (and a torn write of 
   fs.writeFileSync(path.join(d, 'a.txt'), '1');
   assert.deepStrictEqual(walkLocal(d), ['a.txt', 'sub/.dockvault-sync']);
   fs.rmSync(d, { recursive: true, force: true });
+});
+
+test('zeroLossResync: a CONNECTION-level failure at the first step is a typed outcome (nothing ran, baseline untouched), not a generic refusal', async () => {
+  const root = tmp();
+  const cases = [
+    ["NewFs: couldn't connect SSH: dial tcp 203.0.113.5:22: connectex: No connection could be made because the target machine actively refused it.", 'connect-failed'],
+    ['ssh: handshake failed: knownhosts: key mismatch', 'host-key-mismatch'],
+    ['ssh: handshake failed: ssh: unable to authenticate, attempted methods [none password]', 'auth-failed'],
+  ];
+  for (const [stderr, result] of cases) {
+    const runner = { run: async (a) => (a[0] === 'lsf' ? { code: 1, stdout: '', stderr } : { code: 0 }) };
+    const r = await zeroLossResync({ runner, db: null, vault: 'v', local: root, remote: 'vault:V', workdir: path.join(root, 'wd'), config: '/c', now: () => 1 });
+    assert.strictEqual(r.result, result, stderr.slice(0, 40));
+    assert.strictEqual(r.resyncRequired, null, 'the baseline question is left as it was — a never-run vault must not read "needs repair" for a shut door');
+    assert.strictEqual(r.needsAttention, true);
+    assert.strictEqual(r.preserved, 0);
+  }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('every rclone op the zero-loss resync launches carries the connection bound (fail fast, never hang)', async () => {
+  const root = tmp();
+  fs.writeFileSync(path.join(root, 'a.txt'), 'local');
+  const rec = { copies: [] };
+  const runner = fakeRunner({ lsf: { code: 0, stdout: 'a.txt\nb.txt\n' }, check: { code: 0, stdout: '= a.txt\n' } }, rec);
+  await zeroLossResync({ runner, db: null, vault: 'v', local: root, remote: 'vault:V', workdir: path.join(root, 'wd'), config: '/c', now: () => 1, timeoutMs: 5000 }).catch(() => {});
+  const scanOps = rec.args.filter((a) => ['lsf', 'check', 'copyto', 'bisync'].includes(a[0]));
+  assert.ok(scanOps.length >= 1);
+  for (const a of scanOps) {
+    assert.ok(a.includes('--contimeout'), `${a[0]} bounds the TCP connect`);
+    assert.ok(a.includes('--low-level-retries'), `${a[0]} caps rclone's own retry loop`);
+  }
+  fs.rmSync(root, { recursive: true, force: true });
 });

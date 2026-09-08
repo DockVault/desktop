@@ -23,6 +23,12 @@
  *     gets its consented INITIAL baseline resync; a vault BLOCKED after a completed run (a safety abort
  *     or an owed resync) is NEVER auto-resynced — it waits for a deliberate Repair. Both resync paths go
  *     through the zero-loss resync (keep-both), never a destructive bare resync.
+ *   - The endpoint gate: after a run that could not reach the sync server (or met a changed server
+ *     identity), NO credential is minted until the server answers a credential-free probe. A single-use
+ *     credential minted against a door that is shut is never spent, yet it counts against the server's
+ *     hourly per-computer allowance — the old per-tick minting ended in a misleading "credential limit"
+ *     message with the real cause (the server can't be reached) never shown. Routine ticks wait out a
+ *     growing back-off; a deliberate press probes at once; the probe's answer IS the surfaced state.
  *
  * Pure orchestration over injected IO, so every invariant is unit-testable with no Electron or network.
  */
@@ -38,6 +44,13 @@ const HELD_REASONS = new Set([
   'no-grant', 'vault-not-standard', 'device-request-refused', 'host-key-mismatch',
 ]);
 
+// The run results after which the endpoint gate closes (see the class comment): the door could not be reached,
+// or the server presented an identity other than the pinned one. Minting again next tick cannot help either.
+const CONNECT_RESULTS = new Set(['connect-failed', 'host-key-mismatch']);
+// The back-off routine ticks wait after each consecutive connect failure: 5 min, 10, 20, 40, then an hour.
+const ENDPOINT_BACKOFF_BASE_MS = 5 * 60 * 1000;
+const ENDPOINT_BACKOFF_MAX_MS = 60 * 60 * 1000;
+
 class SyncScheduler {
   /**
    * @param {object} io injected input/output surface (all side effects live in the caller)
@@ -48,11 +61,13 @@ class SyncScheduler {
    * @param {(cfg:object) => Promise<{ok:true,folder:string}|{ok:false,reason:string}>} [io.resolveFolder]  find the vault's folder by its marker (folder-identity.js); absent => the configured path is used as-is
    * @param {(localFolder:string) => (({ok:boolean,reason?:string})|Promise<{ok:boolean,reason?:string}>)} io.secureFolder  may be async (applies + reads back a real ACL); it is awaited
    * @param {(localFolder:string) => ({ok:boolean,reason?:string})} io.classify
+   * @param {() => Promise<{ok:true}|{ok:false,reason:string}>} [io.probeEndpoint]  a credential-free probe of the sync server (reachable + the pinned identity), run INSTEAD of a mint after a connect failure; absent => the back-off alone bounds the minting
+   * @param {() => number} [io.now]
    * @param {(vaultId:string) => Promise<{ok:boolean,reason?:string}>} io.refreshCred
    * @param {(vaultId:string) => (string|null)} [io.credentialPath]  which credential path the vault's run took ('device' | 'account'), when known
    * @param {(vaultId:string) => Promise<boolean>} [io.confirmFirstUpload]  gate the first upload of a not-yet-consented config
-   * @param {(spec:{vaultId,local,remotePath}) => Promise<object>} io.runSync    normal bidirectional run
-   * @param {(spec:{vaultId,local,remotePath}) => Promise<object>} io.runResync  zero-loss resync (initial baseline / Repair)
+   * @param {(spec:{vaultId,local,remotePath,movedFrom?,remoteMovedFrom?}) => Promise<object>} io.runSync    normal bidirectional run
+   * @param {(spec:{vaultId,local,remotePath,movedFrom?,remoteMovedFrom?}) => Promise<object>} io.runResync  zero-loss resync (initial baseline / Repair)
    * @param {(vaultId:string, ev:{phase:string,reason?:string,after?:string,outcome?:object}) => void} [io.onEvent]
    */
   constructor(io = {}) {
@@ -62,6 +77,44 @@ class SyncScheduler {
     this._queue = [];           // [{ vaultId, manual, repair }], at most one entry per vaultId
     this._authRetried = new Set(); // vaultIds that have already used their one auth-failed retry this episode
     this._held = new Map();        // vaultId -> the settled device-side refusal that holds routine ticks (see HELD_REASONS)
+    this._now = typeof io.now === 'function' ? io.now : () => Date.now();
+    // The endpoint gate's state: one sync server serves every vault, so its reachability is shared. `failures`
+    // counts consecutive connect-class failures (a probe that failed, or a run that could not connect); `until`
+    // is when routine ticks may probe again; `reason` is the last real cause, surfaced meanwhile.
+    this._endpoint = { failures: 0, until: 0, reason: null };
+  }
+
+  /** The endpoint gate's view: how many consecutive connect failures, and the cause surfaced meanwhile. */
+  endpointState() { return { failures: this._endpoint.failures, reason: this._endpoint.reason, until: this._endpoint.until }; }
+
+  // A connect-class failure: close the gate (further) and remember the cause. The back-off doubles per failure.
+  _noteConnectFailure(reason) {
+    const ep = this._endpoint;
+    ep.failures += 1;
+    ep.reason = reason;
+    ep.until = this._now() + Math.min(ENDPOINT_BACKOFF_BASE_MS * (2 ** (ep.failures - 1)), ENDPOINT_BACKOFF_MAX_MS);
+  }
+
+  _clearConnectFailures() { this._endpoint = { failures: 0, until: 0, reason: null }; }
+
+  // The endpoint gate, run in a dispatch's place of minting. Returns the event to emit INSTEAD of minting, or
+  // null when this dispatch may go on to mint. Open (no failure on record) => null at once. Closed: a routine
+  // tick inside the back-off is answered with the last cause, no probe, no mint; a due tick or a deliberate press
+  // probes the server without a credential — an answer opens the gate for this dispatch, a failure closes it
+  // further and becomes the surfaced state (unreachable / not the server / a changed identity). With no probe
+  // wired, a due tick mints (the back-off alone bounds how often).
+  async _endpointGate(manual) {
+    const ep = this._endpoint;
+    if (ep.failures === 0) return null;
+    if (!manual && this._now() < ep.until) return { phase: 'paused', reason: ep.reason || 'sync-server-unreachable' };
+    if (typeof this._io.probeEndpoint !== 'function') return null;
+    let p;
+    try { p = await this._io.probeEndpoint(); } catch { p = { ok: false, reason: 'sync-server-unreachable' }; }
+    if (p && p.ok === true) return null;
+    const reason = (p && typeof p.reason === 'string' && p.reason) ? p.reason : 'sync-server-unreachable';
+    this._noteConnectFailure(reason);
+    // A changed server identity is a settled refusal (HELD_REASONS): routine ticks stop until a person acts.
+    return { phase: reason === 'host-key-mismatch' ? 'refused' : 'paused', reason };
   }
 
   _emit(vaultId, ev) {
@@ -76,8 +129,11 @@ class SyncScheduler {
   /** The settled device-side refusal holding a vault's routine ticks, or null. */
   held(vaultId) { return this._held.get(vaultId) || null; }
 
-  /** Lift every hold (a sign-in, an unlock, or a set-up change may have changed the server's answer). */
-  releaseHolds() { this._held.clear(); }
+  /**
+   * Lift every hold (a sign-in, an unlock, or a set-up change may have changed the server's answer) — and open
+   * the endpoint gate: a changed SFTP address must be tried at once, not after the old address's back-off.
+   */
+  releaseHolds() { this._held.clear(); this._clearConnectFailures(); }
 
   // Enqueue a request, coalescing per vault. A request for the IN-FLIGHT vault is dropped (the running
   // dispatch already serves it). A manual request is ordered ahead of routine ticks and upgrades an
@@ -232,12 +288,21 @@ class SyncScheduler {
         return;
       }
 
+      // The endpoint gate (see the class comment): after a connect-class failure nothing is minted until the sync
+      // server answers a credential-free probe. Placed right before the mint so every cheaper refusal above still
+      // wins, and after the helper gate so a down helper is never mistaken for a down server.
+      const gate = await this._endpointGate(!!item.manual);
+      if (gate) { this._emit(vaultId, gate); return; }
+
       // Refresh + re-send the credential before dispatch; a refresh failure fails closed. A readiness/prepare
       // failure that surfaces HERE (past the gate) is likewise the non-retrying 'helper-not-ready' + its sub.
       const cr = await io.refreshCred(vaultId);
       if (!cr || !cr.ok) { this._emit(vaultId, { phase: 'paused', reason: (cr && cr.reason) || 'cred-refresh-failed', sub: (cr && cr.sub) || null, installed: (cr && cr.installed) || null }); return; }
 
-      const spec = { vaultId, local: localFolder, remotePath, ...(movedFrom && movedFrom !== localFolder ? { movedFrom } : {}) };
+      // The remote path the last completed run used, when it differs from this run's: the engine re-keys the
+      // pair's listings so an account<->device path switch continues from the same baseline.
+      const remoteMovedFrom = (typeof cfg.lastRemotePath === 'string' && cfg.lastRemotePath && cfg.lastRemotePath !== remotePath) ? cfg.lastRemotePath : undefined;
+      const spec = { vaultId, local: localFolder, remotePath, ...(movedFrom && movedFrom !== localFolder ? { movedFrom } : {}), ...(remoteMovedFrom ? { remoteMovedFrom } : {}) };
       const useResync = repair || neverRun; // initial baseline OR deliberate Repair — always zero-loss (keep-both)
       // The first upload is gated, fail-closed. `kind` lets the caller show the right dialog: an initial
       // first-upload (the two-way consent for a not-yet-consented config) vs a Repair confirm — and lets an
@@ -302,13 +367,19 @@ class SyncScheduler {
         return outcome;
       }
       if (!(outcome && outcome.ran === true && outcome.result === 'auth-failed')) this._authRetried.delete(vaultId);
+      // The endpoint gate learns from the run: a connect-class result closes it (the next dispatch probes instead
+      // of minting); any run that actually reached the server — whatever else it found — opens it again.
+      if (outcome && CONNECT_RESULTS.has(outcome.result)) this._noteConnectFailure(outcome.result === 'host-key-mismatch' ? 'host-key-mismatch' : 'sync-server-unreachable');
+      else if (outcome && outcome.ran === true) this._clearConnectFailures();
       // A run that could not EXECUTE (timeout / no helper / send-failed) resolves { ok:false } — that is an
       // 'error', not 'done'. 'done' means the run ran; its typed result (which may still be a conflict or a
       // safety abort) is carried in `outcome` for the status model to classify.
       if (!outcome || outcome.ok === false) {
         this._emit(vaultId, { phase: 'error', reason: (outcome && (outcome.reason || outcome.error || outcome.result)) || 'run-failed', outcome: outcome || null });
       } else {
-        this._emit(vaultId, { phase: 'done', outcome });
+        // `remotePath` names the server-side path this run used, so the caller can remember it for the next
+        // run's carry-over (a vault name or an id form — never a local path).
+        this._emit(vaultId, { phase: 'done', outcome, remotePath });
       }
       return outcome;
     } catch (e) {
@@ -317,4 +388,4 @@ class SyncScheduler {
   }
 }
 
-module.exports = { SyncScheduler };
+module.exports = { SyncScheduler, CONNECT_RESULTS, ENDPOINT_BACKOFF_BASE_MS, ENDPOINT_BACKOFF_MAX_MS };

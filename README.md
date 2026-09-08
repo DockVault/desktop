@@ -107,6 +107,18 @@ into a folder whose identity is in doubt, and nothing in the folder is touched m
 stays on this computer and is never uploaded to the vault; it is a small hidden file named
 `.dockvault-sync`, and deleting it makes DockVault ask about the folder next time.
 
+Each synced folder shows its own state on its card in the Computers window and in the tray: up to
+date, waiting, syncing, paused, or a problem to look at. While a transfer is underway the card shows
+how far along it is — a percentage, how much has moved of how much is queued, and how many files are
+in flight — drawn from what the transfer itself reports, with no file name ever leaving this computer.
+
+When the file transfer server can't be reached, DockVault says so plainly rather than looking like a
+sign-in or permission problem, and it stops asking the server for fresh one-time access while the door
+is shut — it waits, rechecks on a widening interval (and at once if you press Sync now), and tells you
+whether the address can't be reached, isn't answering as a file transfer server, or has a changed
+identity. Troubleshoot's connection check tests the server and file transfer addresses separately so
+you can see which one to fix.
+
 ## Building installers
 
 Installers are produced by [electron-builder](https://www.electron.build/), pinned in

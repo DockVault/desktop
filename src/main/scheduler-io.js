@@ -21,11 +21,15 @@ const { isTransportError } = require('./net-errors');
 
 /**
  * Bind the scheduler's run effects to a ready helper handle whose runSync(spec) takes
- * { vault, local, remotePath, resync? }. The scheduler speaks { vaultId, local, remotePath }.
+ * { vault, local, remotePath, movedFrom?, remoteMovedFrom?, resync? }. The scheduler speaks { vaultId, local, remotePath, … }.
  * @param {{ runSync: (spec:object)=>Promise<object> }} daemon
  */
 function makeRunEffects(daemon) {
-  const toSpec = (s) => ({ vault: s.vaultId, local: s.local, remotePath: s.remotePath, ...(typeof s.movedFrom === 'string' ? { movedFrom: s.movedFrom } : {}) });
+  const toSpec = (s) => ({
+    vault: s.vaultId, local: s.local, remotePath: s.remotePath,
+    ...(typeof s.movedFrom === 'string' ? { movedFrom: s.movedFrom } : {}),
+    ...(typeof s.remoteMovedFrom === 'string' ? { remoteMovedFrom: s.remoteMovedFrom } : {}),
+  });
   return {
     runSync: (spec) => daemon.runSync(toSpec(spec)),
     runResync: (spec) => daemon.runSync({ ...toSpec(spec), resync: true }),
@@ -269,6 +273,12 @@ function conditionForReason(phase, reason) {
     // NOT in RETRYABLE_FAILURE_REASONS, so it surfaces once and stays put rather than looping.
     case 'needs-unlock':     return { state: STATE.NEEDS_DECISION, reason: 'needs-unlock' };
     case 'host-key-unavailable': return { state: STATE.PAUSED, reason: 'cannot-verify-yet' }; // older/unverifiable server — calm, not an alarm
+    // The endpoint gate's answers (a credential-free probe of the sync server, run instead of minting after a
+    // connect failure): the door can't be reached — calm, retried with a growing back-off, escalated by the sink
+    // when it persists; or something answers there that is not an SSH server this app can talk to — a problem at
+    // once (the address is wrong, or the server is misconfigured), never retried as "try again in a moment".
+    case 'sync-server-unreachable': return { state: STATE.PAUSED, reason: 'sync-server-unreachable' };
+    case 'sync-server-unverified': return { state: STATE.SYNC_PROBLEM, reason: 'sync-server-unverified' };
     // This computer's sync identity (device sync). Each server answer is its OWN honest state — none collapses
     // into a sign-in line, a generic retry, or an alarm it does not deserve. None is retried by the streak logic
     // below (a refused identity does not become "check your connection"); the calm ones simply wait.
@@ -327,12 +337,23 @@ function conditionForReason(phase, reason) {
 // 'error', these should read as a calm retry at first but must NOT read that way forever: repeated, they
 // mean the vault simply is not syncing. The reasons that already have their own honest state — sign-in,
 // cannot-verify-yet, a host-key mismatch, a bad folder or an unavailable vault — are deliberately NOT here.
-const RETRYABLE_FAILURE_REASONS = new Set(['mint-failed', 'cred-send-failed', 'cred-refresh-failed', 'vault-list-unavailable', 'helper-unavailable', 'network', 'server-error']);
+const RETRYABLE_FAILURE_REASONS = new Set(['mint-failed', 'cred-send-failed', 'cred-refresh-failed', 'vault-list-unavailable', 'helper-unavailable', 'network', 'server-error', 'sync-server-unreachable']);
 
 function isRetryableFailure(phase, reason) {
   if (phase === 'error') return reason !== 'host-key-mismatch'; // a dispatched run that failed (identity alert excluded)
   if (phase === 'paused' || phase === 'refused') return RETRYABLE_FAILURE_REASONS.has(reason);
   return false;
+}
+
+// The failure a scheduler event stands for on the retry streak, or null when it is not one. A completed run whose
+// typed result says the door could not be reached is a failure like any other on the streak (it is NOT the
+// completion that ends one), carried under the endpoint reason so its escalation keeps naming the real cause.
+function streakFailureReason(ev) {
+  const phase = ev && ev.phase;
+  const reason = ev && ev.reason;
+  if (phase === 'done' && ev.outcome && ev.outcome.result === 'connect-failed') return 'sync-server-unreachable';
+  if (isRetryableFailure(phase, reason)) return reason || 'error';
+  return null;
 }
 
 /*
@@ -353,9 +374,9 @@ class StatusSink {
 
   apply(vaultId, ev) {
     const phase = ev && ev.phase;
-    const reason = ev && ev.reason;
-    if (phase === 'done') this._errors.set(vaultId, 0); // a completed run ends the failure streak
-    if (isRetryableFailure(phase, reason)) {
+    const reason = streakFailureReason(ev);
+    if (phase === 'done' && reason == null) this._errors.set(vaultId, 0); // a completed run ends the failure streak
+    if (reason != null) {
       const n = (this._errors.get(vaultId) || 0) + 1;
       this._errors.set(vaultId, n);
       // Escalate as a CONDITION, not a stored outcome: a later, more specific reason (a sign-in owed, a bad
@@ -368,13 +389,18 @@ class StatusSink {
       // and offer no working fix — and reads 'reconnecting' while it retries. This shares the restart lane with a
       // crash-loop latch, so a wedged helper (which has no latch) still reaches the same "restart it". Every other
       // retryable failure keeps the generic 'retrying' -> 'not-syncing'.
+      //
+      // The sync server that cannot be reached keeps ITS cause through the escalation: "waiting for the sync
+      // server" while it retries, "can't reach the sync server" once it persists — never the generic "check your
+      // connection", and never the credential-limit message the old per-tick minting used to end in.
       const down = reason === 'helper-unavailable';
-      if (n >= this._threshold) this._hub.recordCondition(vaultId, { state: STATE.SYNC_PROBLEM, reason: down ? 'sync-stopped' : 'not-syncing' });
-      else this._hub.recordCondition(vaultId, { state: STATE.PAUSED, reason: down ? 'helper-unavailable' : 'retrying' }); // helper-unavailable reads 'reconnecting'
+      const unreachable = reason === 'sync-server-unreachable';
+      if (n >= this._threshold) this._hub.recordCondition(vaultId, { state: STATE.SYNC_PROBLEM, reason: down ? 'sync-stopped' : unreachable ? 'sync-server-unreachable' : 'not-syncing' });
+      else this._hub.recordCondition(vaultId, { state: STATE.PAUSED, reason: down ? 'helper-unavailable' : unreachable ? 'sync-server-unreachable' : 'retrying' }); // helper-unavailable reads 'reconnecting'
       return;
     }
     applySchedulerEvent(this._hub, vaultId, ev);
   }
 }
 
-module.exports = { makeRunEffects, makeVerifyEligible, makeSession, makeSchedulerIo, perStepGate, applySchedulerEvent, conditionForReason, StatusSink };
+module.exports = { makeRunEffects, makeVerifyEligible, makeSession, makeSchedulerIo, perStepGate, applySchedulerEvent, conditionForReason, streakFailureReason, StatusSink };

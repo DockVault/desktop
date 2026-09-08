@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { StatsStderrParser, isStatsLine, isPerFileLine, toBytes } = require('../src/daemon/stats-parse');
+const { StatsStderrParser, isStatsLine, isPerFileLine, perFilePercent, toBytes, MAX_FILE_PROGRESS } = require('../src/daemon/stats-parse');
 
 // A faithful rclone `--stats --stats-log-level NOTICE` block. The per-file "Transferring:" lines carry
 // PATHS (with a distinctive marker so a leak is unmistakable in an assertion).
@@ -72,7 +72,54 @@ test('LEAK GATE (space + unicode path): a path with spaces/unicode is recognised
   p.push('Transferring:\n *  /Users/me/Rapport Financier Q3 — SECRET-CONFIDENTIEL.pdf: 12% /3Mi, 1/s, 5s\n');
   p.end();
   assert.doesNotMatch(p.stderr(), PATH_MARKER, 'a path with spaces and a unicode dash is dropped');
-  assert.deepStrictEqual(p.counts(), { files: null, bytes: null }, 'no count is mistakenly extracted from a per-file path line');
+  const c = p.counts();
+  assert.deepStrictEqual({ files: c.files, bytes: c.bytes, filesTotal: c.filesTotal, bytesTotal: c.bytesTotal, percent: c.percent }, { files: null, bytes: null, filesTotal: null, bytesTotal: null, percent: null }, 'no aggregate count is mistakenly extracted from a per-file path line');
+  assert.deepStrictEqual({ n: c.transferring, pct: c.fileProgress }, { n: 1, pct: [12] }, 'of the per-file line ONLY its percentage integer is kept');
+});
+
+test('totals, the overall percentage, and each in-flight percentage are read as integers — nothing else', () => {
+  const p = new StatsStderrParser();
+  p.push(BLOCK);
+  p.end();
+  const c = p.counts();
+  assert.strictEqual(c.filesTotal, 8, 'the queued file total');
+  assert.strictEqual(c.bytesTotal, Math.round(12.34 * 1024 * 1024), 'the queued byte total');
+  assert.strictEqual(c.percent, 37, "rclone's own overall percentage (from the bytes line)");
+  assert.strictEqual(c.transferring, 2, 'two files in flight');
+  assert.deepStrictEqual(c.fileProgress, [45, 0], 'their percentages, in order, and nothing of their names');
+  for (const v of Object.values(c)) assert.ok(typeof v === 'number' || v === null || (Array.isArray(v) && v.every((x) => Number.isInteger(x))), 'every field is a number, null, or a list of integers');
+});
+
+test('a later block with no "Transferring:" section clears the in-flight list (no stale per-file motion)', () => {
+  const p = new StatsStderrParser();
+  p.push(BLOCK);
+  p.push('2026/09/03 02:00:10 NOTICE: \nTransferred:   \t   12.340 MiB / 12.340 MiB, 100%, 1.2 MiB/s, ETA 0s\nTransferred:            8 / 8, 100%\nElapsed time:         9.9s\n\n');
+  p.end();
+  const c = p.counts();
+  assert.strictEqual(c.transferring, 0);
+  assert.deepStrictEqual(c.fileProgress, []);
+  assert.strictEqual(c.percent, 100);
+  assert.strictEqual(c.files, 8);
+});
+
+test('the in-flight percentage list is bounded; the in-flight COUNT stays exact', () => {
+  const p = new StatsStderrParser();
+  let block = 'Transferring:\n';
+  for (let i = 0; i < MAX_FILE_PROGRESS + 5; i += 1) block += ` *  SECRET-${i}.bin: ${i}% /1Mi, 1/s, 1s\n`;
+  p.push(block);
+  p.end();
+  const c = p.counts();
+  assert.strictEqual(c.transferring, MAX_FILE_PROGRESS + 5);
+  assert.strictEqual(c.fileProgress.length, MAX_FILE_PROGRESS);
+  assert.doesNotMatch(JSON.stringify(c), PATH_MARKER);
+});
+
+test('perFilePercent reads the tail only: a colon in the name cannot shift it; an unshaped line yields nothing', () => {
+  assert.strictEqual(perFilePercent(' * a/b: c.txt: 45% / 3 MiB, 572 KiB/s, 3s'), 45);
+  assert.strictEqual(perFilePercent(' *  second.bin:100% / 2 MiB, 521.333 KiB/s, 0s'), 100, 'the no-space 100% form');
+  assert.strictEqual(perFilePercent(' *  Photos/x.jpg:  0% /1.500Mi, 0/s, -'), 0);
+  assert.strictEqual(perFilePercent(' * weird: checking'), null);
+  assert.strictEqual(perFilePercent(' * name-with-999%: 999% / 1Mi, 1/s, 1s'), null, 'an out-of-range value is not a percentage');
 });
 
 test('KEEPS genuine non-stats stderr (error/notice lines) for the outcome classifier', () => {
