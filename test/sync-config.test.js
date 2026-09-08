@@ -120,3 +120,31 @@ test('platformRefuseRoots returns the right system-dir set per platform (win32 h
   const lin = cfg.platformRefuseRoots('linux', {});
   assert.ok(lin.includes('/usr') && lin.includes('/etc') && lin.includes('/boot'), 'linux refuses the core system dirs');
 });
+
+test('makeConfigEntry: syncId is optional, normalised to lower case, and must be a well-formed id', () => {
+  const { makeConfigEntry, CONFIG_FIELDS } = require('../src/main/sync-config');
+  const base = { vaultId: 'v1', vaultName: 'V', localFolder: require('node:path').resolve('/f'), remotePath: 'V' };
+  assert.ok(CONFIG_FIELDS.includes('syncId'));
+  assert.strictEqual(makeConfigEntry(base).syncId, undefined);
+  assert.strictEqual(makeConfigEntry({ ...base, syncId: 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA' }).syncId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+  for (const bad of ['x', 42, '../..', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n']) assert.throws(() => makeConfigEntry({ ...base, syncId: bad }), String(bad));
+});
+
+test('makeConfigEntry: movedFrom is optional and must be an absolute path', () => {
+  const { makeConfigEntry } = require('../src/main/sync-config');
+  const p = require('node:path');
+  const base = { vaultId: 'v1', vaultName: 'V', localFolder: p.resolve('/f'), remotePath: 'V' };
+  assert.strictEqual(makeConfigEntry(base).movedFrom, undefined);
+  assert.strictEqual(makeConfigEntry({ ...base, movedFrom: p.resolve('/old') }).movedFrom, p.resolve('/old'));
+  assert.throws(() => makeConfigEntry({ ...base, movedFrom: 'relative' }));
+  assert.throws(() => makeConfigEntry({ ...base, movedFrom: 5 }));
+});
+
+test('makeConfigEntry: markerId is optional and must be two integers', () => {
+  const { makeConfigEntry } = require('../src/main/sync-config');
+  const p = require('node:path');
+  const base = { vaultId: 'v1', vaultName: 'V', localFolder: p.resolve('/f'), remotePath: 'V' };
+  assert.strictEqual(makeConfigEntry(base).markerId, undefined);
+  assert.strictEqual(makeConfigEntry({ ...base, markerId: '123:456789' }).markerId, '123:456789');
+  for (const bad of ['x', '1:', ':2', '1:2:3', 'C:\\x', 5]) assert.throws(() => makeConfigEntry({ ...base, markerId: bad }), String(bad));
+});

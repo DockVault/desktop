@@ -56,6 +56,8 @@ trayPresentation.setPackaged(app.isPackaged);
 serverConfig.setEnvOverrideAllowed(!app.isPackaged);
 const syncVaults = require('./sync-vaults');
 const syncConfig = require('./sync-config');
+const folderMarker = require('./folder-marker');
+const folderIdentity = require('./folder-identity');
 const syncConfigStore = require('./sync-config-store');
 const enableCopy = require('./enable-copy');
 const { mintSftpAccess } = require('./sftp-cred');
@@ -717,6 +719,8 @@ function buildTrayMenu(items, model, migration = null) {
 function handleMustAct(item) {
   if (item && item.kind === 'restart') { if (daemon) daemon.restart(); refreshTray(); return; }
   if (item && item.kind === 'recover-folder' && item.vault) { void recoverSharedFolder(item.vault); return; }
+  // The folder is known by its marker and cannot be found (or is not the one at its path): the relocate-or-stop offer.
+  if (item && item.kind === 'relocate-folder' && item.vault) { void relocateFolder(item.vault); return; }
   // The deliberate Repair: the ONLY thing that clears a blocked-after-run latch (a resync owed, or a
   // >50%-delete abort). It enqueues a manual repair run; the dispatch then asks the keep-both confirm
   // (confirmFirstUpload kind 'repair') before doing a zero-loss resync — nothing is auto-resynced.
@@ -975,6 +979,8 @@ function mustActBody(item) {
   // a version-mismatch). The menu label carries the "Set up the sync helper" fix; the body says what's wrong.
   if (item && item.kind === 'setup-helper') return trayPresentation.helperDetail(item.sub, item.installed, rcloneCfg && rcloneCfg.version);
   const base = (item && item.label) || 'A sync item needs your attention';
+  // A lost folder: the files may be wherever the folder went, so the one honest promise is what was NOT done.
+  if (item && item.kind === 'relocate-folder') return `${base}. Nothing was changed; your vault on the server is untouched.`;
   return `${base}. Your files are safe.`;
 }
 
@@ -1104,7 +1110,7 @@ async function tickSync({ manual = false } = {}) {
   // lock->unlock cycle. Fail-quiet + idempotent; the one-time notification stays governed by the origin flag.
   try { const o = serverConfig.readServerOrigin(app.getPath('userData')); if (o && (!deviceMigrateSupport || deviceMigrateSupport.origin !== o)) void maybeOfferDeviceMigration(); } catch { /* best-effort */ }
   await runStateSnapshot.refresh(syncConfiguredIds()); // a failed refresh keeps it not-fresh → the scheduler skips
-  if (manual) { for (const e of syncConfigList()) if (e && e.enabled) syncScheduler.requestSync(e.vaultId, { manual: true }); }
+  if (manual) { forgetFolderSearches(); for (const e of syncConfigList()) if (e && e.enabled) syncScheduler.requestSync(e.vaultId, { manual: true }); } // a deliberate press also looks afresh for a moved folder
   else syncScheduler.tickAll();
   // Complete any device grant that deferred at setup, now that this pass may find the vault open (the pass is
   // more frequent than the password-freshness window, so an open vault is never missed). Fire-and-forget and
@@ -1335,6 +1341,9 @@ function startSyncScheduler() {
       };
       try { return syncConfig.classifyLocalTarget(resolveReal(folder), ctx); } catch { return { ok: false, reason: 'folder-rejected' }; }
     },
+    // The folder by its identity, before every run (folder-identity.js): a moved or renamed folder is followed
+    // (and the config re-pointed), a folder that cannot be found pauses the vault with the relocate-or-stop offer.
+    resolveFolder: (cfg) => resolveFolderFor(cfg),
     credCache,
     daemon,
     confirmFirstUpload: (o) => confirmFirstUpload(o, entryFor(o.vaultId)),
@@ -1350,6 +1359,14 @@ function startSyncScheduler() {
       // Stamp the run with the credential path it took, so the glance can say which kind of sync ran; and
       // once the run has ended in any way, forget the run's latched path so the next run decides afresh.
       if (ev && ev.phase === 'running') ev = { ...ev, via: mintPath.current(vaultId) };
+      // A run COMPLETED after a move (a clean run, a resync, or a kept-both run — not an abort or a missing-listing
+      // outcome): the engine has carried its listings over, so the old path is forgotten.
+      if (ev && ev.phase === 'done' && ev.outcome && ev.outcome.ran === true && ['ok', 'resync-ok', 'conflict-keep-both'].includes(ev.outcome.result)) {
+        try {
+          const cur = storedConfig().find((e) => e.vaultId === vaultId);
+          if (cur && cur.movedFrom) { const { movedFrom, ...rest } = cur; syncConfigStore.saveConfig(safeStorage, dir, syncConfig.upsertEntry(storedConfig(), syncConfig.makeConfigEntry(rest))); }
+        } catch { /* best-effort; the carry-over is idempotent and runs again next time */ }
+      }
       // The server has ended this computer's identity (removed by the owner, or expired): the local secret can
       // never be presented again, so it is wiped now — the state database is left alone, and the recorded grant
       // details stay for the next set-up. The refusal itself is still recorded and held below.
@@ -1620,6 +1637,10 @@ function buildEnableIo() {
       fs.mkdirSync(p, { recursive: true, mode: 0o700 });
       try { fs.chmodSync(p, 0o700); } catch { /* honoured where the platform supports it */ }
     },
+    // Give the folder its identity: the hidden marker in its root (folder-marker.js). A marker already there
+    // for this same vault is kept, so a folder set up again keeps the identity it had; anything else (none, or
+    // a leftover from another sync) is replaced with a fresh id. Returns the sync id the config records.
+    markFolder: (folder, vaultId) => markFolderFor(folder, vaultId),
     onRefuse: async (reason) => {
       await dialog.showMessageBox(mainWindow, {
         type: 'warning', title: "That folder can't be used", noLink: true,
@@ -2000,6 +2021,232 @@ async function openManageView() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The synced folder's identity (folder-marker.js / folder-identity.js): the marker is written at set-up, read
+// before every run, followed when the folder moves, and — when the folder cannot be found — the person is
+// offered to point at it or to stop. Nothing below ever writes into a folder whose marker does not match.
+
+// Hide the marker on Windows (a dot-name is already hidden elsewhere). Best-effort, asynchronous, never awaited.
+function hideFile(p) {
+  if (process.platform !== 'win32') return;
+  const attrib = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'attrib.exe'); // by full path: never resolved through the cwd or PATH
+  try { execFile(attrib, ['+h', String(p)], { windowsHide: true }, () => { /* the marker works unhidden too */ }); } catch { /* best-effort */ }
+}
+
+function markFolderFor(folder, vaultId) {
+  const m = folderMarker.readMarker(folder);
+  const same = m.kind === 'ok' && m.vaultId === String(vaultId).toLowerCase();
+  const syncId = same ? m.syncId : folderMarker.newSyncId();
+  if (!same) folderMarker.writeMarker(folder, { syncId, vaultId }, { hide: hideFile });
+  return { syncId, markerId: folderMarker.markerIdentity(folder) };
+}
+
+// A search for a moved folder walks the disk with a budget; it is not repeated on every routine tick. A
+// deliberate action (Sync now, the relocate offer, a set-up) clears the throttle so the next look is fresh.
+const FOLDER_SEARCH_EVERY_MS = 10 * 60 * 1000;
+const folderSearchAt = new Map(); // syncId -> when the last full search ran
+function forgetFolderSearches() { folderSearchAt.clear(); }
+
+function resolveFolderFor(cfg) {
+  const dir = app.getPath('userData');
+  const home = app.getPath('home');
+  const io = {
+    readMarker: (folder) => folderMarker.readMarker(folder),
+    writeMarker: (folder, ids) => folderMarker.writeMarker(folder, ids, { hide: hideFile }),
+    markerIdentity: (folder) => folderMarker.markerIdentity(folder),
+    find: ({ syncId, vaultId, lastPath }) => {
+      const last = folderSearchAt.get(syncId) || 0;
+      if (Date.now() - last < FOLDER_SEARCH_EVERY_MS) return { kind: 'not-found', exhausted: false };
+      folderSearchAt.set(syncId, Date.now());
+      return folderMarker.findFolderByMarker({ syncId, vaultId, lastPath, roots: [home] });
+    },
+    classify: (folder, vaultId) => classifyFolderFor(folder, vaultId),
+    repoint: (entry, { localFolder, syncId, markerId, movedFrom }) => {
+      const next = { ...entry, localFolder, syncId };
+      if (markerId) next.markerId = markerId;
+      if (movedFrom) next.movedFrom = movedFrom;
+      const list = syncConfig.upsertEntry(storedConfig(), syncConfig.makeConfigEntry(next));
+      syncConfigStore.saveConfig(safeStorage, dir, list); // throws CONFIG_UNREADABLE rather than clobber
+      folderSearchAt.delete(syncId);
+      if (localFolder !== entry.localFolder) { try { console.log('[sync] a synced folder was found at its new location and is followed'); } catch { /* ignore */ } }
+      refreshTray();
+      notifyManageChanged();
+    },
+  };
+  return folderIdentity.resolveSyncFolder(cfg, io);
+}
+
+// The placement rules for a folder standing in for `vaultId`'s (its own current entry is not an overlap).
+function classifyFolderFor(folder, vaultId) {
+  const dir = app.getPath('userData');
+  const home = app.getPath('home');
+  const ctx = {
+    home, userData: dir,
+    refuseRoots: syncConfig.platformRefuseRoots(process.platform, process.env),
+    existingFolders: storedConfig().filter((e) => e.vaultId !== vaultId).map((e) => e.localFolder),
+    caseInsensitive: process.platform === 'win32' || process.platform === 'darwin',
+  };
+  try { return syncConfig.classifyLocalTarget(realFolderPath(folder), ctx); } catch { return { ok: false, reason: 'folder-rejected' }; }
+}
+function realFolderPath(folder) {
+  const real = fs.realpathSync.native || fs.realpathSync;
+  try { return real(folder); } catch { try { return fs.realpathSync(folder); } catch { return path.resolve(folder); } }
+}
+
+// The relocate-or-stop offer for a vault whose folder cannot be found. Native dialogs, main-driven: the person
+// either points at the folder (only the one carrying THIS sync's marker is accepted — a look-alike is refused
+// with the reason and the offer stays), stops syncing it here (the local pointer is dropped; files are never
+// touched), or leaves it paused. Shares the single-flight with the other set-up flows.
+async function relocateFolder(vaultId) {
+  if (syncFlowBusy) return;
+  syncFlowBusy = true;
+  try {
+    const dir = app.getPath('userData');
+    let entry = null;
+    try { entry = storedConfig().find((e) => e.vaultId === vaultId) || null; } catch { entry = null; }
+    if (!entry) return;
+    const name = entry.vaultName || 'this vault';
+    forgetFolderSearches();
+    // One more look before asking — the folder may have come back (a drive plugged in, a rename undone).
+    let found = null;
+    try { found = await resolveFolderFor(entry); } catch { found = null; }
+    if (found && found.ok) { refreshTray(); notifyManageChanged(); void tickSync({ manual: true }); return; }
+    const reason = (found && found.reason) || 'folder-missing';
+    const candidates = (found && Array.isArray(found.folders)) ? found.folders : [];
+    const placement = (found && found.placement) || null;
+    const findLabel = findVerb(reason);
+    let detail = relocateDetail(name, entry.localFolder, reason, candidates, placement);
+    for (;;) {
+      let res;
+      try {
+        res = await dialog.showMessageBox(mainWindow, {
+          type: 'warning', title: `Where is ${name}'s folder?`, noLink: true,
+          message: `The folder for ${name} can't be synced right now`, detail,
+          buttons: ['Not now', 'Stop syncing here', findLabel], defaultId: 2, cancelId: 0,
+        });
+      } catch { return; }
+      if (!res || res.response === 0) return;
+      if (res.response === 1) {
+        // Stop: confirmed like the card's own button, then the local pointer goes; the files stay wherever they are.
+        let sure;
+        try {
+          sure = await dialog.showMessageBox(mainWindow, {
+            type: 'question', title: 'Stop syncing', noLink: true,
+            message: `Stop syncing ${name} on this computer?`,
+            detail: `The files stay where they are, and the vault on the server is untouched. To sync ${name} here again, run Set up sync… from the tray.`,
+            buttons: ['Cancel', 'Stop syncing'], defaultId: 0, cancelId: 0,
+          });
+        } catch { return; }
+        if (!sure || sure.response !== 1) continue;
+        try { syncConfigStore.saveConfig(safeStorage, dir, syncConfig.removeEntry(storedConfig(), vaultId)); }
+        catch (e) { await infoBox('Stop syncing', configWriteTrouble(e)); continue; }
+        // The marker belonged to this sync: take it off wherever the folder is known to be (the old place, or the copies found).
+        if (entry.syncId) for (const f of [entry.localFolder, ...candidates]) { try { folderMarker.removeMarker(f, entry.syncId); } catch { /* best-effort */ } }
+        forgetVaultHistory(vaultId);
+        try { deviceGrantStore.removeGrantMeta(safeStorage, dir, vaultId); } catch { /* best-effort */ }
+        try { devicePending.clearPending(safeStorage, dir, vaultId); } catch { /* best-effort */ }
+        try { if (credCache) credCache.clear(); } catch { /* best-effort */ }
+        try { if (syncHub) syncHub.setVaults(storedConfig().map((e) => e.vaultId)); } catch { /* best-effort */ }
+        refreshTray(); notifyManageChanged();
+        return;
+      }
+      // Find: the OS picker, then the marker must match. A refusal offers another try or a way out, without
+      // re-reading the whole offer each time.
+      for (;;) {
+        let picked = null;
+        try {
+          const r = await dialog.showOpenDialog(mainWindow, { title: `Choose ${name}'s folder`, defaultPath: candidates[0] || undefined, properties: ['openDirectory'] });
+          picked = (r.canceled || !r.filePaths || !r.filePaths[0]) ? null : r.filePaths[0];
+        } catch { picked = null; }
+        if (!picked) break; // back to the offer
+        picked = realFolderPath(picked); // the real place, after any link — what set-up records too
+        const check = folderIdentity.checkRelocation(entry, picked, { readMarker: (f) => folderMarker.readMarker(f), markerIdentity: (f) => folderMarker.markerIdentity(f), classify: (f, v) => classifyFolderFor(f, v) });
+        if (!check.ok) {
+          const words = relocateRefusal(name, check.reason);
+          let again;
+          try {
+            again = await dialog.showMessageBox(mainWindow, { type: 'info', title: words.title, noLink: true, message: words.title, detail: words.detail, buttons: ['Not now', 'Try another folder'], defaultId: 1, cancelId: 0 });
+          } catch { return; }
+          if (!again || again.response !== 1) return;
+          continue;
+        }
+        try {
+          // The old path rides along until a run completes at the new one, so the engine carries its listings over.
+          const next = { ...entry, localFolder: picked, movedFrom: entry.movedFrom || entry.localFolder };
+          if (check.markerId) next.markerId = check.markerId; // the person confirmed this one: it is the folder from here on
+          const list = syncConfig.upsertEntry(storedConfig(), syncConfig.makeConfigEntry(next));
+          syncConfigStore.saveConfig(safeStorage, dir, list);
+        } catch (e) { await infoBox('Find the folder', configWriteTrouble(e)); return; }
+        // The copies that were NOT chosen stop being recognised as this sync's folder, so a stray copy is never followed later.
+        if (entry.syncId) for (const c of candidates) { if (realFolderPath(c) !== picked) { try { folderMarker.removeMarker(c, entry.syncId); } catch { /* best-effort */ } } }
+        refreshTray(); notifyManageChanged();
+        void tickSync({ manual: true });
+        return;
+      }
+    }
+  } finally { syncFlowBusy = false; }
+}
+
+// A sync stopped here: the helper forgets the vault's run history and listings, so a later set-up starts with
+// a fresh baseline rather than a repair against state from a folder that is gone.
+function forgetVaultHistory(vaultId) {
+  try { if (daemon) daemon.forgetVault(vaultId); } catch { /* best-effort */ }
+}
+
+function infoBox(title, detail) {
+  try { return dialog.showMessageBox(mainWindow, { type: 'info', title, noLink: true, message: title, detail, buttons: ['OK'] }).then(() => undefined).catch(() => undefined); } catch { return Promise.resolve(); }
+}
+
+// Why the sync settings could not be written: the one known cause has its own remedy (the same sentence the
+// Computers window shows); anything else is a plain try-again.
+function configWriteTrouble(e) {
+  if (e && e.code === 'CONFIG_UNREADABLE') return 'Your sync settings could not be read, so nothing was changed. This usually clears up after unlocking your login keychain and reopening DockVault.';
+  return "DockVault couldn't update its sync settings just now. Nothing was changed. Try again in a moment.";
+}
+
+// The words for the offer: what is known, what is not, and what each button does. Paths named here are the
+// person's own, shown on their own screen only. "Marker" is explained once, in the trailer.
+function relocateDetail(name, lastPath, reason, candidates, placement) {
+  const where = `It was at ${lastPath}.`;
+  let what;
+  switch (reason) {
+    case 'folder-marker-missing': what = `${where} A folder is there now, but it isn't the one DockVault was syncing. If you moved the original folder, find it; if you made a fresh folder on purpose, stop syncing here and set ${name} up again.`; break;
+    case 'folder-other-vault': what = `${where} The folder there now is synced by a different vault. Find ${name}'s own folder, or stop syncing here.`; break;
+    case 'folder-marker-unreadable': what = `${where} The folder there has a DockVault marker file that can't be read, so DockVault can't tell whether it is ${name}'s folder. If it is, choose Stop syncing here, then Set up sync… from the tray and pick this same folder; nothing in it is lost.`; break;
+    case 'folder-ambiguous': what = `${where} Two or more folders now look like ${name}'s (a copy was made):\n${candidates.map((c) => `• ${c}`).join('\n')}\nChoose the one to keep syncing (the picker opens at the first); the others are left as they are.`; break;
+    case 'folder-moved-rejected': what = `${where} It is now at ${candidates[0] || 'a new location'}, but DockVault doesn't sync there (${placementWords(placement)}). Move the folder back, or to a folder of your own like Documents, then press Find the folder… and point at it — or stop syncing here.`; break;
+    case 'folder-found-elsewhere': what = `${where} A folder that looks like ${name}'s is at ${candidates[0] || 'another place'}, but it isn't the same folder as before — it may be a copy of it, or the folder may have moved to another drive. If it is the right one, press Confirm the folder… and pick it; DockVault syncs it from here on. If not, find the right folder, or stop syncing here.`; break;
+    case 'folder-marker-unwritable': what = `${where} DockVault can't write its hidden marker file there — the folder may be read-only. Make the folder writable and press Find the folder… to pick it again, or stop syncing here.`; break;
+    default: what = `${where} It may have been moved, renamed, or deleted, or it may be on a drive that isn't plugged in. Nothing is synced until it is found, and no files are touched meanwhile. If you plug the drive back in or put the folder back, syncing carries on by itself.`;
+  }
+  return `${what}\n\n${findVerb(reason)} lets you point at it; DockVault accepts only the same folder, which it knows by the hidden marker file it left there when the sync was set up. Stop syncing here forgets this sync on this computer. Either way, your files and the vault on the server are not touched.`;
+}
+function findVerb(reason) { return reason === 'folder-ambiguous' ? 'Choose the folder…' : (reason === 'folder-found-elsewhere' ? 'Confirm the folder…' : 'Find the folder…'); }
+
+// The placement rule a found folder fell foul of, in a few words (the setup screen's own refusal sentences carry more).
+function placementWords(reason) {
+  switch (reason) {
+    case 'system-location': return "it's a system folder";
+    case 'home-root-or-above': return "it's your whole home folder, or above it";
+    case 'filesystem-root': return "it's the top of a drive";
+    case 'app-data-dir': return "it's inside DockVault's own data";
+    case 'overlaps-another-sync': return "it's inside, or around, another synced folder";
+    case 'inside-cloud-sync': return "it's inside a cloud storage folder, which would sync the same files twice";
+    default: return "it's not a place DockVault syncs";
+  }
+}
+
+// A refused pick: what that folder is, and what to do instead. Each ends with a way forward.
+function relocateRefusal(name, reason) {
+  switch (reason) {
+    case 'no-marker': return { title: `That isn't ${name}'s folder`, detail: `That isn't the folder DockVault was syncing for ${name}. If you want ${name} in a different folder, choose Not now, then Stop syncing here, then Set up sync… from the tray and pick that folder.` };
+    case 'other-sync': return { title: `That isn't ${name}'s folder`, detail: `That folder is synced by a different vault, not ${name}. Point at the folder ${name} was using, or stop syncing here.` };
+    case 'marker-unreadable': return { title: `That folder can't be recognised`, detail: `That folder has a DockVault marker file that can't be read, so DockVault can't tell whether it is ${name}'s folder. If it is, choose Not now, then Stop syncing here, then Set up sync… from the tray and pick this same folder; nothing in it is lost.` };
+    case 'folder-missing': return { title: `That folder can't be opened`, detail: "DockVault can't open that folder. Check it is still there and try again, or choose Not now." };
+    default: return { title: `${name}'s folder can't be synced there`, detail: `That is ${name}'s folder, but DockVault doesn't sync in that place (${placementWords(reason)}). Move the folder somewhere of your own, like Documents, then try again.` };
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The Troubleshoot view: a window of checks a person runs from this computer (troubleshoot.js owns the checks
 // and their words); this is the window and the io over the saved server setting and the real network.
 let troubleshootWindow = null;
@@ -2075,8 +2322,12 @@ function buildManageIo() {
   };
   const dropLocalVault = (vaultId) => {
     // The local pointer: the sync entry (may throw CONFIG_UNREADABLE rather than clobber), the grant record,
-    // and any pending marker. The folder and its files are left alone.
+    // and any pending marker. The folder and its files are left alone — except its hidden identity marker,
+    // which belonged to this sync and goes with it (only when it is this sync's own; best-effort).
+    const gone = storedConfig().find((e) => e.vaultId === vaultId);
     syncConfigStore.saveConfig(safeStorage, dir, syncConfig.removeEntry(storedConfig(), vaultId));
+    if (gone && gone.syncId) { try { folderMarker.removeMarker(gone.localFolder, gone.syncId); } catch { /* best-effort */ } }
+    forgetVaultHistory(vaultId);
     try { deviceGrantStore.removeGrantMeta(safeStorage, dir, vaultId); } catch { /* best-effort */ }
     try { devicePending.clearPending(safeStorage, dir, vaultId); } catch { /* best-effort */ }
     try { if (credCache) credCache.clear(); } catch { /* best-effort */ }
@@ -2134,6 +2385,7 @@ function buildManageIo() {
     revokeDevice: (deviceId) => accountCall('POST', `/devices/${encodeURIComponent(deviceId)}/revoke`),
     deleteDevice: (deviceId) => accountCall('DELETE', `/devices/${encodeURIComponent(deviceId)}`),
     dropLocalVault,
+    relocateFolder: (vaultId) => { void relocateFolder(vaultId); },
     dropLocalIdentity: () => {
       // This computer's identity ended on the server: it can never be presented again, so clear it here along with
       // the records that belong to it. The sync entries stay (the honest "removed — set it up again" state), the
@@ -2236,6 +2488,7 @@ function buildWizardIo(win) {
       makePrivate: base.makePrivate,
       isNonEmptyDir: base.isNonEmptyDir,
       ensureFolder: base.ensureFolder,
+      markFolder: base.markFolder,
       save: base.save,
     },
     pickFolderNative: async () => {
@@ -2612,7 +2865,7 @@ async function finishTraySelftestIfNeeded() {
   app.exit(ok ? 0 : 1);
 }
 
-module.exports = { __private: { readState, writeState, openSyncWizard, openManageView, openTroubleshoot } }; // exposed only for tests
+module.exports = { __private: { readState, writeState, openSyncWizard, openManageView, openTroubleshoot, tickSync, relocateFolder, handleMustAct } }; // exposed only for tests
 
 // ---------------------------------------------------------------------------------------------
 // Start at login. One honest fact, read from the platform every time (login-item.js); the person's

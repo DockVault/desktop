@@ -461,3 +461,18 @@ test('makeSchedulerIo: session reports uncertain when the snapshot is not fresh 
   const io = makeSchedulerIo({ snapshot: { get: () => null, fresh: () => false }, credCache: {}, daemon: {}, isAccountUsable: () => true, hasAccount: () => true, isOnline: () => true });
   assert.strictEqual(io.session().uncertain, true);
 });
+
+test('conditionForReason: every way of losing the folder is its own needs-decision, never a calm retry', () => {
+  const { STATE } = require('../src/main/sync-status-model');
+  for (const reason of ['folder-missing', 'folder-marker-missing', 'folder-other-vault', 'folder-marker-unreadable', 'folder-ambiguous', 'folder-moved-rejected', 'folder-found-elsewhere', 'folder-marker-unwritable', 'config-unwritable']) {
+    assert.deepStrictEqual(conditionForReason('paused', reason), { state: STATE.NEEDS_DECISION, reason });
+  }
+});
+
+test('makeRunEffects forwards movedFrom to the helper only when the scheduler set it', async () => {
+  const seen = [];
+  const fx = makeRunEffects({ runSync: async (spec) => { seen.push(spec); return {}; } });
+  await fx.runSync({ vaultId: 'v', local: '/l', remotePath: 'p', movedFrom: '/old' });
+  await fx.runSync({ vaultId: 'v', local: '/l', remotePath: 'p' });
+  assert.deepStrictEqual(seen, [{ vault: 'v', local: '/l', remotePath: 'p', movedFrom: '/old' }, { vault: 'v', local: '/l', remotePath: 'p' }]);
+});

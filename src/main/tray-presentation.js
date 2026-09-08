@@ -42,6 +42,17 @@ const REASON_DETAIL = Object.freeze({
   // A sync step failed in our own code path (an unclassified internal error, or a credential provider that
   // threw) rather than a connection/sign-in issue. Honest and non-alarming; not retried forever.
   'sync-error': 'a sync step hit a problem',
+  // The folder is known by its marker: these say why it cannot be synced right now (the must-act line says what to do).
+  // (Short: the tray tooltip is cut at about 127 characters on Windows.)
+  'folder-missing': "its folder isn't where it was — moved, deleted, or on a drive that isn't plugged in",
+  'folder-marker-missing': 'a different folder is now where its folder was',
+  'folder-other-vault': "another vault's folder is now where its folder was",
+  'folder-marker-unreadable': "its folder's hidden marker file can't be read",
+  'folder-ambiguous': 'two or more folders look like its folder — a copy was made',
+  'folder-moved-rejected': "its folder was moved somewhere DockVault doesn't sync",
+  'folder-found-elsewhere': 'a folder that looks like its folder was found elsewhere — confirm it first',
+  'folder-marker-unwritable': "its folder won't let DockVault write its marker file",
+  'config-unwritable': "the sync settings couldn't be saved",
   // 'waiting-first-sync' carries no suffix: the "Waiting to start" label already says it plainly, and
   // a configured-but-never-run vault must read as not-yet-running, never as active "syncing".
 });
@@ -178,6 +189,7 @@ function tooltip(model, lockPhase, pinned, options = {}) {
 const HANDLED_ACTION_KINDS = Object.freeze([
   'restart', 'recover-folder', 'repair', 'setup-helper',
   'open', 'reopen', 'review', 'sign-in', 'unlock', 'check-identity', 'choose-folder', 'reset-device', 'set-up-again',
+  'relocate-folder',
 ]);
 
 // The vault's display NAME for a label, resolved from the caller's id→name map (the configured list). The
@@ -206,6 +218,17 @@ function itemForVault(v, nameById) {
     case 'folder-problem': return { kind: 'recover-folder', vault: v.vault, label: `The sync folder for ${name} is shared again — make it private` };
     case 'folder-insecure':
     case 'folder-rejected': return { kind: 'choose-folder', vault: v.vault, label: `The sync folder for ${name} can't be used — choose a folder again` };
+    // The folder is known by the marker it carries (folder-identity.js). Each way of losing it is said plainly,
+    // and each opens the same relocate-or-stop offer; nothing syncs until the person answers.
+    case 'folder-missing': return { kind: 'relocate-folder', vault: v.vault, label: `The folder for ${name} can't be found — find it, or stop syncing` };
+    case 'folder-marker-missing': return { kind: 'relocate-folder', vault: v.vault, label: `A different folder is where ${name}'s was — find ${name}'s folder, or stop syncing` };
+    case 'folder-other-vault': return { kind: 'relocate-folder', vault: v.vault, label: `Another vault's folder is where ${name}'s was — find ${name}'s folder, or stop syncing` };
+    case 'folder-marker-unreadable': return { kind: 'relocate-folder', vault: v.vault, label: `${name}'s folder can't be recognised — find it, or stop syncing` };
+    case 'folder-ambiguous': return { kind: 'relocate-folder', vault: v.vault, label: `Two or more folders look like ${name}'s — choose which one to sync` };
+    case 'folder-moved-rejected': return { kind: 'relocate-folder', vault: v.vault, label: `${name}'s folder was moved somewhere DockVault can't sync — move it, then find it` };
+    case 'folder-found-elsewhere': return { kind: 'relocate-folder', vault: v.vault, label: `A folder that looks like ${name}'s was found — confirm it, or stop syncing` };
+    case 'folder-marker-unwritable': return { kind: 'relocate-folder', vault: v.vault, label: `${name}'s folder won't let DockVault write its marker file — check the folder, or stop syncing` };
+    case 'config-unwritable': return { kind: 'open', vault: v.vault, label: `${name}'s sync settings couldn't be saved — unlock your login keychain and reopen DockVault` };
     // A code fault in our OWN sync path — own it plainly so the person doesn't go hunting their own
     // connection/sign-in/keychain for a fault only we can fix. (A "Report a problem" action is a follow-up.)
     case 'sync-error': return { kind: 'open', vault: v.vault, label: "Something in DockVault's own sync step failed — this is on our side, not your connection or sign-in." };

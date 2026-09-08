@@ -52,6 +52,11 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 // tunable up to 10s if a rendered pass shows flicker — and it is DECOUPLED from the inactivity window below
 // (a shorter period only widens the margin). The flags are fixed here — never caller/renderer-supplied.
 const SYNC_STATS_ARGS = Object.freeze(['--stats', '5s', '--stats-log-level', 'NOTICE']);
+// The folder's identity marker (main/folder-marker.js) lives in the synced folder's root and is LOCAL ONLY: it
+// is excluded from every transfer, listing, and compare, so it is never uploaded to the vault, never deleted
+// from the folder by a sync, and never counted as a difference. The name is fixed here, not caller-supplied.
+const MARKER_NAME = '.dockvault-sync';
+const MARKER_FILTER_ARGS = Object.freeze(['--exclude', `/${MARKER_NAME}`, '--exclude', `/${MARKER_NAME}.*.tmp`]);
 const SYNC_INACTIVITY_MS = 120 * 1000;          // 24x the 5s stats period — ample margin against a false idle-trip
 const SYNC_HARD_CEILING_MS = 6 * 60 * 60 * 1000; // absolute backstop, even if stats never stop
 
@@ -91,9 +96,85 @@ function buildBisyncArgs({ local, remote, workdir, resync = false }) {
     // server's per-source login limiter. It also means a safety abort (excessive delete) is never
     // re-attempted. A transient failure simply re-ticks on the next scheduled sweep.
     '--retries', '1',
+    ...MARKER_FILTER_ARGS, // the folder's own identity marker stays home
     ...SYNC_STATS_ARGS]; // periodic progress so the inactivity timeout can tell a long run from a hung one
-  if (resync) args.push('--resync'); // only ever on an explicit, user-initiated resync
+  if (resync) args.push('--resync'); // a deliberate resync, or the one automatic empty-baseline refresh (see runBisync)
   return args;
+}
+
+// An empty baseline. bisync refuses a normal run whose PRIOR listing is empty on either side ("cannot sync to
+// an empty directory") — its guard against a side that was wiped — and it judges the prior listing, not the
+// folder as it is now. So a new vault synced into a new folder (both empty at the baseline) can never run
+// normally again, not even after the first file arrives. The rule here: an empty prior listing means a FRESH
+// BASELINE is due, and taking one loses nothing — a side that recorded nothing had nothing that could since have
+// been deleted, so the union a resync makes only brings files across. How it is taken depends on the local side:
+//   - the local folder holds nothing but its own identity marker -> a plain `--resync` right here (one process,
+//     one credential): nothing local can be overwritten, the server's files simply come down;
+//   - the local folder holds files -> the daemon routes the run through the zero-loss resync instead (keep-both
+//     for any same-named, differing file), never a bare --resync that could let one side win.
+// A folder that HAD files at the baseline and is now empty keeps rclone's guard; anything unreadable counts as
+// not-empty (fail closed); no listing at all is the scheduler's never-run branch, not this rule.
+function localHasNoFiles(local) {
+  let entries;
+  try { entries = fs.readdirSync(local, { withFileTypes: true }); } catch { return false; }
+  for (const e of entries) {
+    if (e.name === MARKER_NAME || (e.name.startsWith(`${MARKER_NAME}.`) && e.name.endsWith('.tmp'))) continue;
+    if (e.isDirectory()) { if (!localHasNoFiles(path.join(local, e.name))) return false; continue; }
+    return false;
+  }
+  return true;
+}
+function priorListingEmpty(workdir, local, remote) {
+  let names;
+  try { names = fs.readdirSync(workdir); } catch { return false; }
+  // Only the listings of the pair this run is about (bisync keys them by both paths): a stale listing from
+  // an earlier pairing in the same vault's workdir must not decide anything.
+  const key = local ? `${canonicalPath(local)}..${remote ? canonicalPath(remote) : ''}` : '';
+  const lists = names.filter((n) => n.startsWith(key) && (n.endsWith('.path1.lst') || n.endsWith('.path2.lst')));
+  if (!lists.length) return false; // never baselined here: that is the scheduler's never-run branch, not this
+  for (const n of lists) {
+    let text;
+    try { text = fs.readFileSync(path.join(workdir, n), 'utf8'); } catch { return false; }
+    if (!text.split(/\r?\n/).some((line) => line.trim() && !line.startsWith('#'))) return true; // one empty side is enough
+  }
+  return false;
+}
+/** A fresh baseline is due (a prior listing is empty) and the local side holds files: the zero-loss path. */
+function needsZeroLossBaseline({ local, remote, workdir }) {
+  return priorListingEmpty(workdir, local, remote) && !localHasNoFiles(local);
+}
+/** A fresh baseline is due and the local side holds nothing: a plain resync right here loses nothing. */
+function emptyPairBaseline({ local, remote, workdir }) {
+  return priorListingEmpty(workdir, local, remote) && localHasNoFiles(local);
+}
+
+// bisync keys its prior listings by the two paths: a synced folder that was moved or renamed would otherwise
+// read as "no prior listings" and demand a repair, though nothing in it changed. When main reports where the
+// folder came from, its listing files are renamed to the new key first, so the run continues from the same
+// baseline. The name is rclone's own canonical form of a path (whitespace, separators, ':', '?', '*' become
+// '_'; leading/trailing separators dropped). The carried listing is the LIVE baseline (the folder was just
+// followed from `from`), so a listing already sitting under the new name — left by an earlier pairing of that
+// path — is stale and is set aside, never used; any mismatch simply leaves bisync to ask for its repair.
+const NON_CANONICAL = /[\s\\/:?*]/g;
+function canonicalPath(p) {
+  return String(p).replace(/^[\\/]+|[\\/]+$/g, '').replace(NON_CANONICAL, '_');
+}
+function carryListings(workdir, { from, to }) {
+  const oldKey = `${canonicalPath(from)}..`;
+  const newKey = `${canonicalPath(to)}..`;
+  if (!from || !to || oldKey === newKey) return 0;
+  let names;
+  try { names = fs.readdirSync(workdir); } catch { return 0; }
+  let moved = 0;
+  for (const n of names) {
+    if (!n.startsWith(oldKey)) continue;
+    const target = path.join(workdir, newKey + n.slice(oldKey.length));
+    try {
+      if (fs.existsSync(target)) fs.renameSync(target, `${target}.stale-${Date.now()}`); // the stale one is set aside, not read again
+      fs.renameSync(path.join(workdir, n), target); moved += 1;
+    } catch { /* leave it; bisync will ask for a repair */ }
+  }
+  return moved;
 }
 
 /**
@@ -161,7 +242,9 @@ async function runBisync(o) {
   }
 
   fs.mkdirSync(o.workdir, { recursive: true });
-  const args = buildBisyncArgs({ local: o.local, remote: o.remote, workdir: o.workdir, resync: !!o.resync });
+  // The one automatic re-baseline: an empty pair (see emptyPairBaseline). Nothing local can be lost by it.
+  const resync = !!o.resync || (!o.resync && emptyPairBaseline({ local: o.local, remote: o.remote, workdir: o.workdir }));
+  const args = buildBisyncArgs({ local: o.local, remote: o.remote, workdir: o.workdir, resync });
   const { code, stdout, stderr } = await o.runner.run(args, {
     config: o.config,
     inactivityMs: o.inactivityMs || SYNC_INACTIVITY_MS,
@@ -174,11 +257,12 @@ async function runBisync(o) {
   // Classify into ONE typed result. A safety abort (excessive delete) and a critical/needs-resync outcome
   // SET the resync block; a completed run clears it; a connection-level block (host-key mismatch) or a
   // plain error leaves the prior block untouched (resyncRequired=null => keep the prior value). Nothing
-  // here auto-resyncs or auto-forces — the abort is surfaced, and the server copy is left intact by rclone.
-  const outcome = classifyBisyncOutcome({ code, stdout, stderr, resync: !!o.resync });
+  // here auto-forces, and nothing auto-clears a latched abort — the one automatic resync above runs only
+  // for an empty baseline with an empty local side, where nothing can be lost.
+  const outcome = classifyBisyncOutcome({ code, stdout, stderr, resync });
   const resyncRequired = outcome.resyncRequired === null ? state.resyncRequired : outcome.resyncRequired;
   if (o.db) recordRun(o.db, o.vault, { result: outcome.result, resyncRequired, atUtc: now() });
   return { ran: true, code, result: outcome.result, resyncRequired, needsAttention: outcome.needsAttention, stdout, stderr };
 }
 
-module.exports = { buildBisyncArgs, runBisync, credPrepareOutcome, bisyncWorkdir, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS };
+module.exports = { buildBisyncArgs, runBisync, credPrepareOutcome, bisyncWorkdir, emptyPairBaseline, needsZeroLossBaseline, localHasNoFiles, priorListingEmpty, canonicalPath, carryListings, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS };

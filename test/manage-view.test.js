@@ -193,3 +193,13 @@ test('malformed ids and unknown kinds are refused before anything is called', as
   }
   assert.deepEqual(h.log, []);
 });
+
+test('relocate-folder asks main for the offer, only for a vault configured here, with a well-formed id', async () => {
+  const calls = [];
+  const { view } = harness({ relocateFolder: (v) => calls.push(v) });
+  assert.deepEqual(await view.act({ kind: 'relocate-folder', vaultId: V1 }), { ok: true });
+  assert.deepEqual(calls, [V1]);
+  assert.deepEqual(await view.act({ kind: 'relocate-folder', vaultId: '99999999-9999-4999-8999-999999999999' }), { ok: false, reason: 'not-found' });
+  assert.deepEqual(await view.act({ kind: 'relocate-folder', vaultId: 'C:\\x' }), { ok: false, reason: 'bad-request' });
+  assert.equal(calls.length, 1);
+});

@@ -187,3 +187,31 @@ test('the resolved (symlink-real) target is what gets classified and stored', as
   assert.strictEqual(r.enabled, false); // system-location refused -> then pickFolder empty -> cancel
   assert.deepStrictEqual(log.refused, ['system-location'], 'classification ran on the RESOLVED target, not the link');
 });
+
+test('the folder is marked after it is ensured and before the entry is saved; the entry records the marker\'s id', async () => {
+  const order = [];
+  const { io, log } = makeIo({ folders: [abs('/Users/tester/Photos')], ensureFolder: (p) => { order.push(['ensure', p]); }, save: (e) => { order.push(['save']); log.saved = e; } });
+  io.markFolder = (folder, vaultId) => { order.push(['mark', folder, vaultId]); return { syncId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', markerId: '7:42' }; };
+  const r = await runEnableFlow(io);
+  assert.strictEqual(r.enabled, true);
+  assert.deepStrictEqual(order.map((o) => o[0]), ['ensure', 'mark', 'save']);
+  assert.deepStrictEqual(order[1], ['mark', abs('/Users/tester/Photos'), 'v1']);
+  assert.strictEqual(log.saved.syncId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+  assert.strictEqual(log.saved.markerId, '7:42');
+});
+
+test('a folder that refuses the marker is re-picked with a folder problem, never a dead end', async () => {
+  const { io, log } = makeIo({ folders: [abs('/Users/tester/ReadOnly'), abs('/Users/tester/Photos')] });
+  io.markFolder = (folder) => { if (folder.endsWith('ReadOnly')) throw new Error('EROFS'); return { syncId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', markerId: '7:1' }; };
+  const r = await runEnableFlow(io);
+  assert.strictEqual(r.enabled, true);
+  assert.deepStrictEqual(log.refused, ['folder-problem']);
+  assert.strictEqual(log.saved.localFolder, abs('/Users/tester/Photos'));
+});
+
+test('without a markFolder (an older io) the entry is saved without a sync id, to be adopted on its first run', async () => {
+  const { io, log } = makeIo({ folders: [abs('/Users/tester/Photos')] });
+  const r = await runEnableFlow(io);
+  assert.strictEqual(r.enabled, true);
+  assert.strictEqual(log.saved.syncId, undefined);
+});

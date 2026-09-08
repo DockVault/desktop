@@ -13,7 +13,8 @@
  *   E) Stop syncing here and Sync now on this computer's card;
  *   F) the sign-in gate renders its statement, nothing else;
  *   G) the sender gate: a page at the interface root cannot read the model or act;
- *   H) a pushed sync status refreshes a card's state without reloading the model.
+ *   H) a pushed sync status refreshes a card's state without reloading the model;
+ *   I) a folder that cannot be found: the card says so and its "Find the folder…" asks main for the relocate offer.
  * Writes .local/manage-check.json and prints one PASS/FAIL line. Exit 0 = PASS.
  *
  *   node_modules/electron/dist/electron.exe test/manage-check.js
@@ -43,6 +44,7 @@ const OTHER = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const OLD = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const V1 = '11111111-1111-4111-8111-111111111111';
 const FOLDER = path.join('C:', 'Users', 'someone', 'Photos');
+const relocated = [];
 
 function makeIo(over = {}) {
   const log = [];
@@ -218,7 +220,24 @@ app.whenReady().then(async () => {
     out.H_pass = r.before === 'Up to date' && r.after === 'Syncing now' && r.syncNowDisabled === true && r.lists === r.listsAfter;
   }
 
-  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+  // I) a folder that cannot be found: the card says so and offers "Find the folder…", which asks main for the offer
+  {
+    const r = await scenario('I_relocate', { ioSpec: {
+      liveStatus: () => ({ vaults: [{ vault: V1, state: 'needs-decision', reason: 'folder-missing', running: false, lastSyncedAt: 1700000000000, via: 'device' }] }),
+      reasonText: () => "Its folder can't be found where it was.",
+      relocateFolder: (v) => { relocated.push(v); },
+    }, drive: async (win, ctx) => {
+      const s = await ev(win, settle);
+      await ev(win, clickIn('Photos', 'Find the folder…'));
+      return { card: s.sections[0].cards[0], log: ctx.log };
+    } });
+    out.I_pass = r.card.state === 'Needs your decision' && r.card.text.includes("can't be found") && r.card.buttons[0] === 'Find the folder…'
+      && relocated.length === 1 && relocated[0] === V1 && !r.log.some((l) => l[0] !== 'listDevices');
+  }
+  // A card in a healthy state offers no such button.
+  out.I_pass = out.I_pass && !(out.A_render.sections[0].cards[0].buttons.includes('Find the folder…'));
+
+  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
   out.ok = KEYS.every((k) => out[`${k}_pass`] === true);
   clearTimeout(watchdog);
   dump();

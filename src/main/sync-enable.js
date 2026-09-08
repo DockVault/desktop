@@ -100,9 +100,18 @@ async function runEnableFlow(io) {
 
     // The remote is ALWAYS the value derived from the chosen vault above — never a picker/renderer value.
     io.ensureFolder(resolved);
+    // The folder gets its identity now: a hidden marker in its root carrying a fresh sync id (folder-marker.js),
+    // so a later rename or move is followed by the marker, never guessed from the path. A marker already there
+    // for this same vault (the folder was synced before) is kept, so its identity stays stable across set-ups.
+    let mark = null;
+    if (typeof io.markFolder === 'function') {
+      try { mark = io.markFolder(resolved, vault.vaultId); } catch { mark = null; }
+      if (!mark) { await io.onRefuse('folder-problem'); continue; } // a folder that refuses the marker is re-picked, never a dead end
+      if (typeof mark === 'string') mark = { syncId: mark };
+    }
     // consented: the two-way readable-copies consent was just given (confirmConsent above), so the first
     // scheduled upload does not re-ask; a config written before this flag existed re-asks, fail-safe.
-    const entry = makeConfigEntry({ vaultId: vault.vaultId, vaultName: vault.vaultName, localFolder: resolved, remotePath, enabled: true, consented: true });
+    const entry = makeConfigEntry({ vaultId: vault.vaultId, vaultName: vault.vaultName, localFolder: resolved, remotePath, enabled: true, consented: true, ...(mark ? { syncId: mark.syncId, ...(mark.markerId ? { markerId: mark.markerId } : {}) } : {}) });
     await io.save(entry);
     return { enabled: true, entry };
   }

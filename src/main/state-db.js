@@ -151,6 +151,11 @@ function recordRun(db, vault, { result, resyncRequired, atUtc }) {
     .run(vault, atUtc, String(result), resyncRequired ? 1 : 0);
 }
 
+/** Forget one vault's run history (a sync stopped here): its next set-up starts with a fresh baseline. */
+function forgetRunState(db, vault) {
+  db.prepare('DELETE FROM sync_run WHERE vault=?').run(vault);
+}
+
 /** Remove the database and its wrapped key. Relationship-ends only — never on an idle-lock. */
 function wipe(dir) {
   for (const f of [dbkPath(dir), dbPath(dir), dbPath(dir) + '-wal', dbPath(dir) + '-shm']) {
@@ -158,4 +163,4 @@ function wipe(dir) {
   }
 }
 
-module.exports = { loadOrMintDBK, openStateDb, wipe, getRunState, recordRun, CIPHER, dbkPath, dbPath };
+module.exports = { loadOrMintDBK, openStateDb, wipe, getRunState, recordRun, forgetRunState, CIPHER, dbkPath, dbPath };

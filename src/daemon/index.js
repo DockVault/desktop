@@ -21,7 +21,7 @@
  *                        session end); acked, so the clear is observable
  *                     { type: 'run-state', id, vaults }    query each vault's run-state (operational
  *                        metadata only — last result + resync-owed; never a credential)
- *                     { type: 'sync-run', id, spec }       run one bisync; spec = { vault, local,
+ *                     { type: 'sync-run', id, spec }       run one bisync; spec = { vault, local, movedFrom?,
  *                        remotePath, resync? }. Uses the prepared config from the last sftp-cred.
  *   child  -> parent : { type: 'hello' }          sent once the child is up, before init
  *                     { type: 'ready', encrypted, reason? }
@@ -45,6 +45,7 @@ const ephemeralConfig = require('./ephemeral-config');
 const { deriveCredSub } = require('./helper-sub');
 const syncEngine = require('./sync-engine');
 const { runVaultSync } = require('./sync-run');
+const fs = require('node:fs');
 
 let db = null;
 let rclone = null;      // the standard-vault sync runner (one-shot rclone children), if configured
@@ -189,6 +190,18 @@ function onSftpCredClear(m) {
   reply({ type: 'sftp-cred-ack', id: m.id, ok: true });
 }
 
+// A sync stopped on this computer: forget the vault's run history and its bisync listings, so a later set-up
+// (into the same folder or another) starts with a fresh baseline instead of a repair against stale state.
+// Never while a run for it is in flight; never any file of the person's.
+function onSyncForget(m) {
+  const vault = m && typeof m.vault === 'string' ? m.vault : null;
+  if (!vault || (syncInFlight)) { reply({ type: 'sync-forget-result', id: m.id, ok: false }); return; }
+  let ok = true;
+  if (db) { try { stateDb.forgetRunState(db, vault); } catch { ok = false; } }
+  if (rcloneRunDir) { try { fs.rmSync(syncEngine.bisyncWorkdir(rcloneRunDir, vault), { recursive: true, force: true }); } catch { ok = false; } }
+  reply({ type: 'sync-forget-result', id: m.id, ok });
+}
+
 // Report each requested vault's run-state so the scheduler (in main) can tell a never-run vault from a
 // blocked one without opening the state DB itself (the daemon stays its single owner). This is OPERATIONAL
 // METADATA ONLY — the two run-state columns (last typed result, resync-owed) — never a credential or any
@@ -245,13 +258,19 @@ async function onSyncRun(m) {
     if (!syncReady) syncReady = await rclone.ready();
     const workdir = syncEngine.bisyncWorkdir(rcloneRunDir, b.vault);
     const remote = 'vault:' + b.remotePath;
+    // A folder that was moved or renamed keeps its baseline: the prior listings are re-keyed to the new path.
+    if (typeof b.movedFrom === 'string' && b.movedFrom) { try { syncEngine.carryListings(workdir, { from: b.movedFrom, to: b.local }); } catch { /* bisync will ask for a repair if it cannot continue */ } }
+    // A baseline that recorded an empty side cannot be run normally by bisync; with files now on the local side
+    // the fresh baseline goes through the zero-loss path (sync-engine.js explains why nothing is lost).
+    let resync = !!b.resync;
+    if (!resync) { try { resync = syncEngine.needsZeroLossBaseline({ local: b.local, remote, workdir }); } catch { resync = false; } }
     // A resync runs several rclone processes, each of which burns a single-use credential — so each gets its
     // own fresh one via prepareFreshCred (main authorises + sends; this rewrites the ephemeral config). A
     // normal one-process bisync needs no provider: it uses the dispatch credential already prepared.
     const r = await ephemeralConfig.withEphemeralConfig(rcloneRunDir, sftpConfig, (cfgPath) =>
       runVaultSync({
-        runner: rclone, db, vault: b.vault, local: b.local, remote, workdir, config: cfgPath, resync: !!b.resync,
-        prepareCred: b.resync ? (() => prepareFreshCred(b.vault, cfgPath)) : undefined,
+        runner: rclone, db, vault: b.vault, local: b.local, remote, workdir, config: cfgPath, resync,
+        prepareCred: resync ? (() => prepareFreshCred(b.vault, cfgPath)) : undefined,
         // Progress: the runner extracts the two aggregate {files,bytes} integers from rclone's stats and calls
         // this as a transfer moves. Forward ONLY those numbers + the vault id on the existing parent channel —
         // never a line, never a path (the path-bearing stats lines die in the daemon's stats parser).
@@ -291,6 +310,7 @@ process.parentPort.on('message', (event) => {
       }
       case 'run-state': onRunState(m); break;
       case 'sync-run': void onSyncRun(m); break;
+      case 'sync-forget': onSyncForget(m); break;
       case 'zk-lock':
         // Drop the daemon's in-memory ZK sync key as part of the atomic lock purge, then ACK so the
         // purge is observable (request->ack; the id correlates the reply). No such key exists until

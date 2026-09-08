@@ -98,6 +98,15 @@ and what to do next, and one verdict on the whole. It runs the same verification
 does, against the saved addresses (following a redirect the way the app itself would), and changes
 nothing; from it you can go straight to changing the server.
 
+A synced folder is known by a small hidden marker file in its root, written when the sync is set up,
+not by where the folder happens to sit. Rename or move the folder anywhere under your home folder and
+the sync follows it. If the folder can't be found, or a different folder now sits where it was, that
+vault pauses, and the tray and the Computers window offer two ways forward: point DockVault at the
+folder (it accepts only the same folder), or stop syncing it on this computer. Nothing is ever written
+into a folder whose identity is in doubt, and nothing in the folder is touched meanwhile. The marker
+stays on this computer and is never uploaded to the vault; it is a small hidden file named
+`.dockvault-sync`, and deleting it makes DockVault ask about the folder next time.
+
 ## Building installers
 
 Installers are produced by [electron-builder](https://www.electron.build/), pinned in

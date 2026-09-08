@@ -46,6 +46,9 @@ test('buildBisyncArgs bakes in the safety controls and never emits --force/--ign
   assert.ok(ri >= 0 && a[ri + 1] === '1', 'the run is attempted once — no re-auth with a spent single-use credential, no re-attempt of a safety abort');
   const ki = a.indexOf('--compare');
   assert.ok(ki >= 0 && a[ki + 1] === 'size', 'change-detection is by size — this server cannot preserve a client mtime, so a modtime compare would spuriously report every file changed');
+  // The folder's identity marker (and a torn write of it) never travels: excluded at the root, by fixed name.
+  const ex = a.map((x, i) => (x === '--exclude' ? a[i + 1] : null)).filter(Boolean);
+  assert.deepStrictEqual(ex, ['/.dockvault-sync', '/.dockvault-sync.*.tmp']);
 });
 
 test('buildBisyncArgs adds --resync only when requested; the delete guard is fixed + non-defeatable', () => {
@@ -112,4 +115,95 @@ test('runBisync: after the block clears, a normal run proceeds; a plain error le
   assert.strictEqual(r.resyncRequired, false, 'a plain error leaves the resync block as it was (was clear)');
   assert.strictEqual(getRunState(db, 'v1').lastResult, 'error');
   db.close(); fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// --- the empty-pair baseline (a new vault into a new folder) -----------------------------------------
+test('emptyPairBaseline: true only for an empty prior listing AND a local side holding nothing but its marker', () => {
+  const { emptyPairBaseline, localHasNoFiles, priorListingEmpty, canonicalPath } = require('../src/daemon/sync-engine');
+  const dir = tmp();
+  const local = path.join(dir, 'local'); const wd = path.join(dir, 'wd');
+  fs.mkdirSync(local); fs.mkdirSync(wd);
+  const remote = 'vault:V';
+  const key = `${canonicalPath(local)}..vault_V`; // bisync keys the listings by the pair; only this pair's count
+  assert.strictEqual(priorListingEmpty(wd, local, remote), false, 'no listing yet: not this rule (the never-run branch)');
+  fs.writeFileSync(path.join(wd, 'C__somewhere_else..vault_V.path1.lst'), '# bisync listing v1\n');
+  fs.writeFileSync(path.join(wd, `${canonicalPath(local)}..vault_Other.path1.lst`), '# bisync listing v1\n');
+  assert.strictEqual(priorListingEmpty(wd, local, remote), false, 'a stale listing of another pairing (either side) decides nothing');
+  fs.writeFileSync(path.join(wd, `${key}.path1.lst`), '# bisync listing v1 from 2026-01-01\n');
+  assert.strictEqual(priorListingEmpty(wd, local, remote), true);
+  assert.strictEqual(localHasNoFiles(local), true);
+  fs.writeFileSync(path.join(local, '.dockvault-sync'), '{}');
+  fs.mkdirSync(path.join(local, 'empty-sub'));
+  assert.strictEqual(localHasNoFiles(local), true, 'the marker and empty folders are not files');
+  assert.strictEqual(emptyPairBaseline({ local, remote, workdir: wd }), true);
+  fs.writeFileSync(path.join(local, 'empty-sub', 'x.txt'), '1');
+  assert.strictEqual(localHasNoFiles(local), false);
+  assert.strictEqual(emptyPairBaseline({ local, remote, workdir: wd }), false, 'a local file: the guard stands');
+  fs.rmSync(path.join(local, 'empty-sub'), { recursive: true });
+  fs.writeFileSync(path.join(wd, `${key}.path1.lst`), '# bisync listing v1\n-        3 - - 0001-01-01T00:00:00.000000000+0000 "f.txt"\n');
+  assert.strictEqual(emptyPairBaseline({ local, remote, workdir: wd }), false, 'a folder that HAD files and is now empty: the guard stands');
+  // Either side's prior listing being empty is enough (a new vault: the server side recorded nothing).
+  fs.writeFileSync(path.join(wd, `${key}.path2.lst`), '# bisync listing v1\n');
+  assert.strictEqual(priorListingEmpty(wd, local), true);
+  assert.strictEqual(emptyPairBaseline({ local, remote, workdir: wd }), true);
+  const { needsZeroLossBaseline } = require('../src/daemon/sync-engine');
+  assert.strictEqual(needsZeroLossBaseline({ local, remote, workdir: wd }), false, 'no local files: the plain resync suffices');
+  fs.writeFileSync(path.join(local, 'first.txt'), 'the first file after an empty baseline');
+  assert.strictEqual(needsZeroLossBaseline({ local, remote, workdir: wd }), true, 'local files + an empty prior listing: the zero-loss path');
+  assert.strictEqual(emptyPairBaseline({ local, workdir: wd }), false);
+  assert.strictEqual(localHasNoFiles(path.join(dir, 'nope')), false, 'unreadable counts as not empty');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('runBisync: an empty pair re-baselines on its own (--resync), and the outcome is read as a resync', async () => {
+  const dir = tmp();
+  const db = openStateDb(dir, nodeCrypto.randomBytes(32));
+  const local = path.join(dir, 'local'); const wd = path.join(dir, 'wd');
+  fs.mkdirSync(local); fs.mkdirSync(wd);
+  await runBisync({ runner: fakeRunner({ code: 0 }), db, vault: 'v1', local, remote: 'vault:p', workdir: wd, config: '/c', resync: true, now: () => 1 });
+  const { canonicalPath } = require('../src/daemon/sync-engine');
+  fs.writeFileSync(path.join(wd, `${canonicalPath(local)}..vault_p.path1.lst`), '# bisync listing v1\n'); // the pair key of remote 'vault:p'
+  const rec = {};
+  const r = await runBisync({ runner: fakeRunner({ code: 0 }, rec), db, vault: 'v1', local, remote: 'vault:p', workdir: wd, config: '/c', now: () => 2 });
+  assert.ok(rec.args.includes('--resync'), 'the empty pair re-baselines');
+  assert.strictEqual(r.ran, true);
+  assert.strictEqual(r.resyncRequired, false);
+  // With a file in the folder the same call is a normal run.
+  fs.writeFileSync(path.join(local, 'a.txt'), '1');
+  const rec2 = {};
+  await runBisync({ runner: fakeRunner({ code: 0 }, rec2), db, vault: 'v1', local, remote: 'vault:p', workdir: wd, config: '/c', now: () => 3 });
+  assert.ok(!rec2.args.includes('--resync'));
+  db.close(); fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// --- carrying the prior listings over a folder move --------------------------------------------------
+test('canonicalPath matches rclone\'s listing key: whitespace, separators, colon, ? and * become _, ends trimmed', () => {
+  const { canonicalPath } = require('../src/daemon/sync-engine');
+  assert.strictEqual(canonicalPath('C:/Users/me/Photos-2026 (new)'), 'C__Users_me_Photos-2026_(new)');
+  assert.strictEqual(canonicalPath('C:\\Users\\me\\My Photos\\'), 'C__Users_me_My_Photos');
+  assert.strictEqual(canonicalPath('/home/u/what?*'), 'home_u_what__');
+});
+
+test('carryListings re-keys every listing file of the old pair to the new one, never overwrites, and is idempotent', () => {
+  const { carryListings } = require('../src/daemon/sync-engine');
+  const wd = tmp();
+  const from = 'C:\\Users\\me\\Photos'; const to = 'C:\\Users\\me\\Pictures\\Photos 2026';
+  fs.writeFileSync(path.join(wd, 'C__Users_me_Photos..vault_V.path1.lst'), '1');
+  fs.writeFileSync(path.join(wd, 'C__Users_me_Photos..vault_V.path2.lst'), '2');
+  fs.writeFileSync(path.join(wd, 'C__Users_me_Photos..vault_V.path1.lst-old'), '3');
+  fs.writeFileSync(path.join(wd, 'C__Users_me_Other..vault_V.path1.lst'), 'x');
+  assert.strictEqual(carryListings(wd, { from, to }), 3);
+  assert.deepStrictEqual(fs.readdirSync(wd).sort(), [
+    'C__Users_me_Other..vault_V.path1.lst',
+    'C__Users_me_Pictures_Photos_2026..vault_V.path1.lst', 'C__Users_me_Pictures_Photos_2026..vault_V.path1.lst-old', 'C__Users_me_Pictures_Photos_2026..vault_V.path2.lst',
+  ]);
+  assert.strictEqual(carryListings(wd, { from, to }), 0, 'nothing left under the old key');
+  // A stale listing already under the new key (an earlier pairing of that path) is set aside: the LIVE one wins.
+  fs.writeFileSync(path.join(wd, 'C__Users_me_Photos..vault_V.path1.lst'), 'live');
+  assert.strictEqual(carryListings(wd, { from, to }), 1);
+  assert.strictEqual(fs.readFileSync(path.join(wd, 'C__Users_me_Pictures_Photos_2026..vault_V.path1.lst'), 'utf8'), 'live');
+  assert.ok(fs.readdirSync(wd).some((n) => n.startsWith('C__Users_me_Pictures_Photos_2026..vault_V.path1.lst.stale-')), 'the stale one is kept aside, never read');
+  assert.strictEqual(carryListings(wd, { from, to: from }), 0, 'same key: nothing to do');
+  assert.strictEqual(carryListings(path.join(wd, 'nope'), { from, to }), 0, 'no workdir: nothing, no throw');
+  fs.rmSync(wd, { recursive: true, force: true });
 });

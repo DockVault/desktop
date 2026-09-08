@@ -45,6 +45,7 @@ class SyncScheduler {
    * @param {(vaultId:string) => ({lastResult:(string|null),resyncRequired:boolean}|null)} io.runState  null => never-run
    * @param {() => ({locked:boolean,online:boolean,accountLive:boolean,deviceLive?:boolean})} io.session
    * @param {(vaultId:string) => Promise<{ok:true,remotePath:string,vaultName?:string}|{ok:false,reason:string}>} io.verifyEligible
+   * @param {(cfg:object) => Promise<{ok:true,folder:string}|{ok:false,reason:string}>} [io.resolveFolder]  find the vault's folder by its marker (folder-identity.js); absent => the configured path is used as-is
    * @param {(localFolder:string) => (({ok:boolean,reason?:string})|Promise<{ok:boolean,reason?:string}>)} io.secureFolder  may be async (applies + reads back a real ACL); it is awaited
    * @param {(localFolder:string) => ({ok:boolean,reason?:string})} io.classify
    * @param {(vaultId:string) => Promise<{ok:boolean,reason?:string}>} io.refreshCred
@@ -190,12 +191,25 @@ class SyncScheduler {
       if (s.locked && el.via !== 'device') { this._emit(vaultId, { phase: 'skipped', reason: 'paused-locked' }); return; }
       const remotePath = el.remotePath;
 
+      // The folder is known by its marker, not its path: a moved or renamed folder is followed, a folder that
+      // cannot be found (or is not the one the marker names) PAUSES the vault — nothing is ever written to a
+      // folder whose identity is in doubt. Without a resolver (a bare test io) the configured path stands.
+      let localFolder = cfg.localFolder;
+      // Where the folder was before a move, for the engine to carry its prior listings over: a move just
+      // followed, or one recorded on the config from an earlier tick whose run did not complete.
+      let movedFrom = typeof cfg.movedFrom === 'string' ? cfg.movedFrom : undefined;
+      if (typeof io.resolveFolder === 'function') {
+        const rf = await io.resolveFolder(cfg);
+        if (!rf || !rf.ok || typeof rf.folder !== 'string' || !rf.folder) { this._emit(vaultId, { phase: 'paused', reason: (rf && rf.reason) || 'folder-missing', folders: (rf && rf.folders) || undefined }); return; }
+        localFolder = rf.folder;
+        if (rf.moved && typeof rf.moved.from === 'string') movedFrom = rf.moved.from;
+      }
       // Re-secure + re-classify the folder before any write (covers configs/folders created before these
       // checks). secureFolder may be async (it applies + reads back a real ACL), so it is awaited — a
       // Promise left unawaited would read as a truthy object with no `ok` and wrongly refuse every run.
-      const sec = await io.secureFolder(cfg.localFolder);
+      const sec = await io.secureFolder(localFolder);
       if (!sec || !sec.ok) { this._emit(vaultId, { phase: 'refused', reason: (sec && sec.reason) || 'folder-insecure' }); return; }
-      const cl = io.classify(cfg.localFolder);
+      const cl = io.classify(localFolder);
       if (!cl || !cl.ok) { this._emit(vaultId, { phase: 'refused', reason: (cl && cl.reason) || 'folder-rejected' }); return; }
 
       // gate-before-mint: verify the sync helper is READY before minting a single-use credential. This SKIPS the
@@ -223,7 +237,7 @@ class SyncScheduler {
       const cr = await io.refreshCred(vaultId);
       if (!cr || !cr.ok) { this._emit(vaultId, { phase: 'paused', reason: (cr && cr.reason) || 'cred-refresh-failed', sub: (cr && cr.sub) || null, installed: (cr && cr.installed) || null }); return; }
 
-      const spec = { vaultId, local: cfg.localFolder, remotePath };
+      const spec = { vaultId, local: localFolder, remotePath, ...(movedFrom && movedFrom !== localFolder ? { movedFrom } : {}) };
       const useResync = repair || neverRun; // initial baseline OR deliberate Repair — always zero-loss (keep-both)
       // The first upload is gated, fail-closed. `kind` lets the caller show the right dialog: an initial
       // first-upload (the two-way consent for a not-yet-consented config) vs a Repair confirm — and lets an

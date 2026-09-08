@@ -106,7 +106,7 @@ const api = Object.freeze({
     // Names, ids, dates, states, and the folder paths main itself holds; never a credential or a raw error.
     model: () => ipcRenderer.invoke('dockvault:manage.model'),
     // Carry out an action the person confirmed on the page: { kind, deviceId?, vaultId? } with kind one of
-    // revoke-grant | revoke-computer | remove-computer | stop-sync | sync-now. Main checks the ids' shape and
+    // revoke-grant | revoke-computer | remove-computer | stop-sync | sync-now | relocate-folder. Main checks the ids' shape and
     // decides; the server is the authority. Resolves { ok, reason? }.
     act: (action) => ipcRenderer.invoke('dockvault:manage.act', { kind: String(action && action.kind), deviceId: action && action.deviceId != null ? String(action.deviceId) : undefined, vaultId: action && action.vaultId != null ? String(action.vaultId) : undefined }),
     // Open the sync setup wizard (the app's own window), and close this one.

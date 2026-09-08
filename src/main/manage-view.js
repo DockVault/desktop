@@ -70,6 +70,7 @@ function standingOf({ granted, recorded, identityStatus }) {
  *   endpoint()                 -> { serverHost, sftp: {host, port}|null }
  *   remotePathFor(vaultId, via, vaultName) -> the remote directory a run uses
  *   revokeGrant(deviceId, vaultId), revokeDevice(deviceId), deleteDevice(deviceId) -> Promise<{ ok, reason? }>
+ *   relocateFolder(vaultId)    -> open main's relocate-or-stop offer for a folder that cannot be found
  *   dropLocalVault(vaultId)    -> remove the local sync entry + records for a vault
  *   dropLocalIdentity()        -> clear this computer's identity + grant records locally
  *   syncNow(vaultId)
@@ -243,6 +244,15 @@ function createManageView(io) {
       case 'sync-now': {
         if (!isUuid(vaultId)) return { ok: false, reason: 'bad-request' };
         try { io.syncNow(vaultId); } catch { return { ok: false, reason: 'refused' }; }
+        return { ok: true };
+      }
+      // The relocate-or-stop offer for a folder that cannot be found: main runs it (its own dialogs); the page
+      // only asks for it, and only for a vault configured here.
+      case 'relocate-folder': {
+        if (!isUuid(vaultId)) return { ok: false, reason: 'bad-request' };
+        const here = (safe(() => io.configured(), []) || []).some((c) => c && c.vaultId === vaultId);
+        if (!here) return { ok: false, reason: 'not-found' };
+        try { io.relocateFolder(vaultId); } catch { return { ok: false, reason: 'refused' }; }
         return { ok: true };
       }
       default:

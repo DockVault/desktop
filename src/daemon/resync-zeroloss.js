@@ -28,7 +28,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { planPreservation } = require('./resync-plan');
 const { keepBothName } = require('./keepboth-name');
-const { runBisync, credPrepareOutcome, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS } = require('./sync-engine');
+const { runBisync, credPrepareOutcome, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS } = require('./sync-engine');
 const { RESULT } = require('./bisync-outcome');
 const { recordRun } = require('../main/state-db');
 
@@ -70,6 +70,8 @@ function walkLocal(root) {
     for (const e of entries) {
       const full = path.join(dir, e.name);
       const rel = prefix ? `${prefix}/${e.name}` : e.name;
+      // The folder's identity marker (and a torn write of it) at the root is local-only: never a file to preserve or compare.
+      if (!prefix && (e.name === MARKER_NAME || (e.name.startsWith(`${MARKER_NAME}.`) && e.name.endsWith('.tmp')))) continue;
       if (e.isDirectory()) rec(full, rel);
       else if (e.isFile()) out.push(rel);
     }
@@ -136,7 +138,7 @@ async function zeroLossResync(o) {
 
   // 1. FAIL-CLOSED enumeration of the server side.
   { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved: 0 }; }
-  const ls = await o.runner.run(['lsf', '-R', '--files-only', o.remote, ...SYNC_STATS_ARGS], scanOpts);
+  const ls = await o.runner.run(['lsf', '-R', '--files-only', o.remote, ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts);
   if (ls.code !== 0) throw new Error('zero-loss resync: could not enumerate the server — refusing to resync');
   const serverList = parseLsf(ls.stdout);
   const localList = walkLocal(o.local);
@@ -149,7 +151,7 @@ async function zeroLossResync(o) {
   let differing = [];
   if (onBoth.length) {
     { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved: 0 }; }
-    const chk = await o.runner.run(['check', o.local, o.remote, '--download', '--combined', '-', ...SYNC_STATS_ARGS], scanOpts)
+    const chk = await o.runner.run(['check', o.local, o.remote, '--download', '--combined', '-', ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts)
       .catch((e) => ({ code: -1, stdout: '', stderr: String(e) }));
     const parsed = parseCheckDiffering(chk.stdout, onBoth);
     if (parsed.compareError || parsed.covered.size !== onBoth.length) {

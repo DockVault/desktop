@@ -542,3 +542,74 @@ test('real LockState drives boot -> dispatch+mint -> idle-lock pause -> resume r
   assert.deepStrictEqual(calls.runSync, ['a', 'a'], 'resume lets the next run dispatch again');
   assert.deepStrictEqual(calls.refreshCred, ['a', 'a'], 're-mint: a FRESH credential is minted on the post-resume run');
 });
+
+// --- the folder by its marker (folder-identity.js) -------------------------------------------------
+test('resolveFolder: the resolved folder (a moved one) is what is secured, classified, and run — not the configured path', async () => {
+  const { sch, calls, log } = harness({ resolveFolder: async (cfg) => ({ ok: true, folder: '/moved/' + cfg.vaultId, syncId: 'x', moved: { from: cfg.localFolder, to: '/moved/' + cfg.vaultId } }) });
+  sch._io.resolveFolder = async (cfg) => ({ ok: true, folder: '/moved/' + cfg.vaultId });
+  sch.requestSync('a');
+  await settle(sch);
+  assert.deepStrictEqual(calls.secureFolder, ['/moved/a']);
+  assert.deepStrictEqual(calls.classify, ['/moved/a']);
+  assert.deepStrictEqual(phases(log, 'a'), ['running', 'done']);
+});
+
+test('resolveFolder: a folder that cannot be found PAUSES the vault with the typed reason (and any candidates); nothing is secured, minted, or run', async () => {
+  for (const reason of ['folder-missing', 'folder-marker-missing', 'folder-other-vault', 'folder-marker-unreadable', 'folder-ambiguous', 'folder-moved-rejected']) {
+    const { sch, calls, log } = harness();
+    sch._io.resolveFolder = async () => ({ ok: false, reason, folders: reason === 'folder-ambiguous' ? ['/a', '/b'] : undefined });
+    sch.requestSync('a');
+    await settle(sch);
+    assert.deepStrictEqual(phases(log, 'a'), ['paused'], reason);
+    const ev = log.find((e) => e.vaultId === 'a');
+    assert.strictEqual(ev.reason, reason);
+    if (reason === 'folder-ambiguous') assert.deepStrictEqual(ev.folders, ['/a', '/b']);
+    assert.deepStrictEqual(calls.secureFolder, []);
+    assert.deepStrictEqual(calls.refreshCred, []);
+    assert.deepStrictEqual(calls.runSync, []);
+    assert.strictEqual(sch.held('a'), null, 'not held: the folder may come back (a drive plugged in) and the next tick should look again');
+  }
+});
+
+test('resolveFolder: a resolver that answers without a folder, or that throws, never runs', async () => {
+  {
+    const { sch, calls, log } = harness();
+    sch._io.resolveFolder = async () => ({ ok: true });
+    sch.requestSync('a'); await settle(sch);
+    assert.deepStrictEqual(phases(log, 'a'), ['paused']);
+    assert.deepStrictEqual(calls.runSync, []);
+  }
+  {
+    const { sch, calls, log } = harness();
+    sch._io.resolveFolder = async () => { throw new Error('boom'); };
+    sch.requestSync('a'); await settle(sch);
+    assert.deepStrictEqual(phases(log, 'a'), ['error']);
+    assert.deepStrictEqual(calls.runSync, []);
+  }
+});
+
+test('resolveFolder runs AFTER eligibility (no folder walk for an ineligible vault) and is optional (a bare io uses the configured path)', async () => {
+  const seen = [];
+  const { sch, calls } = harness({ verifyEligible: async () => { seen.push('eligible'); return { ok: false, reason: 'no-session' }; } });
+  sch._io.resolveFolder = async () => { seen.push('resolve'); return { ok: true, folder: '/x' }; };
+  sch.requestSync('a'); await settle(sch);
+  assert.deepStrictEqual(seen, ['eligible']);
+  const bare = harness();
+  bare.sch.requestSync('a'); await settle(bare.sch);
+  assert.deepStrictEqual(bare.calls.secureFolder, ['/folders/a']);
+  assert.deepStrictEqual(calls.runSync, []);
+});
+
+test('resolveFolder: a move just followed, or one still recorded on the config, rides on the run spec as movedFrom', async () => {
+  const { sch, log } = harness({ runSync: async (spec) => { log.push({ vaultId: spec.vaultId, phase: 'spec', spec }); return { result: 'ok', ran: true }; } });
+  sch._io.resolveFolder = async (cfg) => ({ ok: true, folder: '/new/a', moved: { from: cfg.localFolder, to: '/new/a' } });
+  sch.requestSync('a'); await settle(sch);
+  assert.deepStrictEqual(log.find((e) => e.phase === 'spec').spec, { vaultId: 'a', local: '/new/a', remotePath: 'A', movedFrom: '/folders/a' });
+  const again = harness({ listConfigured: () => [vault('a', { localFolder: '/new/a', movedFrom: '/folders/a' })], runSync: async (spec) => { again.log.push({ vaultId: spec.vaultId, phase: 'spec', spec }); return { result: 'ok', ran: true }; } });
+  again.sch._io.resolveFolder = async () => ({ ok: true, folder: '/new/a' });
+  again.sch.requestSync('a'); await settle(again.sch);
+  assert.strictEqual(again.log.find((e) => e.phase === 'spec').spec.movedFrom, '/folders/a');
+  const plain = harness({ runSync: async (spec) => { plain.log.push({ vaultId: spec.vaultId, phase: 'spec', spec }); return { result: 'ok', ran: true }; } });
+  plain.sch.requestSync('a'); await settle(plain.sch);
+  assert.strictEqual('movedFrom' in plain.log.find((e) => e.phase === 'spec').spec, false, 'no move: the field is absent');
+});

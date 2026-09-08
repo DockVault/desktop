@@ -19,6 +19,7 @@
 
   let busy = false;
   let lastModel = null;
+  const FOLDER_LOST = new Set(['folder-missing', 'folder-marker-missing', 'folder-other-vault', 'folder-marker-unreadable', 'folder-ambiguous', 'folder-moved-rejected', 'folder-found-elsewhere', 'folder-marker-unwritable']);
 
   const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
   const para = (text, cls) => el('p', cls, text);
@@ -164,6 +165,11 @@
     if (v.granted && v.grantedAt) c.appendChild(row('Permission since', dayOf(v.grantedAt)));
     const acts = el('div', 'actions');
     if (v.local) {
+      // A folder that cannot be found (or is not the one at its path) is answered by main's own relocate-or-stop
+      // offer: the card only opens that door.
+      if (FOLDER_LOST.has(v.local.reason)) {
+        acts.appendChild(button(v.local.reason === 'folder-ambiguous' ? 'Choose the folder…' : (v.local.reason === 'folder-found-elsewhere' ? 'Confirm the folder…' : 'Find the folder…'), { primary: true, onClick: () => { if (api) void api.act({ kind: 'relocate-folder', vaultId: v.vaultId }); } }));
+      }
       const syncBtn = button('Sync now', { onClick: (b) => syncNow(c, v, b), disabled: !!v.local.running });
       syncBtn.dataset.role = 'sync-now';
       acts.appendChild(syncBtn);

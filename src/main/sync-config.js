@@ -24,7 +24,11 @@
 const path = require('node:path');
 
 // The only fields the persisted config may carry. Anything credential-adjacent is rejected outright.
-const CONFIG_FIELDS = Object.freeze(['vaultId', 'vaultName', 'localFolder', 'remotePath', 'enabled', 'consented']);
+const CONFIG_FIELDS = Object.freeze(['vaultId', 'vaultName', 'localFolder', 'remotePath', 'enabled', 'consented', 'syncId', 'movedFrom', 'markerId']);
+// The marker file's identity on its volume (folder-marker.js markerIdentity): two integers.
+const MARKER_ID_RE = /^\d{1,40}:\d{1,40}$/;
+// The sync id ties the entry to the marker in the folder's root (folder-marker.js): a UUID the app made.
+const SYNC_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const FORBIDDEN_CONFIG_FIELDS = Object.freeze([
   'password', 'credential', 'cred', 'secret', 'token', 'accessToken', 'sessionToken',
   'hostKey', 'hostKeys', 'key', 'passphrase', 'obscured',
@@ -167,7 +171,28 @@ function makeConfigEntry(o = {}) {
   // `consented` records that the two-way readable-copies consent was given at set-up. It defaults false,
   // so a config written before this existed reads as not-yet-consented and the first upload re-asks — the
   // consent is never assumed, only ever recorded when it was actually given.
-  return { vaultId: o.vaultId, vaultName: o.vaultName, localFolder: path.resolve(o.localFolder), remotePath: o.remotePath, enabled: o.enabled !== false, consented: !!o.consented };
+  // `syncId` names the marker written in the folder's root, so the folder is known by its identity, not its
+  // path. It is optional on read — a config from before markers existed has none and is adopted on its next
+  // run — but when present it must be a well-formed id, never a smuggled string.
+  const entry = { vaultId: o.vaultId, vaultName: o.vaultName, localFolder: path.resolve(o.localFolder), remotePath: o.remotePath, enabled: o.enabled !== false, consented: !!o.consented };
+  if (o.syncId != null) {
+    if (typeof o.syncId !== 'string' || !SYNC_ID_RE.test(o.syncId)) throw new Error('config syncId must be a well-formed id');
+    entry.syncId = o.syncId.toLowerCase();
+  }
+  // `movedFrom` is where the folder was before it was followed to its new place (folder-identity.js). It stays
+  // until a run has completed there, so the engine's prior listings — keyed by the old path — are carried over
+  // even if the first run after the move does not get as far as the transfer.
+  if (o.movedFrom != null) {
+    if (typeof o.movedFrom !== 'string' || !path.isAbsolute(o.movedFrom)) throw new Error('config movedFrom must be an absolute path');
+    entry.movedFrom = path.resolve(o.movedFrom);
+  }
+  // `markerId` is the marker file's identity on disk, recorded when the marker was written or the folder last
+  // confirmed; a folder found elsewhere is followed on its own only when its marker carries the same identity.
+  if (o.markerId != null) {
+    if (typeof o.markerId !== 'string' || !MARKER_ID_RE.test(o.markerId)) throw new Error('config markerId must be a well-formed identity');
+    entry.markerId = o.markerId;
+  }
+  return entry;
 }
 
 // Guard used before persisting or shipping a record anywhere: no credential-adjacent field, ever.

@@ -25,7 +25,7 @@ const { isTransportError } = require('./net-errors');
  * @param {{ runSync: (spec:object)=>Promise<object> }} daemon
  */
 function makeRunEffects(daemon) {
-  const toSpec = (s) => ({ vault: s.vaultId, local: s.local, remotePath: s.remotePath });
+  const toSpec = (s) => ({ vault: s.vaultId, local: s.local, remotePath: s.remotePath, ...(typeof s.movedFrom === 'string' ? { movedFrom: s.movedFrom } : {}) });
   return {
     runSync: (spec) => daemon.runSync(toSpec(spec)),
     runResync: (spec) => daemon.runSync({ ...toSpec(spec), resync: true }),
@@ -128,6 +128,7 @@ function perStepGate({ inFlight, locked, via, accountLive }) {
  * @param {(name:string)=>string} deps.remotePathForVault
  * @param {(folder:string)=>({ok:boolean,reason?:string})} deps.secureFolder
  * @param {(folder:string)=>({ok:boolean,reason?:string})} deps.classify
+ * @param {(cfg:object)=>Promise<object>} [deps.resolveFolder]  the folder by its marker (folder-identity.js)
  * @param {{ensureSent:(v:string)=>Promise<object>}} deps.credCache
  * @param {{runSync:(spec:object)=>Promise<object>}} deps.daemon
  * @param {(o:object)=>Promise<boolean>} [deps.confirmFirstUpload]
@@ -157,6 +158,7 @@ function makeSchedulerIo(deps) {
     verifyEligible: makeVerifyEligible({ fetchStandard: deps.fetchStandard, remotePathForVault: deps.remotePathForVault }),
     secureFolder: deps.secureFolder,
     classify: deps.classify,
+    resolveFolder: deps.resolveFolder,
     refreshCred: (vaultId) => deps.credCache.ensureSent(vaultId),
     // gate-before-mint readiness check: the helper's health (rclone checksum + version), side-effect-free (no
     // mint, no SFTP) and cheap (cached on a healthy helper — one `rclone version` spawn only while not ready).
@@ -247,6 +249,19 @@ function conditionForReason(phase, reason) {
     // A folder that was made private and is now RE-SHARED (a foreign ACE reappeared): the same consent can
     // fix it, so this is a distinct decision from a folder that is simply gone/unusable (choose-folder).
     case 'folder-problem':   return { state: STATE.NEEDS_DECISION, reason: 'folder-problem' };
+    // The folder is known by its marker (folder-identity.js). Each way of not finding it is its own decision:
+    // the folder is gone from where it was (moved away, deleted, a drive unplugged); something else now sits
+    // at that path; the marker was torn; two folders carry the marker (a copy was made). All pause the vault
+    // — never sync the wrong place — and offer relocate-or-stop; none is retried into a "check your connection".
+    case 'folder-missing':          return { state: STATE.NEEDS_DECISION, reason: 'folder-missing' };
+    case 'folder-marker-missing':   return { state: STATE.NEEDS_DECISION, reason: 'folder-marker-missing' };
+    case 'folder-other-vault':      return { state: STATE.NEEDS_DECISION, reason: 'folder-other-vault' };
+    case 'folder-marker-unreadable': return { state: STATE.NEEDS_DECISION, reason: 'folder-marker-unreadable' };
+    case 'folder-ambiguous':        return { state: STATE.NEEDS_DECISION, reason: 'folder-ambiguous' };
+    case 'folder-moved-rejected':   return { state: STATE.NEEDS_DECISION, reason: 'folder-moved-rejected' }; // found, but now somewhere it must not sync
+    case 'folder-found-elsewhere':  return { state: STATE.NEEDS_DECISION, reason: 'folder-found-elsewhere' }; // a look-alike (a copy, or moved across drives): confirm first
+    case 'folder-marker-unwritable': return { state: STATE.NEEDS_DECISION, reason: 'folder-marker-unwritable' }; // the folder refuses the marker (read-only)
+    case 'config-unwritable':       return { state: STATE.NEEDS_DECISION, reason: 'config-unwritable' };       // the sync settings could not be saved
     case 'no-session':       return { state: STATE.NEEDS_DECISION, reason: 'sign-in-needed' };
     // A password-protected vault whose password main does not hold (window closed to tray, or not captured), or a
     // vault-password mint refusal (400/429). A NON-retrying must-act: the remedy is to unlock THIS vault so its

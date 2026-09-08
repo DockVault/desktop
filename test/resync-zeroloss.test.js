@@ -131,3 +131,14 @@ test('zeroLossResync FAILS CLOSED when a shared file could not be compared (part
   await assert.rejects(() => zeroLossResync({ runner, db: null, vault: 'v', local: root, remote: 'vault:V', workdir: path.join(root, 'wd'), config: '/c', now: () => 1 }), /could not compare every shared file/);
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+test('walkLocal: the folder\'s identity marker at the root (and a torn write of it) is never a file to preserve or compare; a same-named file deeper down is', () => {
+  const d = tmp();
+  fs.mkdirSync(path.join(d, 'sub'), { recursive: true });
+  fs.writeFileSync(path.join(d, '.dockvault-sync'), '{}');
+  fs.writeFileSync(path.join(d, '.dockvault-sync.123.tmp'), '{}');
+  fs.writeFileSync(path.join(d, 'sub', '.dockvault-sync'), 'x');
+  fs.writeFileSync(path.join(d, 'a.txt'), '1');
+  assert.deepStrictEqual(walkLocal(d), ['a.txt', 'sub/.dockvault-sync']);
+  fs.rmSync(d, { recursive: true, force: true });
+});

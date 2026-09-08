@@ -302,6 +302,15 @@ class DaemonManager {
     });
   }
 
+  /**
+   * Forget one vault's run history in the helper (a sync stopped here): its next set-up starts with a fresh
+   * baseline. Fire-and-forget; best-effort — a dead helper simply means the history is gone with it.
+   */
+  forgetVault(vault) {
+    if (!this.child || typeof vault !== 'string' || !vault) return;
+    try { this.child.postMessage({ type: 'sync-forget', id: ++this._statusSeq, vault }); } catch { /* best-effort */ }
+  }
+
   /** The current child epoch — bumped on every spawn; a credential is bound to the epoch it was minted for. */
   currentEpoch() { return this._epoch; }
 

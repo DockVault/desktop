@@ -50,7 +50,7 @@ class Cancelled extends Error { constructor() { super('sync setup cancelled'); t
  *   grantVault(vault)             -> the device-enable grantVault member
  *   addPending(vaultId)           -> record a deferred grant for the resume sweep
  *   enable                        -> the sync-enable io members that are NOT questions: listVaults, resolveReal,
- *                                    classifyCtx, inspectFolderSharing, makePrivate, isNonEmptyDir, ensureFolder, save;
+ *                                    classifyCtx, inspectFolderSharing, makePrivate, isNonEmptyDir, ensureFolder, markFolder, save;
  *                                    plus someExcluded() (the picker note), configuredFolder(vaultId) (the folder a
  *                                    vault already syncs to here, or null) and vaultHasPassword(vaultId)
  *   pickFolderNative()            -> the OS directory picker; null when cancelled
@@ -196,6 +196,7 @@ function createSyncWizard(io, onQuestion = () => {}) {
         return a === true ? true : (a === 'choose-different' ? 'choose-different' : false);
       },
       ensureFolder: e.ensureFolder,
+      markFolder: e.markFolder,
       onRefuse: async (reason) => { refusal = reason; },
       save: e.save,
     };

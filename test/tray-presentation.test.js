@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { tooltip, mustActItems, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, HANDLED_ACTION_KINDS } = require('../src/main/tray-presentation');
+const { tooltip, mustActItems, itemForVault, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, HANDLED_ACTION_KINDS, REASON_DETAIL } = require('../src/main/tray-presentation');
 const { computeStatus, STATE } = require('../src/main/sync-status-model');
 
 const secure = { hasSecureStore: true, online: true, daemon: 'ready' };
@@ -287,4 +287,20 @@ test('a sleep-woken desktop reads "paused since sleep — Resume sync", not a ba
   assert.strictEqual(tooltip(m, null, null, { lockReason: 'sleep' }), 'DockVault — Sync paused since sleep — Resume sync to continue');
   assert.match(tooltip(m, null, null, { lockReason: 'os-lock' }), /^DockVault — Locked/, 'a real screen lock still reads Locked');
   assert.match(tooltip(m, null, null, {}), /^DockVault — Locked/, 'no reason → the existing Locked glance');
+});
+
+test('a lost folder is a relocate-folder must-act with a plain line per way of losing it', () => {
+  const kinds = new Set();
+  for (const reason of ['folder-missing', 'folder-marker-missing', 'folder-other-vault', 'folder-marker-unreadable', 'folder-ambiguous', 'folder-moved-rejected', 'folder-found-elsewhere', 'folder-marker-unwritable']) {
+    const it = itemForVault({ vault: 'v1', reason }, { v1: 'Photos' });
+    assert.strictEqual(it.kind, 'relocate-folder', reason);
+    assert.ok(HANDLED_ACTION_KINDS.includes(it.kind));
+    assert.ok(it.label.includes('Photos'), it.label);
+    assert.ok(/find|choose|confirm|check the folder/i.test(it.label), it.label);
+    kinds.add(it.label);
+    assert.ok(typeof REASON_DETAIL[reason] === 'string' && REASON_DETAIL[reason].length > 10, `detail for ${reason}`);
+  }
+  assert.strictEqual(kinds.size, 8, 'each reason reads differently');
+  assert.strictEqual(itemForVault({ vault: 'v1', reason: 'config-unwritable' }, { v1: 'Photos' }).kind, 'open');
+  assert.ok(REASON_DETAIL['config-unwritable']);
 });

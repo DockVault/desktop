@@ -120,3 +120,17 @@ test('run-state defaults fail-closed (resync required) and round-trips per vault
   db.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('forgetRunState removes one vault\'s row, leaving the others; the vault then reads as never-run', () => {
+  const { openStateDb, recordRun, getRunState, forgetRunState } = require('../src/main/state-db');
+  const os = require('node:os'); const path = require('node:path'); const fs = require('node:fs'); const crypto = require('node:crypto');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dv-sdb-'));
+  const db = openStateDb(dir, crypto.randomBytes(32));
+  recordRun(db, 'a', { result: 'ok', resyncRequired: false, atUtc: 1 });
+  recordRun(db, 'b', { result: 'ok', resyncRequired: false, atUtc: 2 });
+  forgetRunState(db, 'a');
+  assert.deepStrictEqual(getRunState(db, 'a'), { lastRunUtc: null, lastResult: null, resyncRequired: true });
+  assert.strictEqual(getRunState(db, 'b').lastResult, 'ok');
+  forgetRunState(db, 'nope'); // absent: nothing happens
+  db.close(); fs.rmSync(dir, { recursive: true, force: true });
+});
