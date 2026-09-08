@@ -28,7 +28,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { planPreservation } = require('./resync-plan');
 const { keepBothName } = require('./keepboth-name');
-const { runBisync, credPrepareOutcome, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS, CONNECT_BOUND_ARGS } = require('./sync-engine');
+const { runBisync, credPrepareOutcome, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS, CONNECT_BOUND_ARGS, SINGLE_CONNECTION_ARGS } = require('./sync-engine');
+// Every step's connection discipline in one place: bounded connect, ONE SSH connection, single-stream transfers
+// (see sync-engine SINGLE_CONNECTION_ARGS — a single-use credential must never be presented a second time), and
+// the same one-transfer/one-checker concurrency the bisync run uses, so nothing ever queues up on the one connection.
+const REMOTE_ARGS = Object.freeze([...CONNECT_BOUND_ARGS, ...SINGLE_CONNECTION_ARGS, '--transfers', '1', '--checkers', '1']);
 const { RESULT, classifyConnectionFailure } = require('./bisync-outcome');
 const { recordRun } = require('../main/state-db');
 
@@ -138,7 +142,10 @@ async function zeroLossResync(o) {
 
   // 1. FAIL-CLOSED enumeration of the server side.
   { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved: 0 }; }
-  const ls = await o.runner.run(['lsf', '-R', '--files-only', o.remote, ...CONNECT_BOUND_ARGS, ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts);
+  const ls = await o.runner.run(['lsf', '-R', '--files-only', o.remote, ...REMOTE_ARGS, ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts);
+  // The runner retains stdout BOUNDED; a server list too large to keep whole is a list we do not have. Acting on
+  // a partial one could skip a preserve and let the resync overwrite a file it never saw — refuse instead.
+  if (ls.stdoutTruncated) throw new Error('zero-loss resync: the server file list is too large to hold whole — refusing to resync');
   if (ls.code !== 0) {
     // A connection-level failure gets its typed outcome (nothing ran against the vault, so the baseline question is
     // left as it was — never a "repair owed" for a door that did not open) —
@@ -159,10 +166,12 @@ async function zeroLossResync(o) {
   let differing = [];
   if (onBoth.length) {
     { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved: 0 }; }
-    const chk = await o.runner.run(['check', o.local, o.remote, '--download', '--combined', '-', ...CONNECT_BOUND_ARGS, ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts)
+    const chk = await o.runner.run(['check', o.local, o.remote, '--download', '--combined', '-', ...REMOTE_ARGS, ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts)
       .catch((e) => ({ code: -1, stdout: '', stderr: String(e) }));
     const parsed = parseCheckDiffering(chk.stdout, onBoth);
-    if (parsed.compareError || parsed.covered.size !== onBoth.length) {
+    // A compare report cut short by the retention bound is an incomplete compare — the same fail-closed refusal
+    // as a missing verdict (the coverage check below would catch most of it; this names the cause).
+    if (chk.stdoutTruncated || parsed.compareError || parsed.covered.size !== onBoth.length) {
       throw new Error('zero-loss resync: could not compare every shared file — refusing to resync (fail-closed)');
     }
     differing = parsed.differing;
@@ -174,7 +183,7 @@ async function zeroLossResync(o) {
   for (const action of plan) {
     { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved }; }
     const { full, rel } = reserveLocalPath(o.local, action, source, at);
-    const cp = await o.runner.run(['copyto', `${o.remote}/${action.from}`, full, ...CONNECT_BOUND_ARGS, ...SYNC_STATS_ARGS], scanOpts)
+    const cp = await o.runner.run(['copyto', `${o.remote}/${action.from}`, full, ...REMOTE_ARGS, ...SYNC_STATS_ARGS], scanOpts)
       .catch((e) => ({ code: -1, stderr: String(e) }));
     if (cp.code !== 0) { try { fs.rmSync(full, { force: true }); } catch { /* best effort */ } throw new Error(`zero-loss resync: failed to preserve ${action.from} -> ${rel}`); }
     preserved += 1;

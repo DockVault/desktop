@@ -61,11 +61,35 @@ const SYNC_STATS_ARGS = Object.freeze(['--stats', '5s', '--stats-log-level', 'NO
 // (unreachable / can't-verify / connect-failed) instead of reading as an endless "syncing". A healthy transfer
 // never idles 90s (data is flowing), so this never false-trips real work.
 const CONNECT_BOUND_ARGS = Object.freeze(['--contimeout', '20s', '--timeout', '90s', '--low-level-retries', '3']);
+// ONE SSH connection per rclone process, ever — and every transfer a single stream. The server issues SINGLE-USE
+// credentials: the first SSH connection spends the credential, and any second connection the same process opens
+// is refused at the door. rclone's SFTP backend keeps a connection POOL that grows on demand, and its default
+// multi-thread download (files at or above --multi-thread-cutoff, 256 MiB) opens one extra connection per stream —
+// so on the defaults a large file coming DOWN failed every run ("multi-thread copy: failed to open source: ...
+// unable to authenticate"), and every retry minted another credential. Pinning the pool to one connection
+// makes rclone WAIT for the connection instead of opening a doomed second one, and disabling multi-thread
+// streams keeps a large file a single streamed read that never needs another. Both are fixed by construction
+// here and travel with EVERY rclone operation against the remote (bisync, and the zero-loss resync's list /
+// compare / preserve steps), never caller-supplied. A single stream is also what keeps the transfer's memory
+// flat: rclone streams a file through a small fixed buffer whether it is 1 MB or 10 GB; it never holds a file
+// whole, and neither does this daemon (nothing here reads file bytes; rclone's output is retained bounded).
+// The last two flags keep that one connection QUIET: this server offers SFTP only — no shell, no remote hash
+// commands — yet rclone's defaults probe for both on every process (a shell-type command, then six hash
+// commands), each a channel the server refuses, and then WRITE the findings back into the config file it was
+// handed (the per-run ephemeral config). Declaring "no shell" up front skips every probe and the write-back:
+// one connection, one SFTP channel, nothing else on the wire, and the ephemeral config is never touched.
+// The idle timeout is off because rclone otherwise CLOSES a pooled connection that sat idle for a minute (a long
+// local scan between remote calls is enough) and dials a fresh one for the next call — with the spent credential.
+// A stall on the one connection is still bounded: the daemon's inactivity watchdog kills a run that produces no
+// output for SYNC_INACTIVITY_MS, and rclone's own --timeout ends an IO that stops moving (CONNECT_BOUND_ARGS).
+const SINGLE_CONNECTION_ARGS = Object.freeze(['--sftp-connections', '1', '--sftp-idle-timeout', '0', '--multi-thread-streams', '0', '--sftp-shell-type', 'none', '--sftp-disable-hashcheck']);
 // The folder's identity marker (main/folder-marker.js) lives in the synced folder's root and is LOCAL ONLY: it
 // is excluded from every transfer, listing, and compare, so it is never uploaded to the vault, never deleted
 // from the folder by a sync, and never counted as a difference. The name is fixed here, not caller-supplied.
 const MARKER_NAME = '.dockvault-sync';
 const MARKER_FILTER_ARGS = Object.freeze(['--exclude', `/${MARKER_NAME}`, '--exclude', `/${MARKER_NAME}.*.tmp`]);
+// bisync's stdout is normally EMPTY (its log is stderr); this is the bounded retention for whatever does appear.
+const BISYNC_MAX_STDOUT_BYTES = 256 * 1024;
 const SYNC_INACTIVITY_MS = 120 * 1000;          // 24x the 5s stats period — ample margin against a false idle-trip
 const SYNC_HARD_CEILING_MS = 6 * 60 * 60 * 1000; // absolute backstop, even if stats never stop
 
@@ -106,6 +130,7 @@ function buildBisyncArgs({ local, remote, workdir, resync = false }) {
     // re-attempted. A transient failure simply re-ticks on the next scheduled sweep.
     '--retries', '1',
     ...CONNECT_BOUND_ARGS, // a door that won't talk fails fast, never hangs the run
+    ...SINGLE_CONNECTION_ARGS, // one SSH connection, single-stream transfers: a single-use credential is never re-presented
     ...MARKER_FILTER_ARGS, // the folder's own identity marker stays home
     ...SYNC_STATS_ARGS]; // periodic progress so the inactivity timeout can tell a long run from a hung one
   if (resync) args.push('--resync'); // a deliberate resync, or the one automatic empty-baseline refresh (see runBisync)
@@ -271,6 +296,9 @@ async function runBisync(o) {
   const args = buildBisyncArgs({ local: o.local, remote: o.remote, workdir: o.workdir, resync });
   const { code, stdout, stderr } = await o.runner.run(args, {
     config: o.config,
+    // bisync prints nothing to stdout in normal operation (its log goes to stderr); retain only a small
+    // bounded amount for the outcome classifier's haystack so the run can never grow the daemon by its output.
+    maxStdoutBytes: BISYNC_MAX_STDOUT_BYTES,
     inactivityMs: o.inactivityMs || SYNC_INACTIVITY_MS,
     hardCeilingMs: o.hardCeilingMs || SYNC_HARD_CEILING_MS,
     // Progress sink: the runner calls this with the two aggregate {files,bytes} integers as bytes move
@@ -289,4 +317,4 @@ async function runBisync(o) {
   return { ran: true, code, result: outcome.result, resyncRequired, needsAttention: outcome.needsAttention, stdout, stderr };
 }
 
-module.exports = { CONNECT_BOUND_ARGS, buildBisyncArgs, runBisync, credPrepareOutcome, bisyncWorkdir, emptyPairBaseline, needsZeroLossBaseline, localHasNoFiles, priorListingEmpty, canonicalPath, carryListings, pairKey, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS };
+module.exports = { CONNECT_BOUND_ARGS, SINGLE_CONNECTION_ARGS, BISYNC_MAX_STDOUT_BYTES, buildBisyncArgs, runBisync, credPrepareOutcome, bisyncWorkdir, emptyPairBaseline, needsZeroLossBaseline, localHasNoFiles, priorListingEmpty, canonicalPath, carryListings, pairKey, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS };

@@ -46,6 +46,85 @@ function forbiddenIn(args) {
   return null;
 }
 
+// How much of a child's stdout is RETAINED for the caller, by default. rclone's sync commands print nothing
+// to stdout; the file-list commands the daemon runs (lsf, check --combined) print one short line per file,
+// so this default bounds those at roughly a hundred thousand files. A caller with a known-small expectation
+// (the bisync run itself) passes a smaller cap. The cap bounds the daemon's memory by construction; a run
+// whose output exceeds it comes back flagged `stdoutTruncated`, never silently shortened.
+const DEFAULT_MAX_STDOUT_BYTES = 16 * 1024 * 1024;
+// A partial (newline-less) stdout line longer than this is dropped rather than assembled: a legitimate line
+// is a path or a short message, so an unterminated run of megabytes is not something to keep waiting on.
+const MAX_LINE_BYTES = 1024 * 1024;
+
+/**
+ * Bounded collector for one child stream. Keeps raw chunks up to `maxBytes` (decoded once at end, so a
+ * character split across chunks survives), drops everything past the cap while remembering that it did,
+ * and relays each COMPLETE line to an optional callback without retaining it. Nothing here grows with
+ * the child's total output beyond the two fixed caps.
+ */
+class BoundedOutput {
+  constructor(maxBytes, onLine) {
+    this._max = Math.max(0, Number(maxBytes) || 0);
+    this._chunks = [];
+    this._kept = 0;
+    this._truncated = false;
+    this._onLine = typeof onLine === 'function' ? onLine : null;
+    this._line = this._onLine ? [] : null; // pending partial line (raw chunks) for the relay only
+    this._lineBytes = 0;
+    this._skipLine = false; // an over-long line was dropped: discard the rest of it up to its newline too
+  }
+
+  push(chunk) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    if (this._kept < this._max) {
+      const room = this._max - this._kept;
+      const take = buf.length <= room ? buf : buf.subarray(0, room);
+      this._chunks.push(take);
+      this._kept += take.length;
+      if (take.length < buf.length) this._truncated = true;
+    } else if (buf.length) {
+      this._truncated = true;
+    }
+    if (this._onLine) this._relay(buf);
+  }
+
+  // Split on newlines across chunk boundaries; emit only complete lines; never keep more than one partial line.
+  // A line that outgrows MAX_LINE_BYTES is dropped WHOLE: what was buffered goes, and the rest of it is skipped
+  // through to its newline, so no fragment of it is ever handed out as a "line".
+  _relay(buf) {
+    let start = 0;
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i] !== 0x0a) continue;
+      if (this._skipLine) { this._skipLine = false; this._line = []; this._lineBytes = 0; }
+      else { this._line.push(buf.subarray(start, i)); this._emitLine(); }
+      start = i + 1;
+    }
+    if (start < buf.length && !this._skipLine) {
+      const rest = buf.subarray(start);
+      this._lineBytes += rest.length;
+      if (this._lineBytes > MAX_LINE_BYTES) { this._line = []; this._lineBytes = 0; this._skipLine = true; }
+      else this._line.push(rest);
+    }
+  }
+
+  _emitLine() {
+    let line = Buffer.concat(this._line).toString('utf8');
+    this._line = []; this._lineBytes = 0;
+    if (line.endsWith('\r')) line = line.slice(0, -1);
+    if (line) { try { this._onLine(line); } catch { /* a consumer error is not ours */ } }
+  }
+
+  // How many bytes are retained right now (tests assert this stays at the cap while the child keeps printing).
+  retainedBytes() { return this._kept; }
+
+  end() {
+    if (this._onLine && this._line.length && !this._skipLine) this._emitLine();
+    const text = Buffer.concat(this._chunks).toString('utf8');
+    this._chunks = [];
+    return { text, truncated: this._truncated };
+  }
+}
+
 class RcloneRunner {
   /**
    * @param {object} opts
@@ -111,7 +190,7 @@ class RcloneRunner {
 
   // The single spawn chokepoint. NOTHING spawns rclone unless the binary's checksum has been verified
   // (so a tampered binary is never run), and no forbidden flag/subcommand (--force, any rc server) reaches it.
-  _launch(args, { timeoutMs = 30000, inactivityMs = null, hardCeilingMs = null, onLine, onProgress, input, config } = {}) {
+  _launch(args, { timeoutMs = 30000, inactivityMs = null, hardCeilingMs = null, onLine, onProgress, input, config, maxStdoutBytes = DEFAULT_MAX_STDOUT_BYTES } = {}) {
     // PER-SPAWN atomic re-hash (TTL): re-verify the pinned binary bytes NOW, then spawn in the SAME synchronous
     // code path below with NO await between the compare and the spawn — closing the swap window. A mismatch or
     // unreadable throws here (sticky fail-closed) and never reaches the spawn; the same resolved path is used.
@@ -130,7 +209,13 @@ class RcloneRunner {
       try { child = this._spawn(this.bin, full, { stdio: [stdin, 'pipe', 'pipe'], windowsHide: true }); }
       catch (e) { if (e) e.subReason = (e.code === 'ENOENT') ? 'binary-missing' : 'spawn-failed'; return reject(e); }
       if (input != null && child.stdin) { try { child.stdin.end(input); } catch { /* child gone */ } }
-      let stdout = '';
+      // stdout is collected BOUNDED, never as one growing string: raw chunks are kept only up to
+      // maxStdoutBytes (so a run that prints forever cannot grow the daemon without limit), decoded ONCE
+      // at exit (a multi-byte character split across chunks is never corrupted, which matters for the
+      // file lists lsf/check return here), and anything past the cap is DROPPED and flagged as
+      // `stdoutTruncated` so a consumer that needs the complete output can refuse to act on a partial one.
+      // The optional line relay (onLine) sees each complete line exactly once and retains nothing.
+      const stdoutSink = new BoundedOutput(maxStdoutBytes, onLine);
       // stderr is not accumulated raw: it is fed through a stats parser that extracts ONLY the two
       // aggregate progress integers (files, bytes) and keeps ONLY genuine non-stats lines for the
       // typed-outcome classifier. rclone's stats block carries per-file PATHS ("Transferring:" + " * path")
@@ -162,14 +247,18 @@ class RcloneRunner {
       // the stats parser: it resets the idle timer (so a quiet-but-working transfer stays alive), advances
       // the {files,bytes} progress counters, and — only when a counter advances — calls onProgress with
       // those TWO INTEGERS (never a line, never a path). No raw stderr line is relayed to onLine.
-      if (child.stdout) child.stdout.on('data', (c) => { stdout += c; if (inactivityMs) resetIdle(); if (onLine) String(c).split(/\r?\n/).forEach((l) => { if (l) onLine(l); }); });
+      if (child.stdout) child.stdout.on('data', (c) => { stdoutSink.push(c); if (inactivityMs) resetIdle(); });
       if (child.stderr) child.stderr.on('data', (c) => {
         const advanced = statsParser.push(c);
         if (inactivityMs) resetIdle();
         if (advanced && onProgress) { try { onProgress(statsParser.counts()); } catch { /* a consumer error is not ours */ } }
       });
       child.on('error', (e) => { if (e) e.subReason = (e.code === 'ENOENT') ? 'binary-missing' : 'spawn-failed'; finish(reject, e); });
-      child.on('exit', (code) => { statsParser.end(); finish(resolve, { code, stdout, stderr: statsParser.stderr() }); });
+      child.on('exit', (code) => {
+        statsParser.end();
+        const out = stdoutSink.end();
+        finish(resolve, { code, stdout: out.text, stdoutTruncated: out.truncated, stderr: statsParser.stderr(), stderrTruncated: statsParser.truncated() });
+      });
     });
   }
 
@@ -215,4 +304,4 @@ class RcloneRunner {
   }
 }
 
-module.exports = { RcloneRunner, FORBIDDEN_FLAGS };
+module.exports = { RcloneRunner, BoundedOutput, FORBIDDEN_FLAGS, DEFAULT_MAX_STDOUT_BYTES };

@@ -53,6 +53,13 @@ function perFilePercent(body) {
 
 // How many in-flight per-file percentages are carried at most; the COUNT of files in flight is still exact.
 const MAX_FILE_PROGRESS = 8;
+// Bounds on what the parser RETAINS, so a run that talks forever cannot grow the daemon: the kept non-stats
+// stderr (for the outcome classifier) holds at most this many bytes — the FIRST half of the budget (where a
+// run's first real error lands) and the LAST half (where rclone's final verdict lands), with the middle
+// dropped and the drop flagged. An unterminated partial line longer than MAX_PARTIAL_LINE_BYTES is discarded
+// rather than assembled (a real line is a short message or a path; megabytes without a newline are not).
+const MAX_KEPT_STDERR_BYTES = 256 * 1024;
+const MAX_PARTIAL_LINE_BYTES = 1024 * 1024;
 
 // Section/aggregate rows of a stats block (no path). Dropped after any counts are read — both to bound the
 // kept buffer and to keep it path-free by construction. Anchored to the row LABEL (after any indent) so a
@@ -85,7 +92,12 @@ class StatsStderrParser {
     this._percent = null;  // rclone's own overall percentage (0..100) or null
     this._inFlight = [];   // the percentage of each file in flight in the CURRENT block (ints only, bounded)
     this._inFlightCount = 0; // how many files are in flight in the current block (exact, even past the bound)
-    this._kept = '';       // NON-stats stderr only (for the typed-outcome classifier)
+    this._keptHead = '';   // NON-stats stderr only (for the typed-outcome classifier): the first half-budget ...
+    this._keptTail = [];   // ... and a rolling window of the most recent lines within the second half-budget
+    this._keptTailBytes = 0;
+    this._headSealed = false; // once a line has gone to the tail, the head takes no more (keeps the kept text in order)
+    this._skipLine = false;   // an over-long partial line was dropped: the rest of it (to its newline) goes too
+    this._truncated = false; // some non-stats stderr was dropped to stay within MAX_KEPT_STDERR_BYTES
   }
 
   /**
@@ -100,9 +112,14 @@ class StatsStderrParser {
     while ((nl = this._buf.indexOf('\n')) >= 0) {
       let line = this._buf.slice(0, nl);
       this._buf = this._buf.slice(nl + 1);
+      if (this._skipLine) { this._skipLine = false; continue; } // the rest of a dropped over-long line: gone too
       if (line.endsWith('\r')) line = line.slice(0, -1);
       if (this._consume(line)) advanced = true;
     }
+    // A partial line that has outgrown any legitimate line is dropped WHOLE, not assembled without bound: what is
+    // buffered goes now, and whatever remains of it up to its newline is skipped as it arrives.
+    if (this._skipLine) this._buf = '';
+    else if (this._buf.length > MAX_PARTIAL_LINE_BYTES) { this._buf = ''; this._skipLine = true; this._truncated = true; }
     return advanced; // the tail (an incomplete, possibly path-bearing line) remains unexposed in this._buf
   }
 
@@ -112,7 +129,7 @@ class StatsStderrParser {
    * classified the same way — recognised as a stats/path line and dropped, so no path escapes at EOF.
    */
   end() {
-    if (this._buf) {
+    if (this._buf && !this._skipLine) {
       let line = this._buf;
       this._buf = '';
       if (line.endsWith('\r')) line = line.slice(0, -1);
@@ -125,8 +142,19 @@ class StatsStderrParser {
     const body = line.replace(LOG_PREFIX, '');
     if (isPerFileLine(body)) return this._readPerFile(body);   // path line: keep ONE integer, then DROP it
     if (isStatsLine(body)) return this._readCounts(body); // stats line: read any counts, then DROP it
-    if (body.trim() !== '') this._kept += line + '\n';     // genuine non-stats stderr: keep for classification
+    if (body.trim() !== '') this._keep(line + '\n');      // genuine non-stats stderr: keep (bounded) for classification
     return false;
+  }
+
+  // Retain a non-stats line within the fixed budget: the head fills first (a run's first real error), then
+  // a rolling tail keeps the most recent lines (rclone's final verdict), evicting the oldest tail lines.
+  _keep(text) {
+    const half = MAX_KEPT_STDERR_BYTES / 2;
+    if (!this._headSealed && this._keptHead.length + text.length <= half) { this._keptHead += text; return; }
+    this._headSealed = true; // from here on everything goes to the tail, so head + tail stay in arrival order
+    if (text.length > half) { this._truncated = true; return; } // a single line past the whole tail budget: drop it
+    this._keptTail.push(text); this._keptTailBytes += text.length;
+    while (this._keptTailBytes > half) { const gone = this._keptTail.shift(); this._keptTailBytes -= gone.length; this._truncated = true; }
   }
 
   // Read the aggregate counts from a "Transferred:" line. The bytes line ("4.521 MiB / 10 MiB, 45%, …")
@@ -183,7 +211,14 @@ class StatsStderrParser {
    * construction, and never the incomplete-line buffer — an unterminated (possibly path-bearing) line is
    * never handed out.
    */
-  stderr() { return this._kept; }
+  stderr() {
+    const tail = this._keptTail.join('');
+    if (!tail) return this._keptHead;
+    return this._keptHead + (this._truncated ? '[... stderr trimmed ...]\n' : '') + tail;
+  }
+
+  // Whether any non-stats stderr was dropped to stay within the retention budget.
+  truncated() { return this._truncated; }
 }
 
-module.exports = { StatsStderrParser, isStatsLine, isPerFileLine, perFilePercent, toBytes, MAX_FILE_PROGRESS };
+module.exports = { StatsStderrParser, isStatsLine, isPerFileLine, perFilePercent, toBytes, MAX_FILE_PROGRESS, MAX_KEPT_STDERR_BYTES };
