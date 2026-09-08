@@ -43,6 +43,8 @@ const { LockState } = require('./lock-state');
 const { AutoLock } = require('./auto-lock');
 const keyProtect = require('./key-protection');
 const { SyncStatusHub } = require('./sync-status-hub');
+const syncStatusModel = require('./sync-status-model');
+const vaultSpace = require('./vault-space');
 const trayPresentation = require('./tray-presentation');
 const rcloneBundle = require('./rclone-bundle');
 const { APP_ID } = require('./app-identity');
@@ -127,6 +129,7 @@ let rcloneCfg = null; // the pinned rclone config { bin, version, sha256 }; `ver
 let lockState = null; // the single source of truth for lock state (main-owned)
 let autoLock = null;  // the automatic lock triggers (idle timer + OS suspend/screen-lock)
 let syncHub = null;   // the main-owned computed sync status (feeds the tray, notifications, channel)
+let manageReasonIo = null; // the Computers view's io, kept for composing the live card sentence (built lazily)
 let syncScheduler = null;
 let mintPath = null;      // per-run credential-path choice (device identity vs account session), see mint-path.js
 // The scheduled rotation of this computer's sync identity (device-refresh.js): an hourly check that rotates once
@@ -421,7 +424,7 @@ function registerIpc() {
   ipcMain.handle('dockvault:troubleshoot.open-server-setup', (e) => { if (fromTroubleshootPage(e)) void openServerSetupFromTroubleshoot(); return null; });
   ipcMain.handle('dockvault:troubleshoot.close', (e) => { if (fromTroubleshootPage(e)) closeTroubleshoot(); return null; });
   ipcMain.handle('dockvault:sync.status', () => (syncHub
-    ? syncHub.current()
+    ? syncStatusModel.publicStatus(syncHub.current())
     : { state: 'unavailable', label: 'Sync unavailable', reason: 'no-secure-store', vaults: [], condition: 'unavailable' }));
   // Enabling and stopping sync are driven entirely from the tray (and the notification click) in the
   // main process — there is deliberately NO renderer IPC to START, configure, or list sync. A
@@ -620,6 +623,20 @@ function computeMigration(dir) {
 // The ONE owner of the tray glance and menu: it composes both from the current computed sync status
 // and the lock phase, so lock and sync never fight over the tooltip. Called on every status change
 // and on every lock-phase change.
+// The pending re-render for a live wait (see refreshTray). One timer at a time, cleared when nothing waits.
+let waitRefreshTimer = null;
+const WAIT_REFRESH_MS = 30 * 1000;
+function scheduleWaitRefresh(model) {
+  if (waitRefreshTimer) { clearTimeout(waitRefreshTimer); waitRefreshTimer = null; }
+  const waits = [model && model.retryAt, ...((model && model.vaults) || []).map((v) => v.retryAt)]
+    .filter((t) => typeof t === 'number' && Number.isFinite(t) && t > Date.now());
+  if (!waits.length) return;
+  // Whichever comes first: the next coarse tick, or the moment the earliest wait lapses.
+  const due = Math.max(1000, Math.min(WAIT_REFRESH_MS, Math.min(...waits) - Date.now() + 500));
+  waitRefreshTimer = setTimeout(() => { waitRefreshTimer = null; refreshTray(); }, due);
+  if (waitRefreshTimer.unref) waitRefreshTimer.unref();
+}
+
 function refreshTray() {
   if (!tray) return;
   try {
@@ -629,12 +646,18 @@ function refreshTray() {
     // The lock REASON (only while the account tier is actually paused) so the glance can tell a sleep-woken
     // desktop — unlocked but paused until Resume — from a plain screen lock, instead of a bare "Locked".
     const lockReason = (() => { try { const s = lockState && lockState.snapshot(); return s && s.appLocked ? s.reason : null; } catch { return null; } })();
-    tray.setToolTip(trayPresentation.tooltip(model, effectiveLockPhase(), rcloneCfg && rcloneCfg.version, { lockReason, server }));
+    tray.setToolTip(trayPresentation.tooltip(model, effectiveLockPhase(), rcloneCfg && rcloneCfg.version, { lockReason, server, now: Date.now() }));
+    // A wait that is being counted down has to be RE-rendered, or it is not a countdown: the tooltip and the
+    // menu labels are strings fixed at build time, and the hub only emits when the picture changes — so a
+    // "retrying in about 40 minutes" written once would still say forty minutes thirty-nine minutes later.
+    // While any vault is waiting, re-render on a coarse tick (and once more just after the wait lapses, which
+    // is when the sentence should stop mentioning it). Idle otherwise: no timer exists when nothing is waiting.
+    scheduleWaitRefresh(model);
     // Map each configured vault's id → its name so must-act labels read the vault's NAME, not its id (the
     // model is keyed by id). A vault missing from the config falls back to its id inside mustActItems.
     let nameById = {};
     try { for (const e of storedConfig()) if (e && e.vaultId) nameById[e.vaultId] = e.vaultName; } catch { nameById = {}; }
-    const mustAct = trayPresentation.mustActItems(model, nameById);
+    const mustAct = trayPresentation.mustActItems(model, nameById, { now: Date.now() });
     // Append the calm "finish setting up on this computer" reminder for any vault whose device grant is
     // pending — only while a device identity is live (else the resume can't complete it), and never for a
     // vault that already has a real must-act line above it. The auto-resume finishes it on the next open;
@@ -971,12 +994,45 @@ function notifyManualComplete(vaultId, ev) {
 // Push the computed status to the live renderer (main -> renderer). Cred-free by construction (it is
 // the same model the tray renders); the renderer observes it read-only.
 function pushSyncStatus(model) {
-  for (const win of [mainWindow, manageWindow]) {
-    if (win && !win.isDestroyed()) {
-      try { win.webContents.send('dockvault:evt:syncstatus', model); }
-      catch { /* window gone mid-send */ }
-    }
+  // Through the renderer boundary: the same model with the outcome detail (the only field that can carry a
+  // file's name) removed. One function, used by both renderer paths — see sync-status-model.publicStatus.
+  const safe = syncStatusModel.publicStatus(model);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    // The main window renders the interface the SERVER supplies, on the server's own origin. It gets states,
+    // labels and numbers and nothing else — never a sentence naming a file.
+    try { mainWindow.webContents.send('dockvault:evt:syncstatus', safe); }
+    catch { /* window gone mid-send */ }
   }
+  if (manageWindow && !manageWindow.isDestroyed()) {
+    // The Computers window is the app's OWN page (sender-gated to it), and it is where the honest sentence
+    // belongs — it is already handed this computer's local folder for these vaults. Without the sentence on
+    // the live push it could only patch the state chip, leaving the explanation beside it either blank or,
+    // worse, the previous failure's: a card reading "Needs your decision" with a sentence about a file that is
+    // no longer the problem. So the sentence is composed HERE, in main, and pushed with the state it explains.
+    try { manageWindow.webContents.send('dockvault:evt:syncstatus', withReasonText(safe, model)); }
+    catch { /* window gone mid-send */ }
+  }
+}
+
+// The pushed model plus, per vault, the one plain sentence for its current reason — composed by the same
+// `reasonText` the Computers window's own model uses, so a live patch and a full reload say the same thing.
+function withReasonText(safe, model) {
+  // The same io the Computers view itself is built from — built once, lazily, so both agree by construction.
+  const io = manageReasonIo || (manageReasonIo = buildManageIo());
+  if (!io || typeof io.reasonText !== 'function') return safe;
+  let names = {};
+  try { for (const e of storedConfig()) names[e.vaultId] = e.vaultName; } catch { names = {}; }
+  const byId = new Map((model.vaults || []).map((v) => [v.vault, v]));
+  return {
+    ...safe,
+    vaults: safe.vaults.map((v) => {
+      const full = byId.get(v.vault);
+      if (!full || !full.reason) return { ...v, reasonText: null };
+      let text = null;
+      try { text = io.reasonText(full, names[v.vault] || null); } catch { text = null; }
+      return { ...v, reasonText: text || null };
+    }),
+  };
 }
 
 // One OS notification the first time an unresolved item appears (the hub de-duplicates). Cred-free —
@@ -998,6 +1054,19 @@ function notifyMustAct(item) {
 
 function mustActBody(item) {
   if (item && item.kind === 'restart') return 'Sync stopped working. Your files are safe. Open DockVault to restart it.';
+  // A per-vault must-act: compose the body from the SAME source the tray menu and the Computers card use, with
+  // this vault's own outcome detail, so the one message a person gets WITHOUT opening anything names the real
+  // cause instead of falling through to "something needs your attention". (The hub carries the detail on the
+  // payload for exactly this.)
+  if (item && item.scope === 'vault' && item.vault && item.reason) {
+    let name = null;
+    try { const e = storedConfig().find((c) => c.vaultId === item.vault); name = (e && e.vaultName) || null; } catch { /* no config to name */ }
+    const line = trayPresentation.itemForVault(
+      { vault: item.vault, reason: item.reason, detail: item.detail, retryAt: item.retryAt, resyncRequired: item.resyncRequired },
+      name ? { [item.vault]: name } : {},
+    );
+    if (line && line.label) return withReassurance(line.label);
+  }
   // The unlock-and-reopen guidance already carries its own reassurance and next step — use it verbatim rather
   // than appending the generic "Your files are safe." (which it already states).
   if (item && item.kind === 'reopen') return (item && item.label) || 'DockVault could not read its saved sync state. Your files are safe.';
@@ -1007,7 +1076,16 @@ function mustActBody(item) {
   const base = (item && item.label) || 'A sync item needs your attention';
   // A lost folder: the files may be wherever the folder went, so the one honest promise is what was NOT done.
   if (item && item.kind === 'relocate-folder') return `${base}. Nothing was changed; your vault on the server is untouched.`;
-  return `${base}. Your files are safe.`;
+  return withReassurance(base);
+}
+
+// Append the standing reassurance to a line, joined properly. The labels are a mix of fragments and full
+// sentences now, so appending blindly produced "…keeps syncing.. Your files are safe." A line that already
+// says the files are untouched does not need it said twice.
+function withReassurance(line) {
+  const text = String(line || '').trim();
+  if (/untouched|files are safe|nothing here was (?:lost|changed)/i.test(text)) return text;
+  return /[.!?]$/.test(text) ? `${text} Your files are safe.` : `${text}. Your files are safe.`;
 }
 
 // One positive notification the first time a vault syncs successfully (the hub fires it at most once per
@@ -1469,6 +1547,26 @@ function startSyncScheduler() {
     const pinned = credCache ? credCache.pinnedHostKeys(at.host) : null;
     if (pinned && typeof r.hostKey === 'string' && !pinAccepts(pinned, r.hostKey)) return { ok: false, reason: 'host-key-mismatch' };
     return { ok: true };
+  };
+  // Asked ONCE, after a run whose file the server took and then did not keep: does the vault's own record say
+  // the allowance is spent? A close in this protocol cannot report a failure, so a refused upload is a silence,
+  // and the numbers are the only honest way to name the cause. Metadata only (the vault's limit and how much of
+  // it is stored, nothing else), over the ACCOUNT session — under the lock, or signed out, there is no answer to
+  // be had and the outcome keeps its weaker, true name rather than a guess.
+  const VAULT_SPACE_TIMEOUT_MS = 5000;
+  io.vaultSpace = async (vaultId) => {
+    const unknown = { known: false, limitBytes: null, usedBytes: null, freeBytes: null };
+    // Gated on the ACCOUNT tier, like every other account-session call: under the lock (or signed out) this
+    // computer syncs on its own device identity precisely so it needs no account session, and reaching for
+    // one here would both fail and read the session out of a renderer the lock has paused. No answer is a
+    // perfectly good answer — the outcome simply keeps its weaker, true name.
+    if (!(lockState && lockState.isAccountUsable())) return unknown;
+    const token = await resolveAccountToken();
+    // Bounded, because this runs inside the dispatch's critical section: the queue is held while it waits, and
+    // a server that is slow to answer must not make a vault read "syncing" for the length of an HTTP timeout.
+    // Giving up early costs only the specific wording, never correctness.
+    const answer = vaultSpace.fetchVaultSpace({ serverOrigin: serverConfig.readServerOrigin(dir), sessionToken: token, vaultId }, mainHttpJson);
+    return Promise.race([answer, new Promise((resolve) => { const t = setTimeout(() => resolve(unknown), VAULT_SPACE_TIMEOUT_MS); if (t.unref) t.unref(); })]);
   };
   const accountEligible = io.verifyEligible;
   io.verifyEligible = async (vaultId) => {
@@ -2428,10 +2526,20 @@ function buildManageIo() {
       return { status: gm.status === 'absent' ? 'absent' : 'ok', has: (id) => Object.prototype.hasOwnProperty.call(meta, id) };
     },
     reasonText: (live, name) => {
-      // A decision or a problem: lead with the actionable must-act line (what to do), so the card never leaves the
-      // person with only a calm restatement while the tray offers the next step. Calmer states keep the short detail.
+      // The card's sentence comes from the SAME copy source as the tray, so the two can never tell different
+      // stories about one vault. Three layers, most specific first:
+      //   1. the enriched sentence, when this reason has one — it names the file, the size the server stated,
+      //      the room the vault has left, or how long the wait is, from THIS vault's own outcome detail. It is
+      //      tried for EVERY state, not just the alarming ones: the calm paused reasons (a server limiting
+      //      attempts, a server with no room) are precisely the ones a short glance-suffix under-explains.
+      //   2. a decision or a problem: the actionable must-act line, so the card says what to do rather than
+      //      leaving a calm restatement while the tray offers the next step.
+      //   3. the short glance suffix, as a sentence.
+      // A reason with none of the three yields null and the card simply shows no note — never a raw token.
+      const rich = trayPresentation.reasonSentence(live.reason, { name, detail: live.detail, retryAt: live.retryAt, repairOwed: !!live.resyncRequired });
+      if (rich) return rich;
       if (live.state === 'needs-decision' || live.state === 'sync-problem') {
-        const item = trayPresentation.itemForVault({ vault: live.vault, reason: live.reason }, name ? { [live.vault]: name } : {});
+        const item = trayPresentation.itemForVault({ vault: live.vault, reason: live.reason, detail: live.detail, retryAt: live.retryAt, resyncRequired: live.resyncRequired }, name ? { [live.vault]: name } : {});
         if (item && item.label) return item.label;
       }
       const detail = trayPresentation.REASON_DETAIL[live.reason];

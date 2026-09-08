@@ -171,7 +171,13 @@
       // The server is refusing this computer's sync credentials and this wait's one try is spent: honest about the
       // wait, and that the state already on the card is what to act on (a sign-in or the vault password lets it try
       // at once); a fresh credential is not the fix — each try is what the server is limiting.
-      case 'backing-off': return "The sync server is refusing this computer's sync credentials, so DockVault is waiting before it tries again (" + waitWords(action && action.retryInSec) + '). If the status above asks you to sign in or enter the vault password, doing that lets it try at once.';
+      // The door is refusing and this wait's one try is spent. WHICH refusal decides the answer: a server
+      // limiting attempts ('channel-refused') clears itself and no sign-in or credential change touches it —
+      // saying otherwise sends a person to do useless work — while a refused credential genuinely may be
+      // unblocked by a sign-in or the vault's password. An unknown cause keeps the wider, older wording.
+      case 'backing-off': return action && action.cause === 'channel-refused'
+        ? 'The sync server is temporarily limiting sync attempts from this computer, so DockVault is waiting before it tries again (' + waitWords(action && action.retryInSec) + "). Signing in again or deactivating credentials won't help — the wait is what clears it."
+        : "The sync server is refusing this computer's sync credentials, so DockVault is waiting before it tries again (" + waitWords(action && action.retryInSec) + '). If the status above asks you to sign in or enter the vault password, doing that lets it try at once.';
       case 'not-found': return 'The server no longer lists that, so there was nothing to change here. Refresh to see the current state.';
       case 'auth': case 'no-session': return 'Your sign-in has ended. Open DockVault and sign in, then try again.';
       case 'network': return "Couldn't reach the server, so nothing was changed. Check your connection and try again.";
@@ -193,7 +199,7 @@
       btn.disabled = false; btn.textContent = 'Sync now';
       const s = stateOf(v.local); setChip(card, s);
       const waiting = r && (r.reason === 'cooldown' || r.reason === 'backing-off');
-      const note = el('div', waiting ? 'box' : 'box bad'); note.appendChild(para(failureText((r && r.reason) || 'refused', { kind: 'sync-now', retryInSec: r && r.retryInSec })));
+      const note = el('div', waiting ? 'box' : 'box bad'); note.appendChild(para(failureText((r && r.reason) || 'refused', { kind: 'sync-now', retryInSec: r && r.retryInSec, cause: r && r.cause })));
       card.appendChild(note); setTimeout(() => note.remove(), waiting ? 9000 : 6000);
     }).catch(() => { btn.disabled = false; btn.textContent = 'Sync now'; });
   }
@@ -360,7 +366,20 @@
       if (syncBtn && !card.querySelector('.confirm')) { syncBtn.disabled = !!live.running; if (!live.running) syncBtn.textContent = 'Sync now'; }
       const rows = card.querySelectorAll('.row');
       for (const r of rows) { if (r.firstChild && r.firstChild.textContent === 'Last synced') { const last = agoOf(live.lastSyncedAt); r.lastChild.textContent = last.text; r.lastChild.title = last.exact; } }
+      setReason(card, live.reasonText);
     }
+  }
+  // The card's one plain sentence about why this vault is where it is. Main composes it and pushes it with the
+  // state it explains, so a live patch never leaves the chip saying one thing and the sentence beside it
+  // saying another — or, when a failure clears, an explanation of something that is no longer true. Added,
+  // replaced, or removed in place, right after the standing note.
+  function setReason(card, text) {
+    const existing = card.querySelector('p.reason');
+    if (!text) { if (existing) existing.remove(); return; }
+    if (existing) { existing.textContent = text; return; }
+    const p = el('p', 'reason', text);
+    const after = card.querySelector('p.standing') || card.querySelector('.xfer') || card.querySelector('.title');
+    if (after && after.nextSibling) card.insertBefore(p, after.nextSibling); else card.appendChild(p);
   }
   function cssEscape(s) { return (window.CSS && CSS.escape) ? CSS.escape(String(s)) : String(s).replace(/["\\]/g, '\\$&'); }
 

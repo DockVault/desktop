@@ -30,7 +30,9 @@
  *                     { type: 'run-state-result', id, states }    per-vault { lastResult, resyncRequired }, null
  *                       (a real missing row = never-run), or 'unknown' (unreadable / no state DB — not never-run)
  *                     { type: 'sync-run-result', id, ok, ran?, result?, resyncRequired?, needsAttention?,
- *                        code?, error? }  (a summarized, typed outcome only — never raw output or the cred)
+ *                        code?, error?, detail? }  (a summarized, typed outcome only — never raw output or the
+ *                        cred; `detail` is at most { file, maxBytes, bytes }: one checked BASE file name — no
+ *                        folders above it — and two sizes in bytes, re-validated by safeDetail before sending)
  *                     { type: 'sync-progress', vault, files, filesTotal, bytes, bytesTotal, percent, transferring,
  *                        fileProgress }  (in-flight; integers only — counts, totals, rclone's percentage, how many
  *                        files are in flight and the percentage of each — never a line, never a file path;
@@ -252,6 +254,22 @@ function progressNumbers(c) {
 const REMOTE_SEGMENT_RE = /^[^\\/\u0000-\u001f]{1,255}$/;
 function isRemoteSegment(s) { return typeof s === 'string' && REMOTE_SEGMENT_RE.test(s) && s !== '.' && s !== '..'; }
 
+// The outcome DETAIL, re-validated at the process boundary. The classifier already bounds and checks what it
+// builds; this repeats the check where the promise is actually made ("never raw output"), so a future caller
+// that hands this handler a richer object cannot widen what leaves the helper. Only two fields survive: a base
+// file name (no separators, no control characters, bounded) and a positive, sane byte count. Anything else —
+// extra keys, a path, a wrong type — yields null, and the status layer falls back to its no-name wording.
+const DETAIL_NAME_RE = /^[^\u0000-\u001f\u007f\\/:*?"<>|]{1,80}$/;
+const DETAIL_MAX_BYTES = 1024 ** 5; // a petabyte: far above any real limit, and a hard stop on a silly number
+function safeDetail(d) {
+  if (!d || typeof d !== 'object') return null;
+  const file = typeof d.file === 'string' && DETAIL_NAME_RE.test(d.file) ? d.file : null;
+  const size = (v) => (Number.isSafeInteger(v) && v > 0 && v <= DETAIL_MAX_BYTES ? v : null);
+  const maxBytes = size(d.maxBytes);
+  const bytes = size(d.bytes);   // the failing file's own size, read from the local copy
+  return (file || maxBytes || bytes) ? { file, maxBytes, bytes } : null;
+}
+
 // Run one vault sync using the config prepared by the last sftp-cred. Delete-safety, the first-run/blocked
 // resync gate, and the rule that a resync goes ONLY through the zero-loss (keep-both) path live in the
 // engine + its router; this handler just supplies the ephemeral config + workdir and relays a SUMMARIZED
@@ -303,7 +321,7 @@ async function onSyncRun(m) {
         // the daemon's stats parser).
         onProgress: (c) => reply({ type: 'sync-progress', vault: b.vault, ...progressNumbers(c) }),
       }));
-    reply({ type: 'sync-run-result', id: m.id, ok: true, ran: r.ran, result: r.result, reason: r.reason, resyncRequired: r.resyncRequired, needsAttention: r.needsAttention, code: r.code, preserved: r.preserved });
+    reply({ type: 'sync-run-result', id: m.id, ok: true, ran: r.ran, result: r.result, reason: r.reason, resyncRequired: r.resyncRequired, needsAttention: r.needsAttention, code: r.code, preserved: r.preserved, detail: safeDetail(r.detail) });
   } catch (err) {
     // If a per-spawn re-hash flipped the rail unverified mid-run (a binary swap), drop the cached readiness so
     // the NEXT dispatch's gate re-verifies and refuses with the typed helper-not-ready(checksum-mismatch).

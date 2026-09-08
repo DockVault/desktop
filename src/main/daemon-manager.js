@@ -41,6 +41,23 @@ function progressFields(m) {
   };
 }
 
+// The outcome DETAIL, admitted here field by field. Everything the helper sends crosses this boundary as a
+// message, so what an outcome may CARRY is stated once, in one place: a single base file name (bounded, no
+// separators, no control characters) and two sizes. The helper already builds and re-checks exactly this
+// shape; repeating the check on the receiving side means a change on either side of the boundary cannot
+// quietly widen what the main process will accept. Anything else — an extra field, a path, a wrong type — is
+// dropped, and the human copy falls back to wording that needs no detail.
+const RUN_DETAIL_NAME = /^[^\u0000-\u001f\u007f\\/:*?"<>|]{1,80}$/;
+const RUN_DETAIL_MAX_BYTES = 1024 ** 5;
+function runDetail(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
+  const size = (v) => (Number.isSafeInteger(v) && v > 0 && v <= RUN_DETAIL_MAX_BYTES ? v : null);
+  const file = typeof d.file === 'string' && RUN_DETAIL_NAME.test(d.file) ? d.file : null;
+  const maxBytes = size(d.maxBytes);
+  const bytes = size(d.bytes);
+  return (file || maxBytes || bytes) ? { file, maxBytes, bytes } : null;
+}
+
 class DaemonManager {
   constructor(userDataDir, rcloneConfig = null, opts = {}) {
     this.dir = userDataDir;
@@ -143,7 +160,7 @@ class DaemonManager {
           const tok = (v, re) => (typeof v === 'string' && re.test(v) ? v : null); // bounded bare tokens only — never a message or a path
           const diag = {}; // a failed run's error class / platform code / typed sub — bounded bare tokens, only when present
           for (const [k, re] of [['errorName', /^[A-Za-z]{1,40}$/], ['errorCode', /^[A-Z][A-Z0-9_]{1,31}$/], ['errorSub', /^[a-z-]{1,40}$/]]) { const v = tok(m[k], re); if (v) diag[k] = v; }
-          e.resolve({ ok: !!m.ok, ran: !!m.ran, result: m.result || null, reason: m.reason || null, resyncRequired: !!m.resyncRequired, needsAttention: !!m.needsAttention, code: typeof m.code === 'number' ? m.code : null, preserved: typeof m.preserved === 'number' ? m.preserved : null, refused: m.refused || null, ...diag });
+          e.resolve({ ok: !!m.ok, ran: !!m.ran, result: m.result || null, reason: m.reason || null, resyncRequired: !!m.resyncRequired, needsAttention: !!m.needsAttention, code: typeof m.code === 'number' ? m.code : null, preserved: typeof m.preserved === 'number' ? m.preserved : null, refused: m.refused || null, detail: runDetail(m.detail), ...diag });
         }
         break;
       }

@@ -67,6 +67,13 @@ const ENDPOINT_BACKOFF_MAX_MS = 60 * 60 * 1000;
 // The refusal class that backs off PER VAULT: the door answered, and turned this computer's credential away.
 // (A connect-class failure is the shared endpoint gate above; a settled device-side refusal is a hold.)
 const REFUSAL_RESULTS = new Set(['auth-failed', 'channel-refused']);
+// The run results that MIGHT be the vault running out of room, and are worth one read of the vault's own
+// record to find out. The SFTP door decides at close whether to keep an upload and the protocol gives a close
+// no way to say no, so the client sees only that the file is not there ('upload-not-stored'), or a bare
+// out-of-space word from the server ('server-no-space') that does not say WHOSE space. Neither names the
+// vault's allowance, and neither may be presented as if it did — hence the check (io.vaultSpace), which
+// answers from the server's own two numbers or not at all.
+const SPACE_SUSPECT_RESULTS = new Set(['upload-not-stored', 'server-no-space']);
 // The per-vault back-off after each consecutive refusal — the same schedule as the endpoint gate, and for the
 // same reason: every further attempt is a credential spent against a limit that is still refusing.
 const REFUSAL_BACKOFF_BASE_MS = 5 * 60 * 1000;
@@ -86,6 +93,7 @@ class SyncScheduler {
    * @param {(localFolder:string) => ({ok:boolean,reason?:string})} io.classify
    * @param {() => Promise<{ok:true}|{ok:false,reason:string}>} [io.probeEndpoint]  a credential-free probe of the sync server (reachable + the pinned identity), run INSTEAD of a mint after a connect failure; absent => the back-off alone bounds the minting
    * @param {() => number} [io.now]
+   * @param {(vaultId:string) => Promise<{known:boolean,limitBytes:(number|null),usedBytes:(number|null),freeBytes:(number|null)}>} [io.vaultSpace]  the vault's own allowance and how much of it is stored, read from the server (vault-space.js); asked ONCE after a run whose file the server took and did not keep, so "out of space" is only ever said when the server's numbers say so. Absent, or an answer of `known:false` => the outcome keeps its weaker, true name.
    * @param {(vaultId:string) => Promise<{ok:boolean,reason?:string}>} io.refreshCred
    * @param {(vaultId:string) => (string|null)} [io.credentialPath]  which credential path the vault's run took ('device' | 'account'), when known
    * @param {(vaultId:string) => Promise<boolean>} [io.confirmFirstUpload]  gate the first upload of a not-yet-consented config
@@ -139,6 +147,11 @@ class SyncScheduler {
     r.manualAllowed = !manual;
     this._refusal.set(vaultId, r);
   }
+
+  // When this vault's back-off will next let an attempt through, as an absolute time — or null when its door
+  // is not on record as refusing. Handed to the status layer so a wait can be stated in words and keep
+  // counting down as the glance is read.
+  _retryAt(vaultId) { const r = this._refusal.get(vaultId); return r && r.until > this._now() ? r.until : null; }
 
   // Milliseconds left on the "Sync now" cooldown for this vault, or 0 when a press may mint.
   _cooldownLeft(vaultId) {
@@ -243,7 +256,7 @@ class SyncScheduler {
     if (!manual) {
       if (this._held.has(vaultId)) return { accepted: false, reason: 'held' }; // the settled answer stands
       const r = this._refusal.get(vaultId);
-      if (r && this._now() < r.until) return { accepted: false, reason: 'backing-off', retryInMs: r.until - this._now() };
+      if (r && this._now() < r.until) return { accepted: false, reason: 'backing-off', retryInMs: r.until - this._now(), cause: r.reason };
       this._enqueue(vaultId, { manual: false }); this._pump();
       return { accepted: true };
     }
@@ -402,7 +415,10 @@ class SyncScheduler {
       // Keeps the last state: the refusal already on the glance IS the honest answer, and nothing new was learned.
       const rf = this._refusal.get(vaultId);
       if (rf && this._now() < rf.until && (!item.manual || !rf.manualAllowed)) {
-        this._emit(vaultId, { phase: 'skipped', reason: 'backing-off', retryInMs: rf.until - this._now() });
+        // `cause` is WHICH refusal opened the window: a server limiting attempts ('channel-refused') and a
+        // credential the server would not accept ('auth-failed') both wait, but only one of them is ever helped
+        // by signing in — so the answer a person gets must be able to tell them apart.
+        this._emit(vaultId, { phase: 'skipped', reason: 'backing-off', retryInMs: rf.until - this._now(), cause: rf.reason });
         return;
       }
 
@@ -502,6 +518,30 @@ class SyncScheduler {
         return outcome;
       }
       if (!(outcome && outcome.ran === true && outcome.result === 'auth-failed')) this._authRetried.delete(vaultId);
+      // A file the server took and then did not keep, or a bare "no space" from it. Ask the vault's own record
+      // ONCE whether the allowance is spent, so "this vault is out of space" is said only when the server's
+      // numbers say it — and never guessed from a silence that has several possible causes. The space picture
+      // rides along either way (the honest line names what is free when it is known); a check that cannot
+      // answer changes nothing, so the outcome keeps its own, weaker, true name.
+      if (outcome && outcome.ran === true && SPACE_SUSPECT_RESULTS.has(outcome.result)
+          && typeof this._io.vaultSpace === 'function') {
+        let space = null;
+        try { space = await this._io.vaultSpace(vaultId); } catch { space = null; }
+        if (space && space.known === true) {
+          const detail = { ...(outcome.detail || {}), limitBytes: space.limitBytes, freeBytes: space.freeBytes };
+          // Out of space is claimed on either of two facts the server's own numbers establish, and on nothing
+          // else: the allowance is entirely spent, or what is left is smaller than the file that was refused
+          // (its size read from the untouched local copy). The second is the case people actually meet — a
+          // vault with a little room left still cannot take a file bigger than that room — and without it a
+          // real "no room for this" would be reported as the vague "the server didn't keep it". With no file
+          // size to compare, only the first fact can be established, and the weaker true name stands.
+          const noRoomAtAll = space.freeBytes <= 0;
+          const tooBigForWhatIsLeft = Number.isFinite(detail.bytes) && detail.bytes > 0 && space.freeBytes < detail.bytes;
+          const result = (noRoomAtAll || tooBigForWhatIsLeft) ? 'vault-full' : outcome.result;
+          this._emit(vaultId, { phase: 'done', outcome: { ...outcome, result, detail }, remotePath });
+          return outcome;
+        }
+      }
       // A run that could not EXECUTE (timeout / no helper / send-failed) resolves { ok:false } — that is an
       // 'error', not 'done'. 'done' means the run ran; its typed result (which may still be a conflict or a
       // safety abort) is carried in `outcome` for the status model to classify.
@@ -510,7 +550,12 @@ class SyncScheduler {
       } else {
         // `remotePath` names the server-side path this run used, so the caller can remember it for the next
         // run's carry-over (a vault name or an id form — never a local path).
-        this._emit(vaultId, { phase: 'done', outcome, remotePath });
+        // A refused run also carries WHEN the back-off will let the next attempt through, as an absolute time.
+        // It is what turns "the server is limiting sync attempts" into a sentence with a wait in it. Absolute
+        // rather than a duration on purpose: a duration frozen at the moment of the refusal would be a lie a
+        // minute later, whereas an instant can be re-read against the clock every time a surface is rendered
+        // (which is why the tray re-renders itself while a wait is live).
+        this._emit(vaultId, { phase: 'done', outcome, remotePath, retryAt: refused ? this._retryAt(vaultId) : null });
       }
       return outcome;
     } catch (e) {

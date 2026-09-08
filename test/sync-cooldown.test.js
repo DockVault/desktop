@@ -273,8 +273,9 @@ test('the refusal class is auth-failed + a refused session channel; the channel 
   assert.strictEqual(OUTCOME_STATE['channel-refused'].reason, 'sync-server-refusing');
   assert.notStrictEqual(OUTCOME_STATE['channel-refused'].reason, OUTCOME_STATE['auth-failed'].reason, 'a busy or refusing server is not a sign-in matter');
   const line = require('../src/main/manual-sync-copy').bodyForConditionReason('sync-server-refusing', 'Photos');
-  assert.match(line, /refusing this computer/);
-  assert.doesNotMatch(line, /[Ss]ign in|password/, 'never a remedy the person cannot carry out');
+  assert.match(line, /limiting sync attempts/, 'the real cause, in plain words');
+  assert.doesNotMatch(line, /[Ss]ign in( again)? (to|and)|enter the vault password/, 'never a remedy the person cannot carry out');
+  assert.match(line, /won't help/, 'and it says so about the two people reach for');
   // Not the same thing: a local file that could not be opened, or the word "rejected" in a path, stays what it was.
   assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: 'ERROR : notes/rejected: open failed: permission denied' }).result, RESULT.ERROR);
   assert.strictEqual(classifyBisyncOutcome({ code: 0, stdout: 'copied rejected-drafts/ssh notes.txt' }).result, RESULT.OK);
@@ -431,7 +432,7 @@ test('the manage page: a turned-away "Sync now" resolves with the reason and a w
   answers.push({ accepted: false, reason: 'sync-cooldown', retryInMs: 30_400 });
   assert.deepStrictEqual(await view.act({ kind: 'sync-now', vaultId: V1 }), { ok: false, reason: 'cooldown', retryInSec: 31 });
   answers.push({ accepted: false, reason: 'backing-off', retryInMs: 240_000, cause: 'auth-failed' });
-  assert.deepStrictEqual(await view.act({ kind: 'sync-now', vaultId: V1 }), { ok: false, reason: 'backing-off', retryInSec: 240 });
+  assert.deepStrictEqual(await view.act({ kind: 'sync-now', vaultId: V1 }), { ok: false, reason: 'backing-off', retryInSec: 240, cause: 'auth-failed' }, 'the typed cause rides along so the page can say which refusal this is');
   answers.push({ accepted: false, reason: 'sync-cooldown', retryInMs: 1 });
   assert.deepStrictEqual(await view.act({ kind: 'sync-now', vaultId: V1 }), { ok: false, reason: 'cooldown', retryInSec: 1 }, 'never a 0 that reads as "try now"');
   answers.push(undefined); // a legacy caller that returns nothing is an accepted press

@@ -90,7 +90,7 @@ class SyncStatusHub {
   setVaults(list) {
     const next = new Map();
     for (const v of Array.isArray(list) ? list : []) {
-      const prev = this._vaults.get(v) || { running: false, transferring: false, progress: null, lastResult: null, resyncRequired: false, condition: null, lastSyncedAt: null, everSucceeded: false };
+      const prev = this._vaults.get(v) || { running: false, transferring: false, progress: null, lastResult: null, resyncRequired: false, condition: null, detail: null, retryAt: null, lastSyncedAt: null, everSucceeded: false };
       next.set(v, prev);
     }
     this._vaults = next;
@@ -136,11 +136,28 @@ class SyncStatusHub {
     this._recompute();
   }
 
-  /** Record a completed run's typed outcome for a vault (from the scheduler). */
-  recordOutcome(vault, { result, resyncRequired } = {}) {
+  /**
+   * Record a completed run's typed outcome for a vault (from the scheduler).
+   *
+   * `detail` (a bounded { file, maxBytes, limitBytes, freeBytes } — numbers and one checked base file name) and
+   * `retryAt` (when a refused door will be tried again) are what let the human line say WHICH file, WHICH limit,
+   * and HOW LONG instead of a generic "couldn't sync". They belong to THIS outcome, so they are replaced
+   * wholesale every time one lands and cleared with it — a detail from a previous, different failure must never
+   * trail a new one and name the wrong file.
+   */
+  recordOutcome(vault, { result, resyncRequired, detail, retryAt } = {}) {
     const e = this._vaults.get(vault); if (!e) return;
     e.lastResult = result != null ? result : e.lastResult;
     if (typeof resyncRequired === 'boolean') e.resyncRequired = resyncRequired;
+    // The detail belongs to a RESULT, so it is replaced only when a result actually lands. The blocked latch
+    // re-records `resyncRequired` on every later tick with no result of its own, and clearing the detail there
+    // would quietly strip the file name and the sizes off a failure that is still exactly the one being shown
+    // — the honest sentence would decay into its no-detail version a few minutes after the failure, which is
+    // when a person is most likely to look.
+    if (result != null) {
+      e.detail = detail || null;
+      e.retryAt = typeof retryAt === 'number' && Number.isFinite(retryAt) ? retryAt : null;
+    }
     e.running = false;
     e.transferring = false; // the run is over — no motion trails it
     e.progress = null;
@@ -169,6 +186,11 @@ class SyncStatusHub {
     // `sub`/`installed` are the helper-not-ready DETAIL (a bounded enum + a non-secret version string) — carried
     // for the tray's per-sub message only; they never affect the state, which the reason alone decides.
     e.condition = { state, reason: reason || null, sub: sub || null, installed: installed || null };
+    // A live can't-run condition replaces the last outcome's face, so the last outcome's detail (the file it
+    // named, the size it stated) no longer describes what is being shown — drop it rather than let it trail
+    // onto an unrelated reason. The refusal's retryAt survives: the door is still refusing, and the wait is
+    // still the honest thing to say while a condition holds the vault.
+    e.detail = null;
     e.running = false;
     e.transferring = false; // a vault that cannot run is not transferring
     e.progress = null;
@@ -207,7 +229,11 @@ class SyncStatusHub {
         // 'sync-stopped' is a GLOBAL helper condition (the shared daemon is down/wedged), not a per-vault one — a
         // persistent down helper escalates every vault to it. It is surfaced ONCE as the daemon item below, so it
         // must NOT also fire a per-vault must-act, or one down helper would raise a notification per vault.
-        if (MUST_ACT.has(v.state) && v.reason !== 'sync-stopped') nowActive.set(`${v.vault}:${v.state}:${v.reason || ''}`, { scope: 'vault', vault: v.vault, state: v.state, reason: v.reason || null });
+        // `detail`/`retryAt` ride along so the notification can be composed from the SAME copy source as the
+        // tray menu. Without them the one message a person gets without opening anything would fall back to a
+        // generic "something needs your attention" while every other surface named the real cause — the exact
+        // divergence honest reasons exist to close.
+        if (MUST_ACT.has(v.state) && v.reason !== 'sync-stopped') nowActive.set(`${v.vault}:${v.state}:${v.reason || ''}`, { scope: 'vault', vault: v.vault, state: v.state, reason: v.reason || null, detail: v.detail || null, retryAt: v.retryAt != null ? v.retryAt : null, resyncRequired: !!v.resyncRequired });
       }
       // A stuck helper is one global must-act item (crash-looped OR a persistent per-vault down-helper escalation).
       // Fire it whenever the aggregate is sync-stopped OR ANY vault escalated to it — never only when it wins the

@@ -39,8 +39,12 @@ const REASON_DETAIL = Object.freeze({
   // reads honestly whether calm (a laptop that woke before its network) or, once it persists, a must-act.
   'sync-server-unreachable': "the sync server can't be reached right now",
   // The server answered and refused this computer's sync connection (a turned-away credential, or no session
-  // slot free). A wait, not an action: DockVault is already spacing out its tries.
-  'sync-server-refusing': "the sync server is refusing this computer's sync connections right now",
+  // slot free). A wait, not an action: DockVault is already spacing out its tries. The tooltip is cut at about
+  // 127 characters on Windows, so the WAIT and the "don't go deactivating credentials" part live on the menu
+  // item's fuller sentence; this stays the short glance.
+  'sync-server-refusing': 'the server is limiting sync attempts for now',
+  // The server said it had no room for a file. Nothing on this computer to fix, and it may have room later.
+  'server-no-space': 'the sync server has no free space for new files right now',
   'sync-server-unverified': "what's at that address isn't answering as a sync server",
   // The saved sync state exists but cannot be unlocked/opened on this machine. Lead with reassurance —
   // the person's actual files are never touched by this — because a bare "sync problem" over an unreadable
@@ -49,6 +53,14 @@ const REASON_DETAIL = Object.freeze({
   // A sync step failed in our own code path (an unclassified internal error, or a credential provider that
   // threw) rather than a connection/sign-in issue. Honest and non-alarming; not retried forever.
   'sync-error': 'a sync step hit a problem',
+  // Nothing here could work out what went wrong. Say that, rather than leave the glance as the bare label.
+  'error': "the reason couldn't be identified — it will keep trying",
+  // A file did not land on the server. Short here (the tooltip is cut at about 127 characters on Windows);
+  // the fuller sentence — WHICH file, the size the server stated, the room the vault has left — is composed
+  // by reasonSentence from the outcome's detail and shown on the menu item and the Computers card.
+  'file-too-large': 'a file is larger than the sync server will accept',
+  'vault-full': "this vault doesn't have room for a file",
+  'upload-not-stored': "the sync server didn't keep a file it accepted",
   // The folder is known by its marker: these say why it cannot be synced right now (the must-act line says what to do).
   // (Short: the tray tooltip is cut at about 127 characters on Windows.)
   'folder-missing': "its folder isn't where it was — moved, deleted, or on a drive that isn't plugged in",
@@ -91,6 +103,125 @@ function progressDetail(progress) {
   const t = formatBytes(progress.bytesTotal);
   if (b && t) parts.push(`${b} of ${t}`); else if (b) parts.push(b);
   return parts.length ? parts.join(' · ') : null;
+}
+
+// A wait in words a person can act on: whole seconds under a minute and a half, else whole minutes rounded up.
+// Defined here, with the rest of the human copy, so the tray glance, the Computers card and the "Sync now"
+// toast all say a wait the same way — one phrasing, one rounding, no surface saying "2 minutes" while another
+// says "in about 90 seconds" for the same instant.
+function waitWords(ms) {
+  const sec = Math.max(1, Math.ceil((Number(ms) || 0) / 1000));
+  if (sec < 90) return sec === 1 ? '1 second' : `${sec} seconds`;
+  const min = Math.ceil(sec / 60);
+  return `about ${min === 1 ? '1 minute' : `${min} minutes`}`;
+}
+
+// The wait until an absolute time, in words — or null when there is no time, or it has already passed. A wait
+// that has lapsed says NOTHING rather than "0 seconds": the next tick is what will actually try again, and a
+// promise about a moment already gone is worse than no promise.
+function waitUntilWords(retryAt, now) {
+  if (typeof retryAt !== 'number' || !Number.isFinite(retryAt)) return null;
+  const left = retryAt - (typeof now === 'number' ? now : Date.now());
+  return left > 0 ? waitWords(left) : null;
+}
+
+// A file's name as it may appear in a sentence, or null. The name arrives already bounded and checked twice
+// (the helper builds a BASE name only and re-checks it as it leaves; the main process re-checks it as it
+// arrives). This is the same check once more at the place it would actually be RENDERED — deliberately
+// IDENTICAL to those, since a backstop weaker than the check it backs up is not a backstop. It rejects
+// direction-overriding and zero-width characters too: a name can come from the remote side of a shared
+// vault, and one that reverses the text around it must never reach a menu. Quoted, so a name with spaces
+// reads as one thing.
+const RENDERABLE_NAME = /^(?!\.\.?$)[^\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029\ufeff\\/:*?"<>|]{1,80}$/;
+function fileWord(detail) {
+  const f = detail && typeof detail.file === 'string' ? detail.file : null;
+  return f && RENDERABLE_NAME.test(f) ? `“${f}”` : null;
+}
+// A byte count from a detail, in words, or null — the same formatting as everywhere else in the app.
+function sizeWord(n) { return formatBytes(typeof n === 'number' && Number.isFinite(n) ? n : 0); }
+
+/**
+ * The FULL, plain-English sentence for the reasons whose honest answer needs more than a label: the ones that
+ * can name a file, a size the server stated, the room a vault has left, or how long a wait is. It is the ONE
+ * place that copy lives, so the tray menu item, the notification body and the Computers card cannot tell three
+ * different stories about the same failure.
+ *
+ * Every branch is written to the same rule: say the specific thing ONLY from a value that is actually present,
+ * and otherwise fall back within the same sentence to the true, less specific form. So a missing file name
+ * yields "a file", a missing limit drops the "(max …)", a lapsed wait drops the "in about …" — and nothing is
+ * ever invented to fill a gap. Returns null for a reason with no enriched sentence, leaving the caller's own
+ * table to answer.
+ *
+ * @param {string} reason         the vault's symbolic reason
+ * @param {object} [opts]
+ * @param {string} [opts.name]    the vault's display name
+ * @param {object} [opts.detail]  the outcome detail ({ file, maxBytes, limitBytes, freeBytes })
+ * @param {number} [opts.retryAt] when the back-off will next let an attempt through
+ * @param {number} [opts.now]     the clock, injectable for tests
+ * @returns {string|null}
+ */
+function reasonSentence(reason, opts = {}) {
+  const name = (opts && typeof opts.name === 'string' && opts.name) ? opts.name : 'This vault';
+  const d = (opts && opts.detail && typeof opts.detail === 'object') ? opts.detail : null;
+  const file = fileWord(d);
+  const wait = waitUntilWords(opts && opts.retryAt, opts && opts.now);
+  // Whether a REPAIR is owed decides how every one of these sentences must end. A file the server would not
+  // take makes the sync abort, so nothing more will transfer until a person runs the repair — and a sentence
+  // that ends "everything else keeps syncing" or "DockVault will try again" would then be simply untrue, for
+  // the whole time the person is looking at it. So the promise is made only when it holds, and when it does
+  // not, the sentence says what will actually get the vault moving again.
+  const repairOwed = !!(opts && opts.repairOwed);
+  // Two shapes of the same clause: one that follows an INSTRUCTION ("Take it out of the folder. Then use
+  // Repair…") and one that follows a plain STATEMENT, where a "Then" would imply a sequence that isn't there.
+  const useRepair = ` Use Repair in the DockVault tray menu to start ${name} syncing again.`;
+  const thenRepair = ` Then use Repair in the DockVault tray menu to start ${name} syncing again.`;
+  switch (reason) {
+    // The vault's own allowance — and it is only ever said when the server's own numbers said so
+    // (vault-space.js). Two shapes, and which is true decides the wording: an allowance entirely spent is
+    // "out of space"; an allowance with room left that is simply smaller than the file is NOT (saying "out of
+    // space … 1 MB is free" in one breath contradicts itself), so that one says what is actually wrong.
+    case 'vault-full': {
+      const limit = sizeWord(d && d.limitBytes);
+      const free = sizeWord(d && d.freeBytes);
+      const size = sizeWord(d && d.bytes);
+      const ofLimit = (limit && limit !== free) ? ` of ${limit}` : '';   // "1 MB free of 1 MB" reads as a mistake
+      const fix = `Remove something from the vault, or raise its size limit.${repairOwed ? thenRepair : ` Syncing continues on its own once ${name} has room.`}`;
+      if (size && file && free) return `${name} doesn't have room for ${file}: it needs ${size}, and only ${free} is free${ofLimit}. ${fix}`;
+      return `${name} is out of space.${limit ? ` It has used all ${limit} of its allowance.` : ''} ${fix}`;
+    }
+    // One file is bigger than the server will take. Nothing is wrong with the sync or the account, and no wait
+    // will change it — so the sentence names the file, the maximum the server ITSELF stated (never a guessed
+    // one), and the only two things that resolve it.
+    case 'file-too-large': {
+      const max = sizeWord(d && d.maxBytes);
+      const what = file || 'A file';
+      return `${what} in ${name} is larger than the sync server accepts${max ? ` (max ${max})` : ''}. Take it out of the folder or make it smaller.${repairOwed ? thenRepair : ' Everything else keeps syncing.'}`;
+    }
+    // The bytes went up and the file was not there afterwards, and the reason is NOT knowable from here: the
+    // door decides whether to keep an upload after the transfer, and this protocol gives that decision no way
+    // to report itself. So this says exactly what is known and no more — never a guessed cause — while adding
+    // the vault's remaining room when the numbers were readable, since that is often the answer.
+    case 'upload-not-stored': {
+      const free = sizeWord(d && d.freeBytes);
+      const limit = sizeWord(d && d.limitBytes);
+      const room = free && limit ? ` ${name} has ${free} free of ${limit}.` : '';
+      const next = repairOwed
+        ? ` Your copy on this computer is untouched.${useRepair}`
+        : ' Your copy on this computer is untouched, and DockVault will try again.';
+      return `The sync server accepted ${file || 'a file'} from ${name} and then didn't keep it.${next}${room}`;
+    }
+    // The server said it had no room. Its side, not this computer's, and it may well have room later — so it
+    // asks nothing of the person beyond the repair, if the failed run left one owed.
+    case 'server-no-space':
+      return `The sync server has no free space to take new files from ${name} right now. Nothing here was lost.${repairOwed ? useRepair : ' DockVault will keep trying.'}`;
+    // The server is turning this computer's sync connections away — a limit it is applying, or no session slot
+    // free. It clears ITSELF, so the sentence gives the wait and, pointedly, the two remedies people reach for
+    // and that do NOT help here: this is not an account matter and not a stale-credential matter, so anyone
+    // told to sign in or to go deactivating credentials would be sent to do harmless, useless work.
+    case 'sync-server-refusing':
+      return `The sync server is temporarily limiting sync attempts from this computer for ${name}. It will try again on its own${wait ? ` in ${wait}` : ''} — signing in again or deactivating credentials won't help.`;
+    default: return null;
+  }
 }
 
 // The per-sub helper-not-ready DETAIL — composed from the bounded sub + the non-secret installed/pinned version
@@ -167,7 +298,7 @@ function lockedGlance(model, lockReason) {
 // is paused (device sync). A fourth and fifth positional slot is exactly the shape that made this
 // function collide in the first place, so the object is deliberate — callers name what they pass.
 function tooltip(model, lockPhase, pinned, options = {}) {
-  const { server = null, lockReason = null } = options || {};
+  const { server = null, lockReason = null, now = null } = options || {};
   // With no server in force nothing below can be true — not even the lock — so the glance says that
   // rather than a name with nothing behind it.
   if (server && !server.origin) return 'DockVault — Not connected';
@@ -189,7 +320,11 @@ function tooltip(model, lockPhase, pinned, options = {}) {
     return 'DockVault — ' + model.label + (d ? ' · ' + d : '');
   }
   const detail = REASON_DETAIL[model.reason];
-  return 'DockVault — ' + model.label + (detail ? ' · ' + detail : '');
+  // The rate-limit glance carries its WAIT, because "it will try again on its own" is only half an answer
+  // without when. The rest of that sentence (that signing in and deactivating credentials do not help) is too
+  // long for a tooltip and lives on the menu item, which is one click away. A lapsed wait simply drops.
+  const wait = model.reason === 'sync-server-refusing' ? waitUntilWords(model.retryAt, now) : null;
+  return 'DockVault — ' + model.label + (detail ? ' · ' + detail : '') + (wait ? ` (retrying in ${wait})` : '');
 }
 
 // The action kinds the app can actually perform today. Every item this module emits MUST use one of
@@ -215,8 +350,13 @@ function displayName(v, nameById) {
 
 // One reachable action per unresolved item. `kind` is the stable action the tray layer wires to a handler;
 // `label` is the (provisional) menu text with the vault's NAME; `vault` stays the vault ID the handler acts on.
-function itemForVault(v, nameById) {
+function itemForVault(v, nameById, opts = {}) {
   const name = displayName(v, nameById);
+  // The reasons that can name a file, a stated size, the room left, or a wait get their full sentence from the
+  // ONE copy source, composed from THIS vault's own outcome detail. The switch below still owns everything
+  // else, so adding a rich reason never silently changes an existing label.
+  const rich = reasonSentence(v.reason, { name, detail: v.detail, retryAt: v.retryAt, now: opts && opts.now, repairOwed: !!v.resyncRequired });
+  if (rich) return { kind: RICH_ACTION[v.reason] || 'open', vault: v.vault, label: rich };
   switch (v.reason) {
     case 'conflict-keep-both': return { kind: 'review', vault: v.vault, label: `Review conflicting copies in ${name}` };
     case 'sign-in-needed': return { kind: 'sign-in', vault: v.vault, label: `Sign in to keep ${name} syncing` };
@@ -260,11 +400,39 @@ function itemForVault(v, nameById) {
     case 'vault-not-standard': return { kind: 'open', vault: v.vault, label: `${name} is end-to-end encrypted, so it stays on the web — only Standard vaults sync here` };
     case 'device-cred-cap': return { kind: 'open', vault: v.vault, label: `${name} can't sync yet: this computer has reached your server's sync-credential limit — try again in a while` };
     case 'device-refused': return { kind: 'open', vault: v.vault, label: `${name} couldn't sync — your server refused this computer. Open DockVault.` };
-    default: return { kind: 'open', vault: v.vault, label: `Sync problem with ${name}` };
+    // 'error' is the honest name for a run that failed in a way NOTHING here could identify — not the server
+    // turning this computer away, not a file, not the account, not the folder. Say exactly that, and say what
+    // is being done about it, rather than a bare "sync problem" that leaves a person guessing at their own
+    // account, connection, or files. Troubleshoot is the door because it is the one that actually tests
+    // something (the server address and the SFTP address, separately, from this computer).
+    case 'error':
+      return { kind: 'troubleshoot', vault: v.vault, label: `${name} couldn't sync and DockVault couldn't tell why. Nothing here was changed; it will keep trying. Run Troubleshoot to check the server.` };
+    // A reason with no line of its own. It is a bug for this to be reached — every reason the app can produce
+    // is answered above — so it must never leak the symbol itself into a menu: an internal token in front of a
+    // person is worse than an honest admission that this one has no words yet.
+    default:
+      return { kind: 'open', vault: v.vault, label: `${name} needs attention — open DockVault to see what's wrong.` };
   }
 }
 
-function mustActItems(model, nameById) {
+// Which door each rich-sentence reason opens. A full vault and an oversized file are resolved in the vault
+// itself (open the app); the two the server owns are worth a Troubleshoot look, which tests the server and the
+// SFTP address separately from this computer. Every value here MUST be in HANDLED_ACTION_KINDS.
+// Which door each rich-sentence reason opens. All of them open the app: what these need is done in the vault
+// (free some room, take a file out of the folder) or is a wait, and the repair the sentence names is in the
+// tray menu the person is already in. Deliberately NOT Troubleshoot: none of these sentences mentions it, and
+// for a server that is answering and merely limiting attempts Troubleshoot would report everything fine —
+// a door that contradicts the sentence that opened it is worse than no door. Every value MUST be in
+// HANDLED_ACTION_KINDS.
+const RICH_ACTION = Object.freeze({
+  'vault-full': 'open',
+  'file-too-large': 'open',
+  'upload-not-stored': 'open',
+  'server-no-space': 'open',
+  'sync-server-refusing': 'open',
+});
+
+function mustActItems(model, nameById, opts = {}) {
   const items = [];
   if (model.condition != null) return items; // unavailable / not-configured: nothing to act on here
   // A stuck helper (crash-looped OR a persistent per-vault down-helper escalation) is ONE global restart. Surface
@@ -288,7 +456,7 @@ function mustActItems(model, nameById) {
   for (const v of model.vaults) {
     if (v.reason === 'helper-not-ready') continue; // handled once, app-scoped, above
     if (v.reason === 'sync-stopped') continue; // a global down-helper condition — handled once as the restart above
-    if (v.state === STATE.NEEDS_DECISION || v.state === STATE.SYNC_PROBLEM) items.push(itemForVault(v, nameById));
+    if (v.state === STATE.NEEDS_DECISION || v.state === STATE.SYNC_PROBLEM) items.push(itemForVault(v, nameById, opts));
   }
   // The device-ended states are IDENTITY-wide (every configured vault reports the same removal/expiry), so
   // their set-up-again offer collapses to a SINGLE line — one re-registration fixes them all — rather than
@@ -409,4 +577,4 @@ function changeServerConsent(host) {
   };
 }
 
-module.exports = { tooltip, lockedGlance, mustActItems, itemForVault, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, formatBytes, progressDetail, helperDetail, REASON_DETAIL, HANDLED_ACTION_KINDS, helperRemedy, setPackaged, installedNotification, loginItemMenu, serverMenuItems, changeServerConsent };
+module.exports = { tooltip, lockedGlance, mustActItems, itemForVault, reasonSentence, waitWords, waitUntilWords, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, formatBytes, progressDetail, helperDetail, REASON_DETAIL, HANDLED_ACTION_KINDS, helperRemedy, setPackaged, installedNotification, loginItemMenu, serverMenuItems, changeServerConsent };

@@ -16,7 +16,11 @@
  *   H) a pushed sync status refreshes a card's state without reloading the model;
  *   I) a folder that cannot be found: the card says so and its "Find the folder…" asks main for the relocate offer.
  *   J) a "Sync now" the scheduler turns away (its cooldown, or a server that is refusing this computer's sync
- *      credentials) says so inline with the wait, restores the button, and leaves the card's real state alone.
+ *      credentials) says so inline with the wait, restores the button, and leaves the card's real state alone;
+ *   K) a failure that lands while the window is OPEN updates the card's explanation, not just its state chip:
+ *      the sentence appears with the chip, is replaced when the reason changes, and goes when the vault
+ *      recovers — so the card never shows a state and an explanation that disagree, and never keeps an
+ *      explanation of something that is no longer true.
  * Writes .local/manage-check.json and prints one PASS/FAIL line. Exit 0 = PASS.
  *
  *   node_modules/electron/dist/electron.exe test/manage-check.js
@@ -88,7 +92,7 @@ function sharedWindow() {
 const snapshot = `({
   title: document.getElementById('title').textContent, sub: document.getElementById('sub').textContent,
   text: document.getElementById('body').innerText,
-  sections: [...document.querySelectorAll('.computer')].map(s => ({ name: s.querySelector('.name').textContent, badges: [...s.querySelectorAll('.head .badge')].map(b => b.textContent), buttons: [...s.querySelectorAll('.head button')].map(b => b.textContent), cards: [...s.querySelectorAll('.card')].map(c => ({ vault: c.querySelector('.vault').textContent, text: c.innerText, state: (c.querySelector('.state .meta') || {}).textContent || '', buttons: [...c.querySelectorAll('.actions > button')].map(b => b.textContent) })), note: (s.querySelector('.note') || {}).textContent || '', confirm: (s.querySelector('.confirm') || {}).textContent || '' })),
+  sections: [...document.querySelectorAll('.computer')].map(s => ({ name: s.querySelector('.name').textContent, badges: [...s.querySelectorAll('.head .badge')].map(b => b.textContent), buttons: [...s.querySelectorAll('.head button')].map(b => b.textContent), cards: [...s.querySelectorAll('.card')].map(c => ({ vault: c.querySelector('.vault').textContent, text: c.innerText, state: (c.querySelector('.state .meta') || {}).textContent || '', reason: (c.querySelector('p.reason') || {}).textContent || '', buttons: [...c.querySelectorAll('.actions > button')].map(b => b.textContent) })), note: (s.querySelector('.note') || {}).textContent || '', confirm: (s.querySelector('.confirm') || {}).textContent || '' })),
 })`;
 const settle = `(async () => { for (let i = 0; i < 100; i++) { if (!document.getElementById('body').innerText.startsWith('Loading')) break; await new Promise(r => setTimeout(r, 50)); } await new Promise(r => setTimeout(r, 100)); return ${snapshot}; })()`;
 const clickIn = (scopeText, label) => `(async () => { const s = [...document.querySelectorAll('.computer, .card')].find(n => n.textContent.includes(${JSON.stringify(scopeText)})); if (!s) return 'no-scope'; const b = [...s.querySelectorAll('button')].find(x => x.textContent === ${JSON.stringify(label)}); if (!b) return 'no-button'; b.click(); await new Promise(r => setTimeout(r, 150)); return 'clicked'; })()`;
@@ -266,7 +270,39 @@ app.whenReady().then(async () => {
       && r.tone === 'box'; // a calm note, not the red refusal box
   }
 
-  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
+  // K) the card's EXPLANATION follows the live status, not just the chip
+  {
+    const FAILED = 'The sync server accepted a file from Photos and then didn\'t keep it.';
+    const REFUSING = 'The sync server is temporarily limiting sync attempts from this computer for Photos.';
+    const r = await scenario('K_live_reason', { ioSpec: {}, drive: async (win) => {
+      const before = await ev(win, settle);
+      // A failure lands while the window is open: the chip AND the sentence that explains it arrive together.
+      win.webContents.send('dockvault:evt:syncstatus', { state: 'needs-decision', vaults: [{ vault: V1, state: 'needs-decision', reason: 'upload-not-stored', running: false, lastSyncedAt: 1700000000000, via: 'device', reasonText: FAILED }] });
+      await sleep(300);
+      const failed = await ev(win, snapshot);
+      // A DIFFERENT failure replaces it — the card must never explain the previous one.
+      win.webContents.send('dockvault:evt:syncstatus', { state: 'paused', vaults: [{ vault: V1, state: 'paused', reason: 'sync-server-refusing', running: false, lastSyncedAt: 1700000000000, via: 'device', reasonText: REFUSING }] });
+      await sleep(300);
+      const refusing = await ev(win, snapshot);
+      // And it goes when the vault recovers, rather than sitting under a green chip.
+      win.webContents.send('dockvault:evt:syncstatus', { state: 'up-to-date', vaults: [{ vault: V1, state: 'up-to-date', reason: null, running: false, lastSyncedAt: 1700000000000, via: 'device', reasonText: null }] });
+      await sleep(300);
+      const ok = await ev(win, snapshot);
+      return {
+        before: before.sections[0].cards[0],
+        failed: failed.sections[0].cards[0],
+        refusing: refusing.sections[0].cards[0],
+        ok: ok.sections[0].cards[0],
+      };
+    } });
+    out.K_pass = r.before.reason === ''
+      && r.failed.state === 'Needs your decision' && r.failed.reason === FAILED
+      && r.refusing.reason === REFUSING
+      && r.ok.state === 'Up to date' && r.ok.reason === '';
+    out.K = r;
+  }
+
+  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'];
   out.ok = KEYS.every((k) => out[`${k}_pass`] === true);
   clearTimeout(watchdog);
   dump();

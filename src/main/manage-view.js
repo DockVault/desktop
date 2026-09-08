@@ -254,7 +254,10 @@ function createManageView(io) {
         if (verdict && verdict.accepted === false) {
           const retryInSec = Math.max(1, Math.ceil((Number(verdict.retryInMs) || 0) / 1000));
           if (verdict.reason === 'sync-cooldown') return { ok: false, reason: 'cooldown', retryInSec };
-          if (verdict.reason === 'backing-off') return { ok: false, reason: 'backing-off', retryInSec };
+          // The typed CAUSE rides along (a bounded enum from the scheduler, never a message), because the honest
+          // answer differs: a server limiting attempts is a wait no sign-in shortens, while a refused credential
+          // may well be unblocked by one. Only the two values the page knows how to answer are passed on.
+          if (verdict.reason === 'backing-off') return { ok: false, reason: 'backing-off', retryInSec, cause: verdict.cause === 'channel-refused' || verdict.cause === 'auth-failed' ? verdict.cause : null };
           return { ok: false, reason: 'refused' };
         }
         return { ok: true };

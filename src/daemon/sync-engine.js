@@ -238,7 +238,7 @@ function carryListings(workdir, { from, to }) {
  * @param {boolean} [o.resync] request a resync (the only thing that satisfies the blocked gate)
  * @param {() => number} [o.now]           injectable clock for the recorded timestamp
  * @param {number} [o.timeoutMs]
- * @returns {Promise<{ran:boolean, code?:number, result:string, resyncRequired:boolean, needsAttention?:boolean, stdout?:string, stderr?:string}>}
+ * @returns {Promise<{ran:boolean, code?:number, result:string, resyncRequired:boolean, needsAttention?:boolean, detail?:object|null, stdout?:string, stderr?:string}>}
  */
 // A per-step credential prepare (mint-fresh-per-process, resync path) that FAILED — no rclone ran. Surface the
 // typed reason AS the run outcome so it reads the same as a dispatch-time failure: a changed identity stays the
@@ -269,6 +269,37 @@ function credPrepareOutcome(reason, resyncRequired) {
   const result = CRED_REASON_RESULT[reason] || 'error';
   const needsAttention = result === 'host-key-mismatch' || result === 'auth-failed';
   return { ran: false, result, resyncRequired: !!resyncRequired, needsAttention, preserved: 0 };
+}
+
+/**
+ * Add the failing file's SIZE to an outcome's detail, read from the local copy.
+ *
+ * Why it is worth reading: "the server didn't keep this file" and "this vault has 1 MB free" are each true and
+ * neither is an answer. Put the file's own size beside them and the answer becomes plain — the file is bigger
+ * than the room left — which is what the main process needs before it may say a vault is out of space. The
+ * local copy is untouched by a failed upload, so its size is exactly what was attempted.
+ *
+ * What travels onward is a NUMBER. The relative path is used here, inside the helper that was already given
+ * the folder, and is discarded: only { file, maxBytes, bytes } goes on. Best-effort by design — a file moved
+ * or renamed since the run simply yields no size, and every sentence downstream works without one.
+ */
+function withLocalSize(detail, relPath, localRoot) {
+  if (!detail || !relPath || typeof localRoot !== 'string' || !localRoot) return detail || null;
+  const full = path.resolve(localRoot, relPath);
+  // Belt and braces over failedRelPath's own checks: whatever the join produced must still be INSIDE the
+  // folder this run was given. Paired with the lstat below, that is what keeps this from reading a size
+  // outside the folder the helper was pointed at.
+  const root = path.resolve(localRoot);
+  if (full !== root && !full.startsWith(root + path.sep)) return detail;
+  let bytes = null;
+  try {
+    // lstat, not stat: stat follows a symlink, so a link inside the folder pointing anywhere on the machine
+    // would return the size of its TARGET and the containment check above — which only ever saw the path —
+    // would have proved nothing. A link is not the file that failed to upload, so it simply yields no size.
+    const st = fs.lstatSync(full);
+    if (st.isFile() && Number.isSafeInteger(st.size) && st.size > 0) bytes = st.size;
+  } catch { /* gone, unreadable, or never local — the copy works without a size */ }
+  return bytes == null ? detail : { ...detail, bytes };
 }
 
 async function runBisync(o) {
@@ -314,7 +345,12 @@ async function runBisync(o) {
   const outcome = classifyBisyncOutcome({ code, stdout, stderr, resync });
   const resyncRequired = outcome.resyncRequired === null ? state.resyncRequired : outcome.resyncRequired;
   if (o.db) recordRun(o.db, o.vault, { result: outcome.result, resyncRequired, atUtc: now() });
-  return { ran: true, code, result: outcome.result, resyncRequired, needsAttention: outcome.needsAttention, stdout, stderr };
+  // `detail` is the bounded pair the classifier built (a checked base file name, a stated maximum in bytes) and
+  // NOTHING else from the run's output — it is what lets the status layer name the file and the limit instead of
+  // a generic "couldn't sync". Absent for every outcome that has nothing to add.
+  // The detail travels; the path its size was read from does NOT (see withLocalSize).
+  const detail = withLocalSize(outcome.detail, outcome.failedPath, o.local);
+  return { ran: true, code, result: outcome.result, resyncRequired, needsAttention: outcome.needsAttention, detail: detail || null, stdout, stderr };
 }
 
 module.exports = { CONNECT_BOUND_ARGS, SINGLE_CONNECTION_ARGS, BISYNC_MAX_STDOUT_BYTES, buildBisyncArgs, runBisync, credPrepareOutcome, bisyncWorkdir, emptyPairBaseline, needsZeroLossBaseline, localHasNoFiles, priorListingEmpty, canonicalPath, carryListings, pairKey, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS };

@@ -103,6 +103,20 @@ const OUTCOME_STATE = Object.freeze({
   // NOT an account remedy: asking someone to sign in because a server is busy would be a lie.
   'channel-refused': { state: STATE.PAUSED, reason: 'sync-server-refusing' },
   'path-too-long': { state: STATE.NEEDS_DECISION, reason: 'path-too-long' },
+  // The three ways a file did not land on the server, kept apart because the person's next step differs and
+  // because saying the wrong one is worse than saying the vague one:
+  //   - the server named a size limit the file is over: nothing is wrong with the sync, one file is too big,
+  //     and only the person can decide what to do about it — a decision;
+  //   - the server said it had no room: nothing for the person to fix on this computer, and it may well have
+  //     room again later — a calm paused state that keeps retrying;
+  //   - the server took the bytes and then did not keep the file: a real failure with NO knowable cause here,
+  //     so it is a decision (a person has to look) worded as exactly that and never as a guess.
+  'file-too-large': { state: STATE.NEEDS_DECISION, reason: 'file-too-large' },
+  'server-no-space': { state: STATE.PAUSED, reason: 'server-no-space' },
+  'upload-not-stored': { state: STATE.NEEDS_DECISION, reason: 'upload-not-stored' },
+  // The vault's OWN allowance is spent — established from the server's own two numbers (vault-space.js), never
+  // guessed from a silence. A decision: nothing retries its way out of a full vault.
+  'vault-full': { state: STATE.NEEDS_DECISION, reason: 'vault-full' },
   // The SFTP door could not be reached (refused, timed out, no such host). Calm at first — a laptop that woke up
   // before its network did — and the scheduler stops minting credentials until the door answers a credential-free
   // probe; persisting, the status sink escalates it to a problem that still names the real cause.
@@ -118,6 +132,10 @@ const OUTCOME_STATE = Object.freeze({
   // not a connection issue: a distinct NON-retrying problem, surfaced at once rather than retried as 'error'.
   'sync-error': { state: STATE.SYNC_PROBLEM, reason: 'sync-error' },
 });
+
+// The outcomes that ALREADY say why sync stopped. A resync-owed latch may not replace these with the generic
+// "this needs a repair": the repair is real, but it is the second half of the answer, not the answer.
+const EXPLAINS_ITSELF = new Set(['file-too-large', 'server-no-space', 'upload-not-stored', 'vault-full', 'path-too-long']);
 
 /**
  * @param {object} v one vault's signals
@@ -156,15 +174,32 @@ function vaultStateCore(v) {
   // (a Repair's transfer still shows its numbers under "needs your decision"); once nothing moves it is cleared,
   // so a stale count never trails a finished or paused vault.
   const progress = transferring && running && v.progress ? v.progress : null;
-  return { ...out, running, progress, lastSyncedAt: v.lastSyncedAt != null ? v.lastSyncedAt : null };
+  // The last outcome's DETAIL (which file, which stated size, the vault's room) and the refused door's retryAt
+  // ride along so the human layer can name them. They are presentation facts only — nothing above reads them,
+  // and the state is decided entirely without them, so a missing or malformed detail can never change what the
+  // vault is said to BE, only how fully the one sentence explains it. They are dropped the moment a live
+  // can't-run condition wins the face, since they describe the outcome that is no longer being shown.
+  const showingCondition = out !== base;
+  const detail = (!showingCondition && v.detail && typeof v.detail === 'object') ? v.detail : null;
+  const retryAt = typeof v.retryAt === 'number' && Number.isFinite(v.retryAt) ? v.retryAt : null;
+  return { ...out, running, progress, detail, retryAt, lastSyncedAt: v.lastSyncedAt != null ? v.lastSyncedAt : null };
 }
 
 function baseVaultState(v, transferring, running, resyncRequired) {
   // A blocked latch (a resync is owed) is a decision the person must make, even mid-run: it never
   // silently clears and it never reads as green. It outranks the transient "syncing" face.
+  //
+  // The one thing it must NOT do is erase a cause that already explains itself. A file the server would not
+  // take makes bisync abort and owe a resync, so the latch is set on exactly the runs whose cause this app
+  // just worked out — and answering those with a bare "needs a repair" would put the wrong instruction in
+  // front of the person (a repair does not make a file fit, or make a full vault bigger) and lose the
+  // sentence that tells them what to actually do. So a self-explaining outcome KEEPS its reason and is lifted
+  // to the decision tier the latch belongs to: the cause is named, the repair is still offered, and the
+  // sentence for these reasons says the repair is the way back once the cause is dealt with.
   if (resyncRequired && (v.lastResult == null || OUTCOME_STATE[v.lastResult] == null
       || RANK[OUTCOME_STATE[v.lastResult].state] < RANK[STATE.NEEDS_DECISION])) {
-    return { vault: v.vault, state: STATE.NEEDS_DECISION, reason: 'needs-repair', running, resyncRequired };
+    const own = v.lastResult != null && EXPLAINS_ITSELF.has(v.lastResult) ? OUTCOME_STATE[v.lastResult] : null;
+    return { vault: v.vault, state: STATE.NEEDS_DECISION, reason: own ? own.reason : 'needs-repair', running, resyncRequired };
   }
   if (v.lastResult != null && OUTCOME_STATE[v.lastResult]) {
     const m = OUTCOME_STATE[v.lastResult];
@@ -255,7 +290,7 @@ function computeStatus(s) {
   if (!s.crashLoopLatched && (s.daemon === 'starting' || s.daemon === 'crashed')) {
     contributors.push({ state: STATE.PAUSED, reason: 'reconnecting' });
   }
-  for (const v of vaults) contributors.push({ state: v.state, reason: v.reason, vault: v.vault, progress: v.progress || null, sub: v.sub || null, installed: v.installed || null });
+  for (const v of vaults) contributors.push({ state: v.state, reason: v.reason, vault: v.vault, progress: v.progress || null, sub: v.sub || null, installed: v.installed || null, detail: v.detail || null, retryAt: v.retryAt != null ? v.retryAt : null });
 
   // The aggregate is the highest-precedence contributor; ties keep the first seen (global before
   // per-vault only where ranks are equal, which does not change the surfaced severity).
@@ -271,6 +306,10 @@ function computeStatus(s) {
     // aggregate when the winner is a helper-not-ready vault, so the tray can compose the per-sub message.
     sub: winner.sub || null,
     installed: winner.installed || null,
+    // The winning contributor's own detail + wait, so the ONE-LINE glance can be as specific as the menu item
+    // is. Present only when the winner actually carries them.
+    detail: winner.detail || null,
+    retryAt: winner.retryAt != null ? winner.retryAt : null,
     // The glance's transfer detail, present only when the winning contributor is a syncing vault.
     progress: (winner.state === STATE.SYNCING && winner.progress) ? winner.progress : null,
     // Carried for the tray's locked glance so it can say "waiting to reconnect" under the lock when offline
@@ -281,4 +320,24 @@ function computeStatus(s) {
   };
 }
 
-module.exports = { STATE, RANK, LABEL, OUTCOME_STATE, vaultState, computeStatus };
+/**
+ * The model as a RENDERER may see it: the same states, labels, symbolic reasons and numbers, with the outcome
+ * DETAIL removed.
+ *
+ * The detail is the one field on the model that can carry a file's NAME, and it exists for the surfaces that
+ * live in the main process — the tray glance, its menu, the notification body, and the sentence the Computers
+ * window is HANDED (composed in main, never assembled in the page). Nothing a page renders needs the name
+ * itself, and the app's standing rule for anything that reaches a page is numbers and symbols only — the same
+ * rule that keeps file names out of the live transfer progress. So the boundary is made explicit here, in one
+ * function both renderer paths go through, rather than left to each caller to remember.
+ */
+function publicStatus(model) {
+  if (!model || typeof model !== 'object') return model;
+  const { detail, ...rest } = model;
+  return {
+    ...rest,
+    vaults: Array.isArray(model.vaults) ? model.vaults.map(({ detail: _d, ...v }) => v) : [],
+  };
+}
+
+module.exports = { STATE, RANK, LABEL, OUTCOME_STATE, EXPLAINS_ITSELF, vaultState, computeStatus, publicStatus };

@@ -19,10 +19,16 @@
 
 const { conditionForReason } = require('./scheduler-io');
 const { STATE, OUTCOME_STATE } = require('./sync-status-model');
+const { reasonSentence, waitWords } = require('./tray-presentation');
 
 // A resolved per-vault (state, reason) -> the manual completion line. Shares the reason vocabulary with the
 // tray so the toast and the glance stay one source.
-function bodyForConditionReason(reason, name) {
+function bodyForConditionReason(reason, name, opts = {}) {
+  // The reasons that can name a file, a stated size, the room a vault has left, or a wait get their sentence
+  // from the ONE copy source the tray and the Computers card also read, so a press is answered with exactly
+  // what the glance says — never a second, vaguer version of the same failure.
+  const rich = reasonSentence(reason, { name, detail: opts.detail, retryAt: opts.retryAt, now: opts.now, repairOwed: opts.repairOwed });
+  if (rich) return rich;
   switch (reason) {
     case 'cannot-verify-yet':
       // A fail-closed VERIFICATION pause, NOT a connectivity blip: the server's identity cannot be confirmed
@@ -48,9 +54,6 @@ function bodyForConditionReason(reason, name) {
     // one thing that helps: Troubleshoot checks the saved server and SFTP address separately.
     case 'sync-server-unreachable': return `${name} can't sync: the sync server can't be reached right now. Open DockVault and run Troubleshoot to check the address.`;
     case 'sync-server-unverified': return `${name} can't sync: what's at the sync server address isn't answering as a sync server. Open DockVault and run Troubleshoot to check it.`;
-    // The server answered and refused the sync connection. Deliberately promises no remedy the person can carry
-    // out — it is the server's side — and never a sign-in, which this state is not.
-    case 'sync-server-refusing': return `${name} couldn't sync: the sync server is refusing this computer's sync connections right now. DockVault will try again, less often, until it stops.`;
     case 'helper-not-ready':
       // The sync helper (rclone) isn't ready — a NON-retrying must-act (a wrong/missing/blocked binary, or one
       // that won't start), so NEVER the calm "try again in a moment" that would tell a different story than the
@@ -75,7 +78,10 @@ function bodyForConditionReason(reason, name) {
     case 'device-identity-unreadable': return `${name} will sync once this computer's sync identity can be read again.`;
     case 'grant-details-pending': return `Sign in once to finish setting up ${name} on this computer.`;
     case 'device-access-check': return `${name} couldn't sync just now — this computer's access is being re-checked.`;
-    case 'error': return `${name} couldn't sync. Open DockVault to see why.`;
+    // NOTHING here could identify what went wrong — not the server turning this computer away, not a file, not
+    // the account, not the folder. Say that plainly (and that nothing was changed), rather than a bare
+    // "couldn't sync" that sends a person hunting through their own account and connection.
+    case 'error': return `${name} couldn't sync and DockVault couldn't tell why. Nothing here was changed and it will keep trying — open DockVault and run Troubleshoot to check the server.`;
     // A fault in our OWN sync step (not the connection, not sign-in) — own it, and never promise a retry.
     case 'sync-error': return `Something in DockVault's own sync step failed for ${name} — this is on our side. Open DockVault.`;
     case 'retrying':
@@ -100,10 +106,12 @@ function manualCompletionBody(ev, name) {
   if (phase === 'done' || phase === 'error') {
     const mapped = OUTCOME_STATE[result] || OUTCOME_STATE[reason] || null;
     if (mapped && mapped.state === STATE.UP_TO_DATE) return { body: `${name} is up to date — safe to work offline.` };
-    if (mapped && mapped.reason) return { body: bodyForConditionReason(mapped.reason, name) };
+    // The run's own detail (which file, which stated size, the vault's room) and its back-off time travel with
+    // it, so the press earns the SPECIFIC sentence and not the generic version of it.
+    if (mapped && mapped.reason) return { body: bodyForConditionReason(mapped.reason, name, { detail: ev.outcome && ev.outcome.detail, retryAt: ev.retryAt, repairOwed: !!(ev.outcome && ev.outcome.resyncRequired) }) };
     // 'done' with no typed result, or an unrecognised error: an honest, non-specific line for each.
     return { body: phase === 'error'
-      ? `${name} couldn't sync. Open DockVault to see why.`
+      ? bodyForConditionReason('error', name)
       : `${name} finished, but it needs your attention. Open DockVault to review.` };
   }
   if (phase === 'blocked') return { body: bodyForConditionReason('needs-repair', name) };
@@ -112,7 +120,7 @@ function manualCompletionBody(ev, name) {
   if (reason === 'consent-declined') return { silent: true };
   // The vault's door is refusing this computer's credentials and this wait's one attempt is already spent, so the
   // dispatch stopped before minting. Same sentence as a press turned away at the request — one source, one story.
-  if (reason === 'backing-off') return { body: turnedAwayBody({ accepted: false, reason: 'backing-off', retryInMs: ev && ev.retryInMs }, name) };
+  if (reason === 'backing-off') return { body: turnedAwayBody({ accepted: false, reason: 'backing-off', retryInMs: ev && ev.retryInMs, cause: ev && ev.cause }, name) };
   const cond = conditionForReason(phase, reason);
   if (cond) return { body: bodyForConditionReason(cond.reason, name) };
   // Reasons conditionForReason leaves null — the global signals carry the glance for these — still owe a manual
@@ -123,14 +131,6 @@ function manualCompletionBody(ev, name) {
     case 'ineligible': return { body: `${name} can't be synced any more. Open DockVault for details.` };
     default: return { body: `${name} couldn't sync just now. Try again in a moment.` };
   }
-}
-
-// A wait in words a person can act on: whole seconds under a minute and a half, else whole minutes rounded up.
-function waitWords(ms) {
-  const sec = Math.max(1, Math.ceil((Number(ms) || 0) / 1000));
-  if (sec < 90) return sec === 1 ? '1 second' : `${sec} seconds`;
-  const min = Math.ceil(sec / 60);
-  return `about ${min === 1 ? '1 minute' : `${min} minutes`}`;
 }
 
 /**
@@ -146,7 +146,16 @@ function turnedAwayBody(verdict, name) {
   const wait = waitWords(verdict.retryInMs);
   switch (verdict.reason) {
     case 'sync-cooldown': return `${name} was asked to sync a moment ago — you can ask again in ${wait}. Changes are still picked up on the regular schedule.`;
-    case 'backing-off': return `The sync server is refusing this computer's sync credentials for ${name}, so DockVault is waiting before it tries again (${wait}). If its status asks you to sign in or enter the vault password, doing that lets it try at once.`;
+    // Two different doors, two different answers, told apart by the typed cause the scheduler carries:
+    //   channel-refused — the server ANSWERED and turned the connection away (a limit it is applying, or no
+    //     session slot free). It clears itself. Naming a sign-in or a credential to deactivate here would send
+    //     someone to do work that cannot help, so this branch names them as the things that DON'T.
+    //   auth-failed (or an unknown cause) — the credential itself was refused, and a sign-in or the vault's
+    //     password genuinely may be what unblocks it, so that offer stays.
+    case 'backing-off':
+      return verdict.cause === 'channel-refused'
+        ? `The sync server is temporarily limiting sync attempts from this computer, so DockVault is waiting before it tries ${name} again (${wait}). Signing in again or deactivating credentials won't help — the wait is what clears it.`
+        : `The sync server is refusing this computer's sync credentials for ${name}, so DockVault is waiting before it tries again (${wait}). If its status asks you to sign in or enter the vault password, doing that lets it try at once.`;
     default: return `${name} couldn't be asked to sync just now. Try again in a moment.`;
   }
 }

@@ -202,7 +202,7 @@ async function zeroLossResync(o) {
     if (o.db) recordRun(o.db, o.vault, { result: RESULT.CONFLICT_KEEP_BOTH, resyncRequired: r.resyncRequired, atUtc: now() });
     return { ran: r.ran, result: RESULT.CONFLICT_KEEP_BOTH, preserved, resyncRequired: r.resyncRequired, needsAttention: true };
   }
-  return { ran: r.ran, result: r.result, preserved, resyncRequired: r.resyncRequired, needsAttention: r.needsAttention };
+  return { ran: r.ran, result: r.result, preserved, resyncRequired: r.resyncRequired, needsAttention: r.needsAttention, detail: r.detail || null };
 }
 
 module.exports = { zeroLossResync, parseLsf, parseCheckDiffering, walkLocal, reserveLocalPath };

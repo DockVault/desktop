@@ -49,7 +49,31 @@ test('runSync() round-trips a summarized bisync outcome (id-correlated), never r
   assert.deepStrictEqual(sent.spec, { vault: 'v1', local: 'l', remotePath: 'p', resync: true });
   assert.ok(typeof sent.id === 'number');
   mgr._onMessage({ type: 'sync-run-result', id: sent.id, ok: true, ran: true, result: 'abort-excessive-delete', resyncRequired: true, needsAttention: true, code: 2 });
-  assert.deepStrictEqual(await p, { ok: true, ran: true, result: 'abort-excessive-delete', reason: null, resyncRequired: true, needsAttention: true, code: 2, preserved: null, refused: null });
+  assert.deepStrictEqual(await p, { ok: true, ran: true, result: 'abort-excessive-delete', reason: null, resyncRequired: true, needsAttention: true, code: 2, preserved: null, refused: null, detail: null });
+});
+
+test('the outcome DETAIL crosses the helper boundary field by field, and nothing else does', async () => {
+  const mgr = new DaemonManager('/nonexistent');
+  let sent = null;
+  mgr.child = { postMessage: (m) => { sent = m; } };
+  const round = async (detail) => {
+    const p = mgr.runSync({ vault: 'v1', local: 'l', remotePath: 'p' }, 1000);
+    mgr._onMessage({ type: 'sync-run-result', id: sent.id, ok: true, ran: true, result: 'file-too-large', detail });
+    return (await p).detail;
+  };
+  // The three fields an outcome may carry — one base file name and two sizes — arrive intact.
+  assert.deepStrictEqual(await round({ file: 'holiday video.mov', maxBytes: 512, bytes: 900 }), { file: 'holiday video.mov', maxBytes: 512, bytes: 900 });
+  // A name with a separator or a control character is refused rather than trimmed into something showable,
+  // and a field the boundary does not name is dropped even when it rides alongside valid ones.
+  assert.deepStrictEqual(await round({ file: 'a/b.txt', maxBytes: 512 }), { file: null, maxBytes: 512, bytes: null });
+  assert.deepStrictEqual(await round({ file: 'bad.txt' }), null);
+  assert.deepStrictEqual(await round({ file: 'a.txt', localPath: 'C:/Users/someone/Secret/a.txt', stderr: 'raw output' }), { file: 'a.txt', maxBytes: null, bytes: null });
+  // Sizes must be sane positive integers; anything else is simply absent.
+  assert.deepStrictEqual(await round({ maxBytes: -1, bytes: 1.5 }), null);
+  assert.deepStrictEqual(await round({ bytes: Number.MAX_SAFE_INTEGER }), null, 'an absurd size is not carried');
+  assert.strictEqual(await round(null), null);
+  assert.strictEqual(await round('a raw string'), null);
+  assert.strictEqual(await round([{ file: 'a.txt' }]), null);
 });
 
 test('sync-run-result and sync-status resolves carry a bounded reason, never a raw error string (leak-close)', async () => {

@@ -211,7 +211,11 @@ function applySchedulerEvent(hub, vaultId, ev) {
     case 'running': hub.setRunning(vaultId, true, ev.via || null); return;
     case 'done': {
       const o = ev.outcome || {};
-      hub.recordOutcome(vaultId, { result: o.result, resyncRequired: o.resyncRequired });
+      // `detail` is the bounded pair that lets the human line NAME the thing that failed (a file, a size the
+      // server stated, the room the vault has left) instead of a generic "couldn't sync"; `retryAt` is when a
+      // refused door will be tried again, so the wait can be said in words and keep counting down. Both are
+      // presentation facts riding beside the typed result — neither is ever an input to which state it is.
+      hub.recordOutcome(vaultId, { result: o.result, resyncRequired: o.resyncRequired, detail: o.detail || null, retryAt: ev.retryAt != null ? ev.retryAt : null });
       return;
     }
     case 'error': hub.recordOutcome(vaultId, { result: 'error' }); return;
