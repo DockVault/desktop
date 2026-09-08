@@ -324,6 +324,9 @@ function conditionForReason(phase, reason) {
     case 'paused-locked':
     case 'state-uncertain':
     case 'not-configured':   return null; // transient — the global signals carry these
+    // A routine tick skipped inside the vault's refusal back-off: nothing new was learned, so the refusal already
+    // on the glance (the last run's real outcome) stands. Not a failure on the streak either — no run was attempted.
+    case 'backing-off':      return null;
     default:
       // A credential-refresh failure surfaces as 'paused': an auth failure arrives as 'no-session'
       // (handled above -> sign-in); any other refresh hiccup is a calm, retryable pause.

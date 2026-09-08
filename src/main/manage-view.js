@@ -31,7 +31,9 @@
  *                      its records (it can never be presented again), leaving the synced files alone.
  *   remove-computer    DELETE a computer that is already revoked (housekeeping of the list).
  *   stop-sync          drop a local sync configuration entry (this computer only; the grant stays).
- *   sync-now           ask the scheduler for a run (this computer only).
+ *   sync-now           ask the scheduler for a run (this computer only). Turned away with reason 'cooldown' ("Sync now"
+ *                      was used moments ago) or 'backing-off' (the server is refusing this computer's credentials),
+ *                      each with retryInSec — nothing minted, nothing run.
  * Ids arriving from the page are checked for shape before anything is done with them, and a server refusal
  * is reported as a typed reason, never as a raw message. An answer the server gave that could not be read as
  * a confirmation is 'indeterminate': nothing local changes, and the page says the change could not be confirmed.
@@ -73,7 +75,7 @@ function standingOf({ granted, recorded, identityStatus }) {
  *   relocateFolder(vaultId)    -> open main's relocate-or-stop offer for a folder that cannot be found
  *   dropLocalVault(vaultId)    -> remove the local sync entry + records for a vault
  *   dropLocalIdentity()        -> clear this computer's identity + grant records locally
- *   syncNow(vaultId)
+ *   syncNow(vaultId)           -> the scheduler's verdict on the request: { accepted: true } | { accepted: false, reason, retryInMs? }
  *   afterChange()              -> refresh whatever reads the config / identity
  */
 function createManageView(io) {
@@ -244,7 +246,17 @@ function createManageView(io) {
       }
       case 'sync-now': {
         if (!isUuid(vaultId)) return { ok: false, reason: 'bad-request' };
-        try { io.syncNow(vaultId); } catch { return { ok: false, reason: 'refused' }; }
+        let verdict;
+        try { verdict = io.syncNow(vaultId); } catch { return { ok: false, reason: 'refused' }; }
+        // The scheduler's immediate answer on the request: turned away by the "Sync now" cooldown or by the
+        // vault's refusal back-off (nothing minted) — the page says so, with how long until the next is allowed.
+        // Whole seconds only: the page needs no finer clock, and a 0 never reads as "try again now".
+        if (verdict && verdict.accepted === false) {
+          const retryInSec = Math.max(1, Math.ceil((Number(verdict.retryInMs) || 0) / 1000));
+          if (verdict.reason === 'sync-cooldown') return { ok: false, reason: 'cooldown', retryInSec };
+          if (verdict.reason === 'backing-off') return { ok: false, reason: 'backing-off', retryInSec };
+          return { ok: false, reason: 'refused' };
+        }
         return { ok: true };
       }
       // The relocate-or-stop offer for a folder that cannot be found: main runs it (its own dialogs); the page

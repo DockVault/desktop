@@ -107,7 +107,8 @@ const api = Object.freeze({
     model: () => ipcRenderer.invoke('dockvault:manage.model'),
     // Carry out an action the person confirmed on the page: { kind, deviceId?, vaultId? } with kind one of
     // revoke-grant | revoke-computer | remove-computer | stop-sync | sync-now | relocate-folder. Main checks the ids' shape and
-    // decides; the server is the authority. Resolves { ok, reason? }.
+    // decides; the server is the authority. Resolves { ok, reason?, retryInSec? } (retryInSec rides with a sync-now turned
+    // away for its cooldown or the server's refusal back-off).
     act: (action) => ipcRenderer.invoke('dockvault:manage.act', { kind: String(action && action.kind), deviceId: action && action.deviceId != null ? String(action.deviceId) : undefined, vaultId: action && action.vaultId != null ? String(action.vaultId) : undefined }),
     // Open the sync setup wizard (the app's own window), and close this one.
     openSetup: () => ipcRenderer.invoke('dockvault:manage.open-setup'),

@@ -98,6 +98,10 @@ const OUTCOME_STATE = Object.freeze({
   // A device-path run refused at the SFTP door: this computer's standing is re-checked on the next pass and
   // becomes its own honest state there (revoked, suspended, prove-once-more) — calm meanwhile.
   'auth-failed-device': { state: STATE.PAUSED, reason: 'device-access-check' },
+  // The server answered and refused the session channel: this computer's credential was turned away, or the
+  // server had no session slot left. Calm and RETRYABLE — the scheduler is already backing off — and pointedly
+  // NOT an account remedy: asking someone to sign in because a server is busy would be a lie.
+  'channel-refused': { state: STATE.PAUSED, reason: 'sync-server-refusing' },
   'path-too-long': { state: STATE.NEEDS_DECISION, reason: 'path-too-long' },
   // The SFTP door could not be reached (refused, timed out, no such host). Calm at first — a laptop that woke up
   // before its network did — and the scheduler stops minting credentials until the door answers a credential-free

@@ -83,7 +83,7 @@ const { refreshDeviceSecret, isRotationDue, identityIsStaleAfter, reconcileRotat
 const { RunStateSnapshot } = require('./run-state-snapshot');
 const { SyncScheduler } = require('./sync-scheduler');
 const schedulerIo = require('./scheduler-io');
-const { manualCompletionBody } = require('./manual-sync-copy');
+const { manualCompletionBody, turnedAwayBody } = require('./manual-sync-copy');
 const { ensureFolderSecure, recoverOwnerOnly, classifyForeignAces } = require('./folder-secure');
 
 const STATIC_ROOT = path.resolve(__dirname, '..', '..', 'vendor', 'vault', 'static');
@@ -727,7 +727,9 @@ function handleMustAct(item) {
   // The deliberate Repair: the ONLY thing that clears a blocked-after-run latch (a resync owed, or a
   // >50%-delete abort). It enqueues a manual repair run; the dispatch then asks the keep-both confirm
   // (confirmFirstUpload kind 'repair') before doing a zero-loss resync — nothing is auto-resynced.
-  if (item && item.kind === 'repair' && item.vault) { if (syncScheduler) syncScheduler.requestRepair(item.vault); return; }
+  // A Repair turned away by the scheduler (the door is refusing and this window's attempt is spent) still earns
+  // its one honest answer — the wait — rather than a press that does nothing.
+  if (item && item.kind === 'repair' && item.vault) { if (syncScheduler) notifyTurnedAway(item.vault, syncScheduler.requestRepair(item.vault)); return; }
   // The sync helper (rclone) isn't ready — there is NO in-app install flow (the helper ships with the installer,
   // hash-pinned), so this action shows a real how-to dialog rather than a door to nowhere.
   if (item && item.kind === 'setup-helper') { showHelperFixDialog(item); return; }
@@ -887,7 +889,7 @@ async function recoverSharedFolder(vaultId) {
   try { decision = await confirmMakePrivateDialog(entry.localFolder); } catch { decision = 'choose-different'; }
   if (decision !== 'make-private') { void showOrCreateWindow(); return; } // declined — nothing stripped
   const made = await recoverOwnerOnly(entry.localFolder, folderSecureIo());
-  if (made && made.ok) { if (syncScheduler) syncScheduler.requestSync(vaultId, { manual: true }); } // secured — retry this vault
+  if (made && made.ok) { if (syncScheduler) notifyTurnedAway(vaultId, syncScheduler.requestSync(vaultId, { manual: true })); } // secured — retry this vault (a retry the scheduler turns away says why)
   else {
     try {
       await dialog.showMessageBox(mainWindow, {
@@ -916,13 +918,34 @@ let manualHookPending = null;
 // one), and every dispatch gate stays fail-closed. So this asks for a run and lets the honest status
 // surface show waiting/syncing in turn — it never asserts that a sync "started".
 function syncVaultNow(vaultId) {
-  if (!syncScheduler) return;
+  if (!syncScheduler) return { accepted: false, reason: 'refused' };
   // Flip the glance to the current online state at the moment of the press, so a "Sync now" while offline
   // reads "waiting to reconnect" INSTANTLY rather than green-until-the-next-tick; the dispatch still gates
   // offline (no real run), and the completion answer says "can't reach the server".
   if (syncHub) syncHub.setOnline(isOnlineNow());
-  pendingManualSync.add(vaultId);
-  syncScheduler.requestSync(vaultId, { manual: true });
+  // The scheduler answers the REQUEST at once: a press inside the "Sync now" cooldown, or one against a door
+  // that is refusing and has had this window's attempt, is turned away without a run (nothing minted) — the
+  // caller shows that answer where the person pressed. Only an accepted press earns the completion toast;
+  // a turned-away press owes no second answer.
+  const verdict = syncScheduler.requestSync(vaultId, { manual: true });
+  if (verdict && verdict.accepted) pendingManualSync.add(vaultId);
+  return verdict;
+}
+
+// The answer a deliberate press earns when the scheduler turned the REQUEST away (a cooldown, or a refusing door's
+// spent window): one calm line with the wait, cred-free, best-effort. Nothing for an accepted press — its run answers.
+function notifyTurnedAway(vaultId, verdict) {
+  try {
+    if (!verdict || verdict.accepted !== false) return;
+    if (!Notification || !Notification.isSupported || !Notification.isSupported()) return;
+    let name = 'this vault';
+    try { const e = storedConfig().find((c) => c.vaultId === vaultId); if (e && e.vaultName) name = e.vaultName; } catch { /* name only */ }
+    const body = turnedAwayBody(verdict, name);
+    if (!body) return;
+    const n = new Notification({ title: 'DockVault', body });
+    n.on('click', () => { void showOrCreateWindow(); });
+    n.show();
+  } catch { /* notifications are best-effort */ }
 }
 
 // The completion answer a deliberate "Sync now" press earns — one notification, scoped to manual runs, so a
@@ -1113,7 +1136,12 @@ async function tickSync({ manual = false } = {}) {
   // lock->unlock cycle. Fail-quiet + idempotent; the one-time notification stays governed by the origin flag.
   try { const o = serverConfig.readServerOrigin(app.getPath('userData')); if (o && (!deviceMigrateSupport || deviceMigrateSupport.origin !== o)) void maybeOfferDeviceMigration(); } catch { /* best-effort */ }
   await runStateSnapshot.refresh(syncConfiguredIds()); // a failed refresh keeps it not-fresh → the scheduler skips
-  if (manual) { forgetFolderSearches(); for (const e of syncConfigList()) if (e && e.enabled) syncScheduler.requestSync(e.vaultId, { manual: true }); } // a deliberate press also looks afresh for a moved folder
+  // A deliberate pass (a folder just found again) also looks afresh for a moved folder. It is deliberate but it is
+  // NOT a person pressing each vault's button, so it is marked press:false: it neither starts nor is held by the
+  // "Sync now" cooldown (which belongs to the button), while the refusal back-off still bounds it like anything
+  // else. A vault it cannot run right now is simply picked up by the next routine tick — the folder is already
+  // saved — so these verdicts need no surface of their own.
+  if (manual) { forgetFolderSearches(); for (const e of syncConfigList()) if (e && e.enabled) syncScheduler.requestSync(e.vaultId, { manual: true, press: false }); }
   else syncScheduler.tickAll();
   // Complete any device grant that deferred at setup, now that this pass may find the vault open (the pass is
   // more frequent than the password-freshness window, so an open vault is never missed). Fire-and-forget and

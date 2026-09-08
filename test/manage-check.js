@@ -15,6 +15,8 @@
  *   G) the sender gate: a page at the interface root cannot read the model or act;
  *   H) a pushed sync status refreshes a card's state without reloading the model;
  *   I) a folder that cannot be found: the card says so and its "Find the folder…" asks main for the relocate offer.
+ *   J) a "Sync now" the scheduler turns away (its cooldown, or a server that is refusing this computer's sync
+ *      credentials) says so inline with the wait, restores the button, and leaves the card's real state alone.
  * Writes .local/manage-check.json and prints one PASS/FAIL line. Exit 0 = PASS.
  *
  *   node_modules/electron/dist/electron.exe test/manage-check.js
@@ -237,7 +239,34 @@ app.whenReady().then(async () => {
   // A card in a healthy state offers no such button.
   out.I_pass = out.I_pass && !(out.A_render.sections[0].cards[0].buttons.includes('Find the folder…'));
 
-  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
+  // J) a "Sync now" the scheduler turns away: the page says so, with the wait, and the button comes back
+  {
+    const answers = [
+      { accepted: false, reason: 'sync-cooldown', retryInMs: 30400 },
+      { accepted: false, reason: 'backing-off', retryInMs: 240000, cause: 'auth-failed' },
+    ];
+    const r = await scenario('J_turned_away', { ioSpec: { syncNow: (v) => { relocated.push(['syncNow', v]); return answers.shift(); } }, drive: async (win) => {
+      await ev(win, settle);
+      await ev(win, clickIn('Photos', 'Sync now'));
+      await sleep(250);
+      const cooldown = await ev(win, snapshot);
+      const btn1 = await ev(win, `(() => { const b = [...document.querySelectorAll('.card .actions > button')].find(x => x.textContent === 'Sync now'); return b ? { label: b.textContent, disabled: b.disabled } : null; })()`);
+      await ev(win, `(() => { const n = document.querySelector('.card .box'); if (n) n.remove(); return 'cleared'; })()`);
+      await ev(win, clickIn('Photos', 'Sync now'));
+      await sleep(250);
+      const backingOff = await ev(win, snapshot);
+      const tone = await ev(win, `(() => { const n = document.querySelector('.card .box'); return n ? n.className : null; })()`);
+      return { cooldown: cooldown.sections[0].cards[0], backingOff: backingOff.sections[0].cards[0], btn1, tone };
+    } });
+    const cd = r.cooldown.text; const bo = r.backingOff.text;
+    out.J_pass = cd.includes('was used a moment ago') && cd.includes('31 seconds') && cd.includes('regular schedule')
+      && bo.includes('refusing this computer') && bo.includes('4 minutes') && bo.includes('sign in or enter the vault password')
+      && r.btn1 && r.btn1.label === 'Sync now' && r.btn1.disabled === false   // the button is usable again
+      && r.cooldown.state === 'Up to date' && r.backingOff.state === 'Up to date' // the card's real state is untouched
+      && r.tone === 'box'; // a calm note, not the red refusal box
+  }
+
+  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
   out.ok = KEYS.every((k) => out[`${k}_pass`] === true);
   clearTimeout(watchdog);
   dump();

@@ -26,6 +26,7 @@ const RESULT = Object.freeze({
   NEEDS_RESYNC: 'needs-resync',                      // missing prior listing / critical error; resync required
   HOST_KEY_MISMATCH: 'host-key-mismatch',            // pinned != presented (MITM signal) — block, no auto-TOFU
   AUTH_FAILED: 'auth-failed',                        // SFTP auth refused (e.g. a lapsed credential) — sign-in-needed
+  CHANNEL_REFUSED: 'channel-refused',                // the door answered but refused the session channel (a spent credential, a limit, a busy server)
   CONNECT_FAILED: 'connect-failed',                  // the SFTP door could not be reached at all (refused / timed out / no such host)
   PATH_TOO_LONG: 'path-too-long',                    // a file skipped for OS path length — surface which one
   ERROR: 'error',                                    // any other non-zero exit
@@ -52,6 +53,13 @@ const SIG = Object.freeze({
   // SFTP authentication refused — the ssh handshake got past host-key verification but auth failed (e.g. a
   // lapsed/rotated temp-cred): "ssh: unable to authenticate, attempted methods [none password] ...".
   authFailed: /unable to authenticate|no supported methods remain|permission denied \(publickey,?password/i,
+  // The server ANSWERED and then refused the session channel — the door's other way of turning this computer
+  // away: a spent single-use credential, a credential or attempt limit, or simply a server with no session slots
+  // left. The Go ssh library prefixes every channel-open rejection with this one literal ("ssh: rejected:
+  // administratively prohibited (open failed)" / "... resource shortage"), so the signature is exactly that
+  // prefix. It is its OWN result, not an auth failure: the scheduler backs off from both alike, but only a real
+  // auth failure may go on to ask for a sign-in — a busy server must never be answered with "sign in again".
+  channelRefused: /ssh: rejected:/i,
   // The door could not be reached: "NewFs: couldn't connect SSH: dial tcp host:port: connectex: … actively refused
   // it." / "… i/o timeout" / "dial tcp: lookup host: no such host". Tested AFTER the mismatch and auth signatures:
   // rclone wraps both of those in the same "couldn't connect SSH" prefix, and each has its own honest state.
@@ -75,6 +83,7 @@ function classifyConnectionFailure(stdout, stderr) {
   const text = haystack(stdout, stderr);
   if (SIG.hostKeyMismatch.test(text)) return RESULT.HOST_KEY_MISMATCH;
   if (SIG.authFailed.test(text)) return RESULT.AUTH_FAILED;
+  if (SIG.channelRefused.test(text)) return RESULT.CHANNEL_REFUSED;
   if (SIG.connectFailed.test(text)) return RESULT.CONNECT_FAILED;
   return null;
 }
@@ -93,6 +102,8 @@ function classifyBisyncOutcome(o) {
   // A connection-level auth failure (e.g. a credential that lapsed mid-run): surface it as its own state so
   // the status layer can prompt sign-in, and leave the resync baseline untouched. Fail-closed, never silent.
   if (SIG.authFailed.test(text)) return { result: RESULT.AUTH_FAILED, resyncRequired: null, needsAttention: true };
+  // The door answered and refused the channel — a refusal, but never an account matter: its own typed result.
+  if (SIG.channelRefused.test(text)) return { result: RESULT.CHANNEL_REFUSED, resyncRequired: null, needsAttention: true };
   if (SIG.excessiveDelete.test(text)) return { result: RESULT.ABORT_EXCESSIVE_DELETE, resyncRequired: true, needsAttention: true };
   // A different safety abort than the delete cap — all files on one side read as changed. Must NOT be labelled as
   // a large DELETE (its own honest status); still a fail-closed abort requiring a deliberate resync.

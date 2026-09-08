@@ -48,6 +48,9 @@ function bodyForConditionReason(reason, name) {
     // one thing that helps: Troubleshoot checks the saved server and SFTP address separately.
     case 'sync-server-unreachable': return `${name} can't sync: the sync server can't be reached right now. Open DockVault and run Troubleshoot to check the address.`;
     case 'sync-server-unverified': return `${name} can't sync: what's at the sync server address isn't answering as a sync server. Open DockVault and run Troubleshoot to check it.`;
+    // The server answered and refused the sync connection. Deliberately promises no remedy the person can carry
+    // out — it is the server's side — and never a sign-in, which this state is not.
+    case 'sync-server-refusing': return `${name} couldn't sync: the sync server is refusing this computer's sync connections right now. DockVault will try again, less often, until it stops.`;
     case 'helper-not-ready':
       // The sync helper (rclone) isn't ready — a NON-retrying must-act (a wrong/missing/blocked binary, or one
       // that won't start), so NEVER the calm "try again in a moment" that would tell a different story than the
@@ -107,6 +110,9 @@ function manualCompletionBody(ev, name) {
 
   // paused / refused / skipped: a run did not happen. A choice the person made themselves earns no toast.
   if (reason === 'consent-declined') return { silent: true };
+  // The vault's door is refusing this computer's credentials and this wait's one attempt is already spent, so the
+  // dispatch stopped before minting. Same sentence as a press turned away at the request — one source, one story.
+  if (reason === 'backing-off') return { body: turnedAwayBody({ accepted: false, reason: 'backing-off', retryInMs: ev && ev.retryInMs }, name) };
   const cond = conditionForReason(phase, reason);
   if (cond) return { body: bodyForConditionReason(cond.reason, name) };
   // Reasons conditionForReason leaves null — the global signals carry the glance for these — still owe a manual
@@ -119,4 +125,30 @@ function manualCompletionBody(ev, name) {
   }
 }
 
-module.exports = { manualCompletionBody, bodyForConditionReason };
+// A wait in words a person can act on: whole seconds under a minute and a half, else whole minutes rounded up.
+function waitWords(ms) {
+  const sec = Math.max(1, Math.ceil((Number(ms) || 0) / 1000));
+  if (sec < 90) return sec === 1 ? '1 second' : `${sec} seconds`;
+  const min = Math.ceil(sec / 60);
+  return `about ${min === 1 ? '1 minute' : `${min} minutes`}`;
+}
+
+/**
+ * The one line a deliberate press earns when the scheduler turns the REQUEST away before any run (its verdict
+ * { accepted:false, reason, retryInMs }): a press inside the "Sync now" cooldown, or one against a door that is
+ * refusing this computer's credentials and has had this window's attempt. Honest about the wait, and — for the
+ * refusal — that the state already shown is what to act on: signing in or entering the vault password, when the
+ * status asks for it, lets DockVault try at once; otherwise waiting is what helps, not a fresh credential.
+ * Returns null for an accepted verdict (nothing to say yet: the run's own outcome is the answer).
+ */
+function turnedAwayBody(verdict, name) {
+  if (!verdict || verdict.accepted !== false) return null;
+  const wait = waitWords(verdict.retryInMs);
+  switch (verdict.reason) {
+    case 'sync-cooldown': return `${name} was asked to sync a moment ago — you can ask again in ${wait}. Changes are still picked up on the regular schedule.`;
+    case 'backing-off': return `The sync server is refusing this computer's sync credentials for ${name}, so DockVault is waiting before it tries again (${wait}). If its status asks you to sign in or enter the vault password, doing that lets it try at once.`;
+    default: return `${name} couldn't be asked to sync just now. Try again in a moment.`;
+  }
+}
+
+module.exports = { manualCompletionBody, bodyForConditionReason, turnedAwayBody, waitWords };

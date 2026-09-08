@@ -38,6 +38,9 @@ const REASON_DETAIL = Object.freeze({
   // The sync server (the SFTP address) can't be reached, or what answers there isn't a sync server. Worded so it
   // reads honestly whether calm (a laptop that woke before its network) or, once it persists, a must-act.
   'sync-server-unreachable': "the sync server can't be reached right now",
+  // The server answered and refused this computer's sync connection (a turned-away credential, or no session
+  // slot free). A wait, not an action: DockVault is already spacing out its tries.
+  'sync-server-refusing': "the sync server is refusing this computer's sync connections right now",
   'sync-server-unverified': "what's at that address isn't answering as a sync server",
   // The saved sync state exists but cannot be unlocked/opened on this machine. Lead with reassurance —
   // the person's actual files are never touched by this — because a bare "sync problem" over an unreadable

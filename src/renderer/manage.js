@@ -154,9 +154,24 @@
     busy = false;
   }
 
+  // A wait, in words a person can act on: whole seconds under a minute and a half, else whole minutes rounded up.
+  function waitWords(sec) {
+    const n = Math.max(1, Math.ceil(Number(sec) || 0));
+    if (n < 90) return n === 1 ? '1 second' : n + ' seconds';
+    const m = Math.ceil(n / 60);
+    return 'about ' + (m === 1 ? '1 minute' : m + ' minutes');
+  }
+
   function failureText(reason, action) {
     const what = action && action.kind === 'sync-now' ? 'start a sync' : 'make that change';
     switch (reason) {
+      // "Sync now" was used a moment ago: the scheduler turned this press away without a run, and says when the
+      // next is allowed. Changes are not lost — the regular schedule still picks them up.
+      case 'cooldown': return '"Sync now" was used a moment ago. It is available again in ' + waitWords(action && action.retryInSec) + ' — changes are still picked up on the regular schedule.';
+      // The server is refusing this computer's sync credentials and this wait's one try is spent: honest about the
+      // wait, and that the state already on the card is what to act on (a sign-in or the vault password lets it try
+      // at once); a fresh credential is not the fix — each try is what the server is limiting.
+      case 'backing-off': return "The sync server is refusing this computer's sync credentials, so DockVault is waiting before it tries again (" + waitWords(action && action.retryInSec) + '). If the status above asks you to sign in or enter the vault password, doing that lets it try at once.';
       case 'not-found': return 'The server no longer lists that, so there was nothing to change here. Refresh to see the current state.';
       case 'auth': case 'no-session': return 'Your sign-in has ended. Open DockVault and sign in, then try again.';
       case 'network': return "Couldn't reach the server, so nothing was changed. Check your connection and try again.";
@@ -177,8 +192,9 @@
       if (r && r.ok) return;
       btn.disabled = false; btn.textContent = 'Sync now';
       const s = stateOf(v.local); setChip(card, s);
-      const note = el('div', 'box bad'); note.appendChild(para(failureText((r && r.reason) || 'refused', { kind: 'sync-now' })));
-      card.appendChild(note); setTimeout(() => note.remove(), 6000);
+      const waiting = r && (r.reason === 'cooldown' || r.reason === 'backing-off');
+      const note = el('div', waiting ? 'box' : 'box bad'); note.appendChild(para(failureText((r && r.reason) || 'refused', { kind: 'sync-now', retryInSec: r && r.retryInSec })));
+      card.appendChild(note); setTimeout(() => note.remove(), waiting ? 9000 : 6000);
     }).catch(() => { btn.disabled = false; btn.textContent = 'Sync now'; });
   }
   function setChip(card, s) {
