@@ -38,10 +38,13 @@ Installers are produced by the `Build installers` workflow (see below) and attac
 
 - Windows: `DockVault-<version>-win-x64.exe` — a one-click installer with no questions and no
   administrator prompt. It installs under `%LOCALAPPDATA%\Programs\dockvault-desktop` for the current Windows user only (other people on this PC
-  install it separately) and starts DockVault when it finishes. Uninstalling removes the program
-  and its start-at-login entry; your synced files stay in their folders and the app's data stays
-  in `%APPDATA%\dockvault-desktop`, so this computer's registration and sync state survive a
-  reinstall. Delete that folder yourself if you want it gone.
+  install it separately) and starts DockVault when it finishes. Installing a newer one over it
+  upgrades it in place, in the same folder and under the same entry in Installed apps — never a
+  second copy beside the first. Uninstalling removes the program and its start-at-login entry;
+  your synced files always stay in their folders. It offers one unticked box, **Also delete
+  DockVault's settings and this computer's sync registration**: leave it alone and the app's data stays in
+  `%APPDATA%\dockvault-desktop`, so this computer's registration and sync state survive a
+  reinstall; tick it and that folder goes too, and a reinstall sets this computer up from scratch.
 - macOS: `DockVault-<version>-mac-arm64.dmg` (Apple silicon) or `DockVault-<version>-mac-x64.dmg`
   (Intel) — drag DockVault into Applications.
 - Linux: `DockVault-<version>-linux-x64.AppImage` (make it executable and run it) or

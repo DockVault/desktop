@@ -136,8 +136,10 @@ module.exports = {
   // Windows: a one-click NSIS installer that installs for the current user only and never asks for
   // elevation. One-click deliberately: the assisted installer would show an "anyone who uses this
   // computer / only me" page whose first choice dead-ends without administrator rights, and a
-  // tray app has no reason to ask where it lives. Uninstalling keeps the app's data (the encrypted
-  // session and sync state) and removes the start-at-login entry; see build/installer.nsh.
+  // tray app has no reason to ask where it lives. Installing over an existing one upgrades it in
+  // place. Uninstalling removes the start-at-login entry and, BY DEFAULT, keeps the app's data (the
+  // encrypted session and this computer's sync registration) — deleting that is offered as one
+  // unticked box on the uninstaller, never a side effect; see build/installer.nsh.
   win: {
     target: [{ target: 'nsis', arch: ['x64'] }],
     artifactName: '${productName}-${version}-win-${arch}.${ext}',

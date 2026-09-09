@@ -38,8 +38,20 @@ test('the Windows uninstaller removes exactly the login item the app registers',
 test('the uninstaller names the real data folder, which follows the package name', () => {
   const nsh = fs.readFileSync(path.join(root, 'build', 'installer.nsh'), 'utf8');
   const { name } = require(path.join(root, 'package.json'));
-  // Electron derives the user-data folder from the package name; the note must point at that folder.
-  assert.ok(nsh.includes(`$APPDATA\\${name}`), `uninstall note names $APPDATA\\${name}`);
+  // Electron derives the user-data folder from the package name. The hook used to spell that folder
+  // out, which meant a rename of the package would leave the uninstaller pointing at, and offering to
+  // delete, a folder that no longer existed. It now goes through the define electron-builder fills
+  // from that same package name (-DAPP_PACKAGE_NAME), so the two cannot drift apart — and this asserts
+  // there is no hand-copied name left to drift.
+  const targets = [...nsh.matchAll(/\$APPDATA\\(\$\{APP_PACKAGE_NAME\}|[^"\s\\]+)/g)].map((m) => m[1]);
+  assert.ok(targets.length > 0, 'the uninstaller says something about the data folder');
+  assert.deepEqual([...new Set(targets)], ['${APP_PACKAGE_NAME}'], 'every mention goes through the define');
+  // What this last line does NOT do is prove the define equals the package name. That link is
+  // electron-builder's — it passes -DAPP_PACKAGE_NAME from the app's name, which is this field —
+  // and is not ours to assert. What it pins is the literal the rest of the repo spells out: the
+  // folder the app really writes to, and the one the README tells people about. A rename then has
+  // to be a deliberate edit here rather than a silent divergence.
+  assert.equal(name, 'dockvault-desktop');
 });
 
 test('the login-item name is a plain registry value name, and it is the app id Electron reads it under', () => {
