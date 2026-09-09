@@ -192,10 +192,13 @@ test('the workflow that builds the installers supplies the stamp the build confi
   assert.match(builder, /stampMetadata\(\{ commit: process\.env\.DOCKVAULT_BUILD_COMMIT/);
   // The commit stamped is the one this job checked out, never a value from anywhere else.
   assert.match(yml, /COMMIT: \$\{\{ github\.sha \}\}/);
-  // One date for the whole RUN, not each runner's own clock: three legs of one commit crossing
-  // midnight UTC must not ship installers claiming two different days.
-  assert.match(yml, /STARTED: \$\{\{ github\.run_started_at \}\}/);
-  assert.ok(!/date -u/.test(yml), 'no per-leg clock read');
+  // The DATE is deliberately not asserted here any more. What stood in this place was
+  //     assert.match(yml, /STARTED: \$\{\{ github\.run_started_at \}\}/);
+  // and it passed for as long as the workflow was broken, because it pinned the broken expression:
+  // `github.run_started_at` is not a property of the `github` context, so it rendered empty and every
+  // leg refused to build. Matching source text cannot tell whether a value arrives, so the question is
+  // asked where it can be answered — test/build-date-source.test.js traces the date to a producing job
+  // and RUNS that job's script, and runs the guard below against dates that did and did not arrive.
   // And it is exported BEFORE the build step that consumes it.
   assert.ok(yml.indexOf('DOCKVAULT_BUILD_COMMIT=') < yml.indexOf('- name: Build installers'), 'stamped before the build runs');
 });
@@ -205,11 +208,12 @@ test('the workflow that builds the installers supplies the stamp the build confi
 // not start a build it cannot stamp, and it will not hand on a build the stamp did not reach.
 test('the workflow refuses to build without a stamp, and refuses a build the stamp did not reach', () => {
   const yml = fs.readFileSync(path.join(root, '.github', 'workflows', 'build-installers.yml'), 'utf8');
-  // Before: the values must be a commit and a date, checked whole (which also keeps a newline out of
-  // the $GITHUB_ENV writes, where one would define variables of its own).
-  assert.match(yml, /if \[\[ ! "\$COMMIT" =~ \^\[0-9a-f\]\{7,40\}\$ \]\]; then/);
-  assert.match(yml, /if \[\[ ! "\$built" =~ \^\[0-9\]\{4\}-\[0-9\]\{2\}-\[0-9\]\{2\}\$ \]\]; then/);
-  assert.equal((yml.match(/refusing to build/g) || []).length, 2);
+  // Before: the values must be a commit and a date. NOT asserted here any more — what stood here was
+  // the two `if [[ ... ]]` patterns copied out as regexes plus a count of the string "refusing to
+  // build", and all three were shape: they restated the guard's source instead of asking whether it
+  // refuses. The count was the clearest case — adding a THIRD refusal to the workflow broke it, though
+  // nothing had got worse. test/build-date-source.test.js lifts these guards out of the YAML and runs
+  // them against values that are empty, malformed, or carrying a second line.
   // After: the packaged app must really carry it, and the check must run before the artifacts leave.
   const check = yml.indexOf('- name: Check the packaged app really carries the stamp');
   assert.ok(check > yml.indexOf('- name: Build installers'), 'checked after the build');

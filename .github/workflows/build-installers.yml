@@ -22,8 +22,41 @@ permissions:
   contents: read
 
 jobs:
+  # ONE date for every leg, read once, HERE. The three build legs are separate machines started at
+  # slightly different moments, and a run crossing midnight UTC would otherwise ship Windows, macOS and
+  # Linux installers of ONE commit claiming two different days. A job output is a single value the legs
+  # consume; three reads of three clocks would only usually agree, and the day they did not is exactly
+  # the day it would matter.
+  #
+  # This replaces `${{ github.run_started_at }}`, which is NOT a property of the `github` expression
+  # context — it exists only in the REST API's payload for a run. It rendered as the empty string, the
+  # date guard below refused, and all three legs failed. That is the trap worth naming: an expression
+  # naming something the context does not have is not an error, it is "", so the fix is to take the
+  # value from something that demonstrably WRITES it. There is no guard here; the one guard lives where
+  # the value is USED, so that a date which fails to arrive is caught in the leg that would have
+  # stamped it, however it came to be missing.
+  build_date:
+    name: Date this build
+    runs-on: ubuntu-latest
+    outputs:
+      date: ${{ steps.today.outputs.date }}
+    steps:
+      - name: Read the build date once, for all three legs
+        id: today
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Checked HERE as well as at the point of use, because `set -e` would not catch it: if the
+          # clock read failed, `echo "date=$(date -u +%F)"` still exits 0 and this job would go GREEN
+          # publishing an empty date. The legs would then refuse correctly — but only after three
+          # runners had each spent a few minutes installing dependencies to find that out.
+          built=$(date -u +%F)
+          [ -n "$built" ] || { echo "::error::refusing to build: the clock could not be read"; exit 1; }
+          echo "date=$built" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.name }}
+    needs: build_date
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -61,18 +94,17 @@ jobs:
       # shaped by a shell; electron-builder.js reads them and bakes them into the app's metadata.
       #
       # `github.sha` is the commit this job checked out, so the stamp can never name a different one.
-      # The date comes from when the RUN started, not from each runner's own clock: the three legs are
-      # separate machines started at slightly different moments, and a run crossing midnight UTC would
-      # otherwise ship Windows, macOS and Linux installers of ONE commit claiming two different days.
+      # The date is not read here at all: it is handed down from the `build_date` job above, so all
+      # three legs stamp one value rather than each reading its own clock. See that job for why.
       - name: Stamp this build with its commit and date
         id: stamp
         shell: bash
         env:
           COMMIT: ${{ github.sha }}
-          STARTED: ${{ github.run_started_at }}
+          BUILT: ${{ needs.build_date.outputs.date }}
         run: |
           set -euo pipefail
-          built=${STARTED:0:10}
+          built="$BUILT"
           # Refuse to build rather than build something that cannot say what it is. Without this the
           # stamp would fail SILENTLY: electron-builder.js drops a malformed value, so an empty COMMIT
           # would ship installers that tell their owner they carry no commit, from a green pipeline run.
