@@ -20,7 +20,7 @@
 const path = require('node:path');
 const { LOGIN_ITEM_NAME } = require('./app-identity');
 
-function createLoginItem({ app, platform, fs, homeDir, env = {}, execPath, desktopName = 'dockvault.desktop', productName = 'DockVault' }) {
+function createLoginItem({ app, platform, fs, homeDir, env = {}, execPath, isPortable = false, desktopName = 'dockvault.desktop', productName = 'DockVault' }) {
   const autostartDir = path.join(homeDir || '', '.config', 'autostart');
   const autostartFile = path.join(autostartDir, desktopName);
   // The command the desktop runs at login: the AppImage itself when running from one, else this executable.
@@ -83,7 +83,28 @@ function createLoginItem({ app, platform, fs, homeDir, env = {}, execPath, deskt
     return isEnabled();
   }
 
-  return { isEnabled, setEnabled, autostartFile };
+  // A PORTABLE copy registers nothing and reports nothing, whoever asks and however they ask.
+  //
+  // The guard belongs HERE and not only on the launch path, which is where it was first put. The
+  // tray's "Start at login" switch is a different path to the same registry value, and a person who
+  // ticks it is asking just as much as a first launch is. The value name is the application id — the
+  // same for every copy of DockVault — so a portable copy ticking that box overwrites the INSTALLED
+  // app's entry and points it at the temporary folder the launcher deletes when the run ends. The
+  // installed app then stops starting at login, aimed at nothing, and its own switch reads "off"
+  // because the value no longer names it. On a machine with no install it is orphaned for good.
+  //
+  // Reporting false rather than the real registration is deliberate: a portable copy that read back
+  // the INSTALLED app's registration would show a ticked box for something it does not own and did
+  // not do, and the obvious next move — untick it — would be the same damage by another route.
+  //
+  // `canChange` is the same fact asked a different way, for callers that do more than flip the switch. The
+  // tray's toggle also RECORDS the person's choice in the app's data folder, and that write is not covered by
+  // refusing setEnabled: a portable click was refused by the line above and still left a
+  // login-item.json saying {"startAtLogin":true} behind it - a stored preference nothing honours, which the
+  // next reader has to work out. Callers ask this before doing anything at all.
+  if (isPortable) return { isEnabled: () => false, setEnabled: () => false, canChange: () => false, autostartFile };
+
+  return { isEnabled, setEnabled, canChange: () => true, autostartFile };
 }
 
 /*
@@ -121,8 +142,20 @@ function createLoginChoiceStore({ fs, dir }) {
 
 // What an installed app does at launch, from the stored choice alone. Development runs never register,
 // and only a genuinely ABSENT choice (null) may register: an unreadable one is not "no choice".
-function decideOnLaunch({ storedChoice, isPackaged }) {
+function decideOnLaunch({ storedChoice, isPackaged, isPortable = false }) {
   if (!isPackaged) return { register: false, notify: false, store: null };
+  // A PORTABLE run never registers and never announces itself, and this is not a nicety.
+  // Registration is keyed on the application id, which is the same string for every copy of
+  // DockVault, so a portable run would overwrite the INSTALLED app's start-at-login entry — and
+  // point it at its own executable, which lives in a temporary folder that is deleted the moment
+  // the portable run ends. The installed app would then silently stop starting at login, aimed at
+  // a path that no longer exists, and its own switch would read "off" because the value no longer
+  // names it. On a machine with no install at all, the entry would simply be left behind forever:
+  // nothing removes it, because the thing that removes it is an uninstaller that will never run.
+  // A portable build is supposed to leave nothing behind, and this is the largest thing it could.
+  // The notification is suppressed for the same reason — it says "DockVault is installed" and
+  // "It starts when you sign in", neither of which is true of a build that was not installed.
+  if (isPortable) return { register: false, notify: false, store: null };
   if (storedChoice === null) return { register: true, notify: true, store: true };
   return { register: false, notify: false, store: null };
 }

@@ -1,8 +1,10 @@
 name: Build installers
 
-# Produces the platform installers: a .dmg per architecture for macOS, an NSIS .exe for Windows,
-# and an AppImage plus .deb for Linux. Runs on demand (installers kept as workflow artifacts) and on
-# version tags, where the installers are also attached to the GitHub release for that tag.
+# Produces the platform builds: a .dmg per architecture for macOS, TWO Windows .exe files — the
+# NSIS installer and a portable build that runs without installing — and an AppImage plus .deb for
+# Linux. Runs on demand (everything kept as workflow artifacts) and on
+# version tags, where they are also attached to the GitHub release for that tag — the portable
+# Windows build included, since a person choosing a download may want the one that installs nothing.
 #
 # Signing is driven entirely by repository secrets. When they are absent the artifacts are
 # produced UNSIGNED and the job summary says so; nothing in this workflow or the repository holds a
@@ -218,6 +220,24 @@ jobs:
       - name: List artifacts
         shell: bash
         run: ls -l dist | grep -Ev "\.(yml|yaml|blockmap)$" || true
+
+      # The Windows leg produces TWO .exe files and both are wanted: the installer, and the portable
+      # build that runs without installing. `dist/*.exe` collects both — named separately by the build
+      # config so neither can overwrite the other — and the check below refuses to upload a Windows
+      # leg that somehow produced only one of them, since a silently missing portable build would look
+      # exactly like a successful run.
+      - name: Check both Windows artifacts exist
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          portable=$(find dist -maxdepth 1 -name '*-portable.exe' | wc -l | tr -d '[:space:]')
+          installer=$(find dist -maxdepth 1 -name '*.exe' -not -name '*-portable.exe' | wc -l | tr -d '[:space:]')
+          echo "installer: $installer, portable: $portable"
+          if [ "$installer" -lt 1 ] || [ "$portable" -lt 1 ]; then
+            echo "::error::the Windows leg must produce both an installer and a portable build"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

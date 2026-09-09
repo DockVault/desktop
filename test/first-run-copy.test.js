@@ -33,4 +33,19 @@ test('the login-item checkbox shows exactly the state it is given, and only a tr
   assert.deepEqual(loginItemMenu(false), { label: 'Start at login', type: 'checkbox', checked: false });
   assert.equal(loginItemMenu(undefined).checked, false);
   assert.equal(loginItemMenu('yes').checked, false);
+
+  // A PORTABLE RUN GETS IT DISABLED, WITH THE REASON. The write guard that stops a portable copy touching
+  // the registration is correct and stays — but on its own it left this box drawn, clickable, and inert:
+  // the click was refused, the tick never appeared, and nothing said why. Hiding it would raise a different
+  // question ("where did Start at login go?"); disabled with a reason answers it instead.
+  const portable = loginItemMenu(false, true);
+  assert.equal(portable.enabled, false, 'not clickable in a portable run');
+  assert.equal(portable.checked, false);
+  assert.match(portable.label, /portable/i, 'and the label says why it is off');
+  // Even if the OS somehow reports a registration, a portable copy does not own it and must not claim to.
+  assert.equal(loginItemMenu(true, true).checked, false);
+  assert.equal(loginItemMenu(true, true).enabled, false);
+  // An installed run is untouched by this — it is still a working switch.
+  assert.notEqual(loginItemMenu(true, false).enabled, false);
+  assert.equal(loginItemMenu(true, false).checked, true);
 });

@@ -545,7 +545,30 @@ function installedNotification(platform, registered = true) {
 
 // The tray's "Start at login" checkbox. `enabled` MUST be the platform's real registration read at menu-build
 // time (login-item.js isEnabled), never a remembered preference, so the box can never disagree with the machine.
-function loginItemMenu(enabled) {
+/**
+ * The "Start at login" switch, as the machine really has it.
+ *
+ * A PORTABLE RUN GETS IT DISABLED, WITH THE REASON IN THE LABEL. The write guard that keeps a portable copy
+ * from touching the registration is correct and stays — but on its own it made this box a control that does
+ * nothing: a person clicked it, the click was refused, the tick never appeared, and nothing said why. Worse
+ * than that, the click still left a `login-item.json` behind in the portable data folder saying
+ * `{"startAtLogin":true}`, so the app had a record of a preference it had deliberately not honoured.
+ *
+ * Not hidden, because the absence of a switch someone has used before reads as a bug or a missing feature.
+ * Disabled with a reason answers the question instead of raising it.
+ *
+ * @param {boolean} enabled     whether the OS really has a registration for this app
+ * @param {boolean} [isPortable] a portable run cannot own one
+ */
+function loginItemMenu(enabled, isPortable = false) {
+  if (isPortable) {
+    return {
+      label: 'Start at login — not for a portable copy',
+      type: 'checkbox',
+      checked: false,
+      enabled: false,
+    };
+  }
   return { label: 'Start at login', type: 'checkbox', checked: enabled === true };
 }
 

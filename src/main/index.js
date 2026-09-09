@@ -30,6 +30,7 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, session, clipboard, dialog, safeStorage, powerMonitor, Notification, shell } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const { execFile } = require('node:child_process');
 const { net } = require('electron'); // OS-connectivity read for the sync scheduler's online gate (no network request)
 const { APP_ORIGIN } = require('./config');
@@ -48,6 +49,7 @@ const vaultSpace = require('./vault-space');
 const trayPresentation = require('./tray-presentation');
 const rcloneBundle = require('./rclone-bundle');
 const { APP_ID } = require('./app-identity');
+const portable = require('./portable');
 const buildStamp = require('./build-stamp');
 const loginItemMod = require('./login-item');
 const serverProbe = require('./server-probe');
@@ -190,6 +192,60 @@ app.disableHardwareAcceleration();
 // shortcuts, so the taskbar groups the running window with its shortcut and attributes notifications
 // to DockVault. (This is separate from app.name, which decides where the app's data lives.)
 if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
+
+// A PORTABLE run keeps its own data, and it has to be told so HERE — before the single-instance lock
+// below, which lives inside the data folder, and before anything else reads that path. Electron works
+// the folder out from the app's name, so a portable build sitting in a Downloads folder would
+// otherwise open the SAME data as an installed DockVault: its device identity, its session, its sync
+// state, its database, possibly while the installed one is running against them. Doing it before the
+// lock is also what lets the two be open at once rather than the portable one handing over to the
+// installed app and vanishing. An ordinary run passes straight through: nothing here applies without
+// the launcher's own variable. See portable.js for where it puts the folder and why.
+const portableRun = portable.applyDataDir(app, {
+  env: process.env, fs,
+  localAppData: process.env.LOCALAPPDATA || null,
+  platform: process.platform,
+  isPackaged: app.isPackaged,
+  // NOTE: no temp folder is passed, and none should be added. Three rounds of this decision anchored on
+  // an environment-derived path and each time handed the anchor to whoever set the variables — the last
+  // of them on os.tmpdir(), which is itself TEMP || TMP || SystemRoot\temp. See portable.js.
+  // What an ORDINARY run's folder would be. Asked of ELECTRON, not of the environment: %APPDATA% is
+  // not what Electron uses — set it to a bogus path and getPath('appData') still returns the real
+  // Roaming folder, so anchoring on the variable meant the guard that keeps a portable run out of the
+  // installed profile could be pointed at a folder that is not the installed profile. Asking for
+  // 'appData' creates nothing (it is an existing shell folder); it is 'userData' that Electron makes
+  // when asked, which is the one this deliberately does not touch. The variable is only a fallback.
+  appName: (() => { try { return app.getName(); } catch { return null; } })(),
+  roamingDir: (() => { try { return app.getPath('appData'); } catch { return process.env.APPDATA || null; } })(),
+});
+// A run that was TOLD it was portable and decided otherwise is never an ordinary run, and until now it
+// left no trace anywhere: portableLaunch computes `why` for exactly this purpose and nothing read it.
+// Both isolation defects found in review landed as complete silence — the app opened the installed
+// profile and nothing was logged, shown, or recorded — so the next one should at least be findable.
+// Not an error box: a demotion is not a refusal to start, and the ordinary run that follows is safe.
+// The decision to say it, and the saying, both live in portable.js so that "is a demotion actually
+// reported?" can be asked by a test rather than inferred from this line. Reading source could only see that
+// the reason was READ — which is equally true of a value computed and dropped.
+portable.reportDemotion(portableRun, (line) => console.warn(line));
+if (portableRun.portable && !portableRun.applied) {
+  // It could not be given a folder of its own. The one thing it must not do is fall back to the
+  // installed app's, so it does not start — and it has to SAY so. A console line is not saying so:
+  // this is a windowed program launched from a silent stub, so nothing is attached to read it and
+  // the person would see an icon flash and vanish with no explanation anywhere. showErrorBox is one
+  // of the few things that works before the app is ready, which is where this has to happen.
+  const why = portableRun.refused || 'its data folder could not be set up';
+  try {
+    dialog.showErrorBox('DockVault cannot start from here', [
+      `The portable DockVault needs a folder of its own to keep its settings in, and ${why}.`,
+      '',
+      "It will not use an installed copy's settings instead, so it has stopped rather than starting.",
+      '',
+      'Copy it somewhere you can write to — your Downloads or Desktop folder — and run it again.',
+    ].join('\n'));
+  } catch { /* if even that is unavailable, the exit code is all there is */ }
+  try { console.error(`[dockvault] portable start refused: ${why}`); } catch { /* ignore */ }
+  app.exit(1);
+}
 
 // The scheme must be registered before the 'ready' event.
 schemeMod.registerPrivileged();
@@ -847,7 +903,10 @@ function buildTrayMenu(items, model, migration = null) {
     : { label: 'Lock now', click: () => { if (lockState) void lockState.lock('manual').catch(() => { /* state machine surfaces lock-error */ }); } });
   // Start-at-login as the machine sees it right now (login-item.js reads the real registration on every
   // build of this menu), so the box can never disagree with what will actually happen at login.
-  template.push({ ...trayPresentation.loginItemMenu(loginItem().isEnabled()), click: () => toggleLoginItem() });
+  // A portable run gets this disabled rather than drawn-and-inert: the write guard already refuses to touch
+  // the registration, so without this the box was a control that could be clicked, never ticked, and never
+  // explained — while still recording the refused preference in the portable data folder.
+  template.push({ ...trayPresentation.loginItemMenu(loginItem().isEnabled(), portableRun.portable), click: () => toggleLoginItem() });
   template.push(
     { type: 'separator' },
     // Which build this is. In the tray rather than only in a window, because the question is asked
@@ -3258,6 +3317,9 @@ function loginItem() {
   if (!loginItemInstance) {
     loginItemInstance = loginItemMod.createLoginItem({
       app, platform: process.platform, fs, homeDir: app.getPath('home'), env: process.env, execPath: process.execPath,
+      // A portable copy registers nothing, and the guard lives in the object so EVERY caller gets it -
+      // the tray switch as much as the first-launch registration. See login-item.js for why.
+      isPortable: portableRun.portable,
     });
   }
   return loginItemInstance;
@@ -3267,7 +3329,7 @@ function loginChoice() { return loginItemMod.createLoginChoiceStore({ fs, dir: a
 function maybeRegisterLoginItem() {
   try {
     const store = loginChoice();
-    const d = loginItemMod.decideOnLaunch({ storedChoice: store.read(), isPackaged: app.isPackaged });
+    const d = loginItemMod.decideOnLaunch({ storedChoice: store.read(), isPackaged: app.isPackaged, isPortable: portableRun.portable });
     if (!d.register) return;
     // The read-back, not the intent: a platform that refuses without throwing leaves it off, and the
     // notice then points at the switch rather than claiming it will start. The choice is stored either
@@ -3280,6 +3342,12 @@ function maybeRegisterLoginItem() {
 }
 
 function toggleLoginItem() {
+  // A portable run owns no registration and must not record a preference about one. The menu item is drawn
+  // disabled so this is not reachable by clicking, but the guard belongs here too: setEnabled was already
+  // refused by the login item itself, while the WRITE below went through regardless — leaving a
+  // login-item.json in the portable data folder claiming a start-at-login the app had deliberately refused
+  // to arrange. A stored preference nothing honours is a lie the next reader has to work out.
+  if (!loginItem().canChange()) return;
   try {
     const on = !loginItem().isEnabled();
     loginItem().setEnabled(on);

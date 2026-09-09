@@ -45,6 +45,24 @@ Installers are produced by the `Build installers` workflow (see below) and attac
   DockVault's settings and this computer's sync registration**: leave it alone and the app's data stays in
   `%APPDATA%\dockvault-desktop`, so this computer's registration and sync state survive a
   reinstall; tick it and that folder goes too, and a reinstall sets this computer up from scratch.
+- Windows, portable: `DockVault-<version>-win-x64-portable.exe` — the same app as one file that runs
+  with nothing installed. Useful for trying a particular build without installing it, or alongside an
+  installed DockVault. **It keeps its own data** and never uses, or disturbs, an installed copy's
+  settings, sign-in or sync registration: it starts as a computer the server has never seen, asks for
+  a server address like a fresh install, and does not register itself to start at login.
+  Its data goes in a folder beside the .exe named after it — `DockVault-1.2.3-portable.exe` keeps its
+  data in `DockVault-1.2.3-portable-data` — so two portable builds in one folder never collide, and each
+  keeps its own settings. Renaming the .exe starts it fresh; renaming it back finds the old data again.
+  Deleting the .exe and that folder removes everything it kept, with one exception worth knowing: the
+  first time it shows a notification, Windows records a small registry entry for it under
+  `HKCU\Software\Classes\CLSID`, and nothing removes that afterwards, because no uninstaller ever runs
+  for a portable copy. It is inert, it belongs to that copy alone, and it does not disturb an installed
+  DockVault. Run it from somewhere you can write to. If it can't write there — a
+  read-only stick, or a network share, which it will not write a device identity to — it falls back to
+  a `dockvault-portable-data-…` folder of its own under `%LOCALAPPDATA%`, named after the .exe that was
+  run so two copies never share one, and keeps working; worth knowing because that folder outlives the
+  .exe you deleted. If it can't write there either it shows a message and stops, rather than reaching
+  for an installed copy's data.
 - macOS: `DockVault-<version>-mac-arm64.dmg` (Apple silicon) or `DockVault-<version>-mac-x64.dmg`
   (Intel) — drag DockVault into Applications.
 - Linux: `DockVault-<version>-linux-x64.AppImage` (make it executable and run it) or

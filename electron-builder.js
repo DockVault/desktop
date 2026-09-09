@@ -141,10 +141,34 @@ module.exports = {
   // encrypted session and this computer's sync registration) — deleting that is offered as one
   // unticked box on the uninstaller, never a side effect; see build/installer.nsh.
   win: {
-    target: [{ target: 'nsis', arch: ['x64'] }],
+    // Two Windows artifacts from one packaged app: the installer, and a PORTABLE single .exe that
+    // runs with nothing installed. The portable one exists so a person can try one specific build
+    // with no install, no uninstall and no doubt about which build they are looking at — which is
+    // only true because a portable run keeps its own data folder beside itself rather than opening
+    // the installed app's (src/main/portable.js). Both targets pack the same app; only the wrapper
+    // around it differs.
+    target: [{ target: 'nsis', arch: ['x64'] }, { target: 'portable', arch: ['x64'] }],
     artifactName: '${productName}-${version}-win-${arch}.${ext}',
     files: forPlatform('win32-x64'),
     extraResources: rcloneResources('win32-x64', 'rclone.exe'),
+  },
+  // The portable build needs its OWN artifact name: both targets produce a .exe, and on the default
+  // name the second one written would overwrite the first, leaving one file whose identity depended
+  // on build order. The name says which it is, in the word a person would search for.
+  portable: {
+    artifactName: '${productName}-${version}-win-${arch}-portable.${ext}',
+    // unpackDirName is deliberately NOT set. It would give every build the SAME temporary unpack
+    // directory, and the launcher clears that directory before it extracts into it — so running one
+    // portable build while another was open would delete the files the running one is using. The
+    // default is a fresh id per build, which is exactly the isolation this artifact is for: two
+    // builds side by side is the use it exists to serve, not an edge case.
+    // NOTE ON THE ELEVATE HELPER, because it is not visible from here. `packElevateHelper: false`
+    // is set on the nsis section and CANNOT be repeated here — electron-builder's schema rejects it
+    // as a portable option outright (the build fails, which is how this was found). Both targets
+    // pack the same directory and the first one to reach it decides, so the helper stays out
+    // because `nsis` is listed FIRST in win.target above. That ordering is load-bearing rather than
+    // cosmetic, and a test pins it; swap the two and both artifacts would quietly gain a helper the
+    // installer explicitly refuses.
   },
   nsis: {
     oneClick: true,
