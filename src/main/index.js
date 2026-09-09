@@ -79,6 +79,8 @@ const { createSyncWizard } = require('./sync-wizard');
 const { createManageView } = require('./manage-view');
 const { createStatusView } = require('./status-view');
 const appMenu = require('./app-menu');
+const { WatchGate } = require('./watch-gate');
+const { createFolderWatch } = require('./folder-watch');
 const { createTroubleshoot } = require('./troubleshoot');
 const { verifySetup } = require('./setup-verify');
 const { deviceRemotePath } = require('./mint-path');
@@ -140,6 +142,7 @@ let autoLock = null;  // the automatic lock triggers (idle timer + OS suspend/sc
 let syncHub = null;   // the main-owned computed sync status (feeds the tray, notifications, channel)
 let manageReasonIo = null; // the Computers view's io, kept for composing the live card sentence (built lazily)
 let syncScheduler = null;
+let folderWatch = null; // near-live sync: a watcher per synced folder, feeding routine requests to the scheduler
 let mintPath = null;      // per-run credential-path choice (device identity vs account session), see mint-path.js
 // The scheduled rotation of this computer's sync identity (device-refresh.js): an hourly check that rotates once
 // the stored identity is old enough. Single-flight, online-only, never per mint.
@@ -1722,6 +1725,9 @@ function startSyncScheduler() {
     hasDeviceIdentity: deviceIdentityLive,
     isOnline: isOnlineNow, // the one online source — shared with the status hub's glance (tickSync setOnline)
     onEvent: (vaultId, ev) => {
+      // Tell the watcher when a run is in flight, so a sync's own writes are not read as a person's change.
+      // Without this the first successful sync starts a loop that never ends.
+      try { if (folderWatch && ev && ev.phase) folderWatch.noteEvent(vaultId, ev.phase); } catch { /* never break a run */ }
       // Stamp the run with the credential path it took, so the glance can say which kind of sync ran; and
       // once the run has ended in any way, forget the run's latched path so the next run decides afresh.
       if (ev && ev.phase === 'running') ev = { ...ev, via: mintPath.current(vaultId) };
@@ -1841,6 +1847,31 @@ function startSyncScheduler() {
     return (acc && acc.ok) ? { ...acc, via: 'account' } : acc;
   };
   syncScheduler = new SyncScheduler(io);
+
+  // NEAR-LIVE SYNC. A watcher per synced folder so an edit propagates in seconds rather than waiting out the
+  // poll. The poll is untouched and remains the backstop: everything here is an accelerator, and every way it
+  // can fail degrades to "the poll gets it in a few minutes".
+  //
+  // It asks with the ROUTINE request, exactly as the poll does. Not the deliberate-press path: that one reads
+  // and starts the "Sync now" cooldown, which exists to bound how often a PERSON can spend a credential, and a
+  // machine borrowing it would spend that allowance on their behalf. Everything the scheduler already refuses
+  // - settled holds, the per-vault back-off behind a refusing door, the endpoint gate - therefore applies to
+  // watching unchanged.
+  try {
+    const gate = new WatchGate();
+    folderWatch = createFolderWatch({
+      fs,
+      gate,
+      onDue: (vaultId) => { if (syncScheduler) syncScheduler.requestSync(vaultId, { manual: false }); },
+      onLog: (line) => { try { console.warn(line); } catch { /* a log must never break a sync */ } },
+      // Handed the configuration to re-read rather than hooked at each of the eight places it is written.
+      // A hook is something a future edit forgets, and the symptom of forgetting is a folder that is
+      // silently unwatched - which degrades to the poll, and so never announces itself as broken.
+      readConfig: () => storedConfig(),
+    });
+    folderWatch.reconcile(storedConfig());
+    folderWatch.start();
+  } catch { folderWatch = null; /* watching is optional; the poll is not */ }
   // Authorise the helper's per-step credential requests (a resync mints one fresh single-use credential per
   // rclone process). Main holds the say: it mints ONLY for the vault whose run is in flight right now, and only
   // while the app is active for account-tier sync (not lock-paused) with a live account. The gate is the
