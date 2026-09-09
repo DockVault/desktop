@@ -85,7 +85,10 @@
     .box { margin: .75rem 0; padding: .85rem 1rem; border: 1px solid #22304a; border-radius: 10px; background: #0e1626; }
     .box.bad { border-color: #6b2d27; background: #1b0f0e; } .box.bad p { color: #ffb4a8; }
     .box p:last-child { margin-bottom: 0; }
-    footer { padding: .9rem 2rem 1.25rem; display: flex; gap: .6rem; justify-content: flex-end; border-top: 1px solid #1a2538; }
+    footer { padding: .9rem 2rem 1.25rem; display: flex; gap: .6rem; align-items: center; justify-content: flex-end; border-top: 1px solid #1a2538; }
+    /* Which build this is. `margin-right: auto` puts it at the far left and leaves the buttons where they were.
+       Selectable on purpose: the reason to read it is to quote it somewhere else. */
+    footer .build { margin-right: auto; color: #6f849f; font-size: .8rem; user-select: text; -webkit-user-select: text; }
     [hidden] { display: none !important; }
   </style>
 </head>
@@ -98,6 +101,7 @@
     <div id="body"><p>Loading…</p></div>
   </main>
   <footer>
+    <span class="build" id="build"></span>
     <button class="btn" id="refresh" type="button">Refresh</button>
     <button class="btn" id="setup" type="button">Set up sync…</button>
     <button class="btn primary" id="close" type="button">Close</button>

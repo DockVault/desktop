@@ -27,7 +27,7 @@
  * renderer secure-context probe), writes .local/shell-smoke-result.json, and exits.
  */
 
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, session, dialog, safeStorage, powerMonitor, Notification, shell } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, session, clipboard, dialog, safeStorage, powerMonitor, Notification, shell } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
@@ -48,6 +48,7 @@ const vaultSpace = require('./vault-space');
 const trayPresentation = require('./tray-presentation');
 const rcloneBundle = require('./rclone-bundle');
 const { APP_ID } = require('./app-identity');
+const buildStamp = require('./build-stamp');
 const loginItemMod = require('./login-item');
 const serverProbe = require('./server-probe');
 const serverSetupMod = require('./server-setup');
@@ -360,6 +361,43 @@ async function boot() {
   await finishTraySelftestIfNeeded();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Which build is this? The app's package metadata carries what the build baked in (build-stamp.js
+// explains the whole path); read once, because a build's identity cannot change while it runs.
+// The version comes from Electron rather than the file, so the app can never name a version other
+// than the one it is actually running as. A metadata read that fails leaves an unstamped stamp —
+// the honest answer — instead of throwing inside a menu or an IPC reply.
+let cachedStamp = null;
+function appStamp() {
+  if (!cachedStamp) {
+    let meta = {};
+    try { meta = require('../../package.json'); } catch { meta = {}; }
+    let version = null;
+    try { version = app.getVersion(); } catch { version = null; }
+    cachedStamp = buildStamp.readStamp({ ...meta, version: version || meta.version });
+  }
+  return cachedStamp;
+}
+
+// "About DockVault" — the direct answer to "which build am I running?". It hangs off the tray, so it
+// does not need a window open or anyone signed in. KNOWN GAP: on a desktop with no usable tray the app
+// falls back to a window and there is no menu to hang this on, so neither this nor the Computers window
+// (also reached from the tray) is reachable there — the one environment where the question is most
+// likely to be asked. An app menu is where that belongs, and there is not one yet.
+// The copy button is the point of the box: the reason to open it is almost always to paste what it says.
+async function showAbout() {
+  try {
+    const about = buildStamp.aboutDialog(appStamp(), {
+      platform: process.platform, arch: process.arch, electron: process.versions.electron,
+    });
+    const { response } = await dialog.showMessageBox({
+      type: 'info', title: about.title, message: about.message, detail: about.detail,
+      buttons: about.buttons, defaultId: about.defaultIndex, cancelId: about.closeIndex, noLink: true,
+    });
+    if (response === about.copyIndex) clipboard.writeText(about.copyText);
+  } catch { /* an About box that cannot be shown is never worth failing anything for */ }
+}
+
 function hardenSession(ses) {
   // No renderer-initiated permission (camera, geolocation, notifications, etc.) is granted.
   ses.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
@@ -372,16 +410,6 @@ function hardenSession(ses) {
 }
 
 function registerIpc() {
-  ipcMain.handle('dockvault:app.info', () => ({
-    version: app.getVersion(),
-    platform: process.platform,
-    channel: 'dev',
-    // Non-secret posture facts so the interface can show honest, graceful copy — e.g. a memory-only
-    // note when there is no secret store (nothing kept across launches; stay-unlocked unavailable),
-    // never a fail-closed takeover. No key material is exposed.
-    keyProtection: keyMode,                              // 'A' | 'B' | 'C'
-    persistence: keyProtect.hasSecureStore(keyMode),     // false => memory-only, re-auth each launch
-  }));
   // The read-only sync-status query. Returns the one computed, credential-free model (states, labels,
   // symbolic reasons) — never a credential, host key, token, or raw helper output. Observe-only: there
   // is no renderer channel that starts, stops, or configures sync, so the lock and safety gates can
@@ -430,6 +458,29 @@ function registerIpc() {
   ipcMain.handle('dockvault:troubleshoot.probe', (e, args) => (fromTroubleshootPage(e) && troubleshootInstance ? troubleshootInstance.probe(args && args.id) : null));
   ipcMain.handle('dockvault:troubleshoot.open-server-setup', (e) => { if (fromTroubleshootPage(e)) void openServerSetupFromTroubleshoot(); return null; });
   ipcMain.handle('dockvault:troubleshoot.close', (e) => { if (fromTroubleshootPage(e)) closeTroubleshoot(); return null; });
+
+  // Non-secret app facts, for any page. It sits HERE, below every page gate, because part of what it
+  // answers is gated: `fromShellPage` is the four gates above asked as one question — is the asker one of
+  // the shell's own pages, in the shell's own window? Facts that any shell page may see but the interface
+  // the server supplies may not go behind it.
+  const fromShellPage = (e) => fromSetupPage(e) || fromWizardPage(e) || fromManagePage(e) || fromTroubleshootPage(e);
+  ipcMain.handle('dockvault:app.info', (e) => ({
+    version: app.getVersion(),
+    platform: process.platform,
+    channel: 'dev',
+    // Which build this is, already composed into the one line every surface shows (build-stamp.js) —
+    // but only for the shell's OWN pages. The interface the server supplies runs on this same origin with
+    // this same preload, and the commit is the one fact here that tells two releases sharing a version
+    // apart: handing it over would tell a server exactly which build each computer runs, which is not a
+    // question it has any business answering. Every other page-facing capability in this file is gated to
+    // the shell page that needs it, so this is gated the same way rather than made an exception of.
+    ...(fromShellPage(e) ? { build: appStamp(), buildLine: buildStamp.stampLine(appStamp()), buildNote: buildStamp.stampNote(appStamp()) } : {}),
+    // Non-secret posture facts so the interface can show honest, graceful copy — e.g. a memory-only
+    // note when there is no secret store (nothing kept across launches; stay-unlocked unavailable),
+    // never a fail-closed takeover. No key material is exposed.
+    keyProtection: keyMode,                              // 'A' | 'B' | 'C'
+    persistence: keyProtect.hasSecureStore(keyMode),     // false => memory-only, re-auth each launch
+  }));
   ipcMain.handle('dockvault:sync.status', () => (syncHub
     ? syncStatusModel.publicStatus(syncHub.current())
     : { state: 'unavailable', label: 'Sync unavailable', reason: 'no-secure-store', vaults: [], condition: 'unavailable' }));
@@ -794,6 +845,9 @@ function buildTrayMenu(items, model, migration = null) {
   template.push({ ...trayPresentation.loginItemMenu(loginItem().isEnabled()), click: () => toggleLoginItem() });
   template.push(
     { type: 'separator' },
+    // Which build this is. In the tray rather than only in a window, because the question is asked
+    // when something is wrong — which is exactly when a person may have no window open to ask it in.
+    { label: 'About DockVault', click: () => { void showAbout(); } },
     { label: 'Quit DockVault', click: () => { isQuitting = true; app.quit(); } },
   );
   return Menu.buildFromTemplate(template);
@@ -3101,6 +3155,26 @@ async function finishTraySelftestIfNeeded() {
       record('render-troubleshoot-door', labels.includes('Troubleshoot…'));
       record('render-pending-setup', labels.includes(PENDING));
       record('render-reset-offer', labels.includes(RESET));
+      // Which build this is, reachable from the tray. Two rows, because "the item is there" and "the item
+      // still does something" fail separately: the label proves the entry is drawn, and its click being a
+      // function proves the handler was not dropped. The click is NOT invoked here — its first button copies
+      // to the clipboard, and a self-test must not quietly replace what a person had on theirs.
+      const about = items.find((it) => it && it.label === 'About DockVault');
+      record('render-about', !!about);
+      record('about-click-wired', typeof (about && about.click) === 'function');
+      // The third row is the LINE, composed here from the app's real metadata read. What it can honestly
+      // assert is that the composition produced a well-formed line naming this app at the version Electron
+      // says it is running as, and a tail of one of the three shapes there are (a commit and a date, a
+      // commit whose date did not survive validation, or no stamp at all). NOT that it names a commit:
+      // a self-test run from source is legitimately unstamped, so that would be a row that fails on a
+      // healthy app — and "starts with DockVault" would be the opposite mistake, true of every string this
+      // can return, stamped or not. Whether a build really names its commit is proved where it can be: the
+      // note records the line verbatim, and a run of the PACKAGED app records the stamped one.
+      const line = buildStamp.stampLine(appStamp());
+      let head = null;
+      try { head = `DockVault ${app.getVersion()} · build `; } catch { head = null; }
+      const tail = /· build ([0-9a-f]{7}( · \d{4}-\d{2}-\d{2})?|not stamped)$/;
+      record('about-line-well-formed', typeof line === 'string' && !!head && line.startsWith(head) && tail.test(line), line);
       // tooltip lock-reason path: a paused-locked model + a 'sleep' reason reads the sleep glance. The tooltip's
       // 4th parameter is the lock reason on this branch and an options object on the merged tree, so try the branch
       // shape first and fall back to the object — the assertion then holds on BOTH with no merge-side edit.
@@ -3128,11 +3202,22 @@ async function finishTraySelftestIfNeeded() {
     record('selftest-harness', false, String((e && e.message) || e));
   }
   const ok = rows.every((r) => r.ok !== false); // a null row (a documented re-merge fold) does not fail the run
-  try {
-    const outDir = path.join(__dirname, '..', '..', '.local');
-    fs.mkdirSync(outDir, { recursive: true });
-    fs.writeFileSync(path.join(outDir, 'tray-selftest.json'), JSON.stringify({ ok, rows }, null, 2));
-  } catch { /* best effort */ }
+  // The rows, not just the exit code: which row failed is the whole value of the check. The usual place is
+  // the repo's .local, which exists for an unpackaged run — but in a PACKAGED run __dirname is inside the app
+  // archive, so that write cannot land and the check silently degrades to a bare exit code exactly where the
+  // artifact is most worth checking. Fall back to the throwaway data folder this run was given, which is
+  // always writable (the self-test refuses to run without an explicit --user-data-dir).
+  const written = [];
+  for (const outDir of [path.join(__dirname, '..', '..', '.local'), dir]) {
+    try {
+      fs.mkdirSync(outDir, { recursive: true });
+      const file = path.join(outDir, 'tray-selftest.json');
+      fs.writeFileSync(file, JSON.stringify({ ok, rows }, null, 2));
+      written.push(file);
+      break;
+    } catch { /* try the next place */ }
+  }
+  try { console.warn(`[dockvault] tray self-test ${ok ? 'PASS' : 'FAIL'}${written.length ? ` -> ${written[0]}` : ' (rows could not be written anywhere)'}`); } catch { /* ignore */ }
   // Tear the background workers down EXPLICITLY, then app.exit() with the REAL code. Two facts force this shape:
   // app.exit() skips the before-quit handler (:162) that stops the daemon, so its rclone child would be orphaned;
   // but app.quit() does NOT honour process.exitCode (it exits 0 regardless), which would make this check vacuously

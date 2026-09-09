@@ -21,6 +21,10 @@
  *      the sentence appears with the chip, is replaced when the reason changes, and goes when the vault
  *      recovers — so the card never shows a state and an explanation that disagree, and never keeps an
  *      explanation of something that is no longer true.
+ *   L) the window says WHICH BUILD it is: the footer carries the line main composed (build-stamp.js), it
+ *      says so plainly for an unstamped build, it is there even on the sign-in gate (the state a person is
+ *      most likely to be in when asked which build they are running) — and the server's own interface,
+ *      on the same origin with the same preload, is told nothing about which build this is.
  * Writes .local/manage-check.json and prints one PASS/FAIL line. Exit 0 = PASS.
  *
  *   node_modules/electron/dist/electron.exe test/manage-check.js
@@ -29,6 +33,7 @@ const { app, BrowserWindow, ipcMain, session } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { createManageView } = require('../src/main/manage-view');
+const buildStamp = require('../src/main/build-stamp');
 const { isTrustedSetupSender } = require('../src/main/server-setup');
 const schemeMod = require('../src/main/scheme');
 const { buildCsp } = require('../src/main/csp');
@@ -92,19 +97,32 @@ function sharedWindow() {
 const snapshot = `({
   title: document.getElementById('title').textContent, sub: document.getElementById('sub').textContent,
   text: document.getElementById('body').innerText,
+  build: document.getElementById('build').textContent,
   sections: [...document.querySelectorAll('.computer')].map(s => ({ name: s.querySelector('.name').textContent, badges: [...s.querySelectorAll('.head .badge')].map(b => b.textContent), buttons: [...s.querySelectorAll('.head button')].map(b => b.textContent), cards: [...s.querySelectorAll('.card')].map(c => ({ vault: c.querySelector('.vault').textContent, text: c.innerText, state: (c.querySelector('.state .meta') || {}).textContent || '', reason: (c.querySelector('p.reason') || {}).textContent || '', buttons: [...c.querySelectorAll('.actions > button')].map(b => b.textContent) })), note: (s.querySelector('.note') || {}).textContent || '', confirm: (s.querySelector('.confirm') || {}).textContent || '' })),
 })`;
 const settle = `(async () => { for (let i = 0; i < 100; i++) { if (!document.getElementById('body').innerText.startsWith('Loading')) break; await new Promise(r => setTimeout(r, 50)); } await new Promise(r => setTimeout(r, 100)); return ${snapshot}; })()`;
 const clickIn = (scopeText, label) => `(async () => { const s = [...document.querySelectorAll('.computer, .card')].find(n => n.textContent.includes(${JSON.stringify(scopeText)})); if (!s) return 'no-scope'; const b = [...s.querySelectorAll('button')].find(x => x.textContent === ${JSON.stringify(label)}); if (!b) return 'no-button'; b.click(); await new Promise(r => setTimeout(r, 150)); return 'clicked'; })()`;
 const confirmIn = (scopeText, label) => `(async () => { const s = [...document.querySelectorAll('.computer, .card')].find(n => n.textContent.includes(${JSON.stringify(scopeText)})); const c = s && s.querySelector('.confirm'); if (!c) return 'no-confirm'; const b = [...c.querySelectorAll('button')].find(x => x.textContent === ${JSON.stringify(label)}); if (!b) return 'no-button'; b.click(); await new Promise(r => setTimeout(r, 400)); return 'clicked'; })()`;
 
-async function scenario(name, { ioSpec, drive, pageUrl = null }) {
-  const { io, log } = makeIo(ioSpec);
+// What a build's metadata looks like when the pipeline stamped it, and when nothing did.
+const STAMPED = { version: '0.1.0', buildCommit: '3d6bcc8f0e1d2c3b4a5968778695a4b3c2d1e0f9', buildDate: '2026-09-09' };
+const UNSTAMPED = { version: '0.1.0' };
+// The SAME composition main does (src/main/index.js), so this proves the page renders what main sends —
+// not a line this check wrote for itself — and behind the SAME shell-page gate, so a page that is not
+// the shell's gets the build fields absent, exactly as it would from the real handler.
+const appInfoFor = (meta, shell) => {
+  const stamp = buildStamp.readStamp(meta);
+  return { version: stamp.version, platform: process.platform, channel: 'dev',
+    ...(shell ? { build: stamp, buildLine: buildStamp.stampLine(stamp), buildNote: buildStamp.stampNote(stamp) } : {}) };
+};
+
+async function scenario(name, { ioSpec, drive, pageUrl = null, meta = STAMPED }) {  const { io, log } = makeIo(ioSpec);
   const win = sharedWindow();
   const trusted = (e) => isTrustedSetupSender(e, { webContents: win.webContents, appOrigin: APP_ORIGIN, pagePath: schemeMod.SHELL_PATH + PAGE_NAME });
   const view = createManageView(io);
   let closes = 0; let setups = 0;
-  for (const ch of ['dockvault:manage.model', 'dockvault:manage.act', 'dockvault:manage.close', 'dockvault:manage.open-setup']) ipcMain.removeHandler(ch);
+  for (const ch of ['dockvault:manage.model', 'dockvault:manage.act', 'dockvault:manage.close', 'dockvault:manage.open-setup', 'dockvault:app.info']) ipcMain.removeHandler(ch);
+  ipcMain.handle('dockvault:app.info', (e) => appInfoFor(meta, trusted(e)));
   ipcMain.handle('dockvault:manage.model', (e) => (trusted(e) ? view.model() : null));
   ipcMain.handle('dockvault:manage.act', (e, a) => (trusted(e) ? view.act(a) : { ok: false, reason: 'refused' }));
   ipcMain.handle('dockvault:manage.close', (e) => { if (trusted(e)) closes++; return null; });
@@ -302,7 +320,29 @@ app.whenReady().then(async () => {
     out.K = r;
   }
 
-  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'];
+  // L) which build is this? The footer names it, in every state the window can be in.
+  {
+    const expected = buildStamp.stampLine(buildStamp.readStamp(STAMPED));
+    const stamped = await scenario('L_build', { ioSpec: {}, drive: async (win) => ev(win, settle) });
+    // The gate is the state that matters most here: a person who cannot sign in is exactly the person
+    // being asked which build they are running, and the footer is the same window either way.
+    const gated = await scenario('L_build_signIn', { ioSpec: { signedIn: () => false }, drive: async (win) => ev(win, settle) });
+    // A build with no stamp still gets a line, and it says so rather than leaving the footer blank.
+    const unstamped = await scenario('L_build_unstamped', { ioSpec: {}, meta: UNSTAMPED, drive: async (win) => ev(win, settle) });
+    // ...and the interface the server supplies, on this same origin with this same preload, is told
+    // nothing: the commit is what tells two releases sharing a version apart, and a server has no
+    // business knowing which build a computer runs.
+    const fromRoot = await scenario('L_build_root', { ioSpec: {}, pageUrl: `${APP_ORIGIN}/`,
+      drive: async (win) => ev(win, '(async () => { const i = await window.dockvault.app.info(); return { version: i && i.version, line: i && i.buildLine, build: i && i.build, note: i && i.buildNote }; })()') });
+    out.L = { stamped: stamped.build, gated: gated.build, unstamped: unstamped.build, fromRoot, expected };
+    out.L_pass = stamped.build === expected && gated.build === expected
+      && fromRoot.line === undefined && fromRoot.build === undefined && fromRoot.note === undefined
+      && fromRoot.version === '0.1.0'
+      && stamped.build === 'DockVault 0.1.0 · build 3d6bcc8 · 2026-09-09'
+      && unstamped.build === 'DockVault 0.1.0 · build not stamped';
+  }
+
+  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'];
   out.ok = KEYS.every((k) => out[`${k}_pass`] === true);
   clearTimeout(watchdog);
   dump();

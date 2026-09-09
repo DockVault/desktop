@@ -16,6 +16,7 @@
   const btnRefresh = document.getElementById('refresh');
   const btnSetup = document.getElementById('setup');
   const btnClose = document.getElementById('close');
+  const buildEl = document.getElementById('build');
 
   let busy = false;
   let lastModel = null;
@@ -424,7 +425,23 @@
     if (open) { if (open.dataset.working !== 'true') open.remove(); return; }
     if (!busy && api) void api.close();
   });
+  // Which build this is, in the footer. Main composed the line (build-stamp.js); the page only shows it,
+  // and shows it once — a build's identity does not change while the app runs, so it never needs a refresh.
+  // It stays blank only if main could not be asked at all, which is a window that has bigger problems.
+  async function showBuild() {
+    const appApi = (window.dockvault && window.dockvault.app) || null;
+    if (!appApi || !buildEl) return;
+    let info = null;
+    try { info = await appApi.info(); } catch { info = null; }
+    if (info && typeof info.buildLine === 'string') buildEl.textContent = info.buildLine;
+    // "build not stamped" is only half an answer on a line with no room to explain itself, so the
+    // explanation main sends rides along as the hover. Nothing is hidden by it: the About box says the
+    // same sentence outright, and a stamped build sends none because it needs none.
+    if (info && typeof info.buildNote === 'string' && info.buildNote) buildEl.title = info.buildNote;
+  }
+
   if (api) api.onChanged(() => { if (!busy) void load(); });
   if (window.dockvault && window.dockvault.sync) window.dockvault.sync.onStatus((st) => applyLive(st));
   void load();
+  void showBuild();
 })();

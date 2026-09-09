@@ -43,7 +43,13 @@ function subscribe(channel, cb) {
 
 const api = Object.freeze({
   app: Object.freeze({
-    // Non-secret app facts. Returns { version, platform, channel }.
+    // Non-secret app facts. Returns { version, platform, channel, keyProtection, persistence } for any
+    // page, and for the SHELL'S OWN pages only, WHICH BUILD this is: `build` ({ version, commit, date,
+    // stamped }), `buildLine` (the one line main already composed for showing, build-stamp.js) and
+    // `buildNote` (what "not stamped" means, or null). Those three are gated because the interface the
+    // server supplies runs on this same origin with this same preload, and the commit would tell it
+    // exactly which build a computer runs; a page that is not the shell's simply gets the fields absent.
+    // Still never a path, host, credential, or build-machine detail — a short commit and a date only.
     info: () => ipcRenderer.invoke('dockvault:app.info'),
     // Deep-link (dockvault://) events. Handling is benign navigation only and is default-deny in the
     // main process; it never auto-triggers a confirmation-gated action. Returns an unsubscribe fn.

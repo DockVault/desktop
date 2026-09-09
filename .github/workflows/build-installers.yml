@@ -54,6 +54,46 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # WHICH build is this? Every artifact this workflow produces carries the commit it was built
+      # from and the day it was built, so an installed app can name itself (an About box and the
+      # Computers window footer show it) and a downloaded file can be matched to a commit. Written
+      # to the environment here rather than inline on the build step, because both values have to be
+      # shaped by a shell; electron-builder.js reads them and bakes them into the app's metadata.
+      #
+      # `github.sha` is the commit this job checked out, so the stamp can never name a different one.
+      # The date comes from when the RUN started, not from each runner's own clock: the three legs are
+      # separate machines started at slightly different moments, and a run crossing midnight UTC would
+      # otherwise ship Windows, macOS and Linux installers of ONE commit claiming two different days.
+      - name: Stamp this build with its commit and date
+        id: stamp
+        shell: bash
+        env:
+          COMMIT: ${{ github.sha }}
+          STARTED: ${{ github.run_started_at }}
+        run: |
+          set -euo pipefail
+          built=${STARTED:0:10}
+          # Refuse to build rather than build something that cannot say what it is. Without this the
+          # stamp would fail SILENTLY: electron-builder.js drops a malformed value, so an empty COMMIT
+          # would ship installers that tell their owner they carry no commit, from a green pipeline run.
+          # This is also what lets the app say a copy with no stamp did not come from here.
+          # The pattern is anchored over the WHOLE value, which is what keeps a newline out of the
+          # $GITHUB_ENV writes below (a newline there would define further variables of its own).
+          if [[ ! "$COMMIT" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::refusing to build: the commit to stamp is not a commit id"
+            exit 1
+          fi
+          if [[ ! "$built" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::refusing to build: the build date is not a date"
+            exit 1
+          fi
+          {
+            echo "DOCKVAULT_BUILD_COMMIT=$COMMIT"
+            echo "DOCKVAULT_BUILD_DATE=$built"
+          } >> "$GITHUB_ENV"
+          echo "short=${COMMIT:0:7}" >> "$GITHUB_OUTPUT"
+          echo "### ${{ matrix.name }}: build ${COMMIT:0:7} ($built)" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Decide whether this build can be signed
         id: signing
         shell: bash
@@ -99,6 +139,34 @@ jobs:
           node node_modules/electron-builder/cli.js ${{ matrix.eb }} --publish never
           ls -la dist/ || { echo "::error::electron-builder produced no dist/ output"; exit 1; }
 
+      # The stamp is only worth having if it is REALLY IN THERE. Everything above proves the values were
+      # correct and exported; this proves they survived into the packaged app, which is a different claim
+      # and the one that matters. Without it a lost export would still produce an installer named after a
+      # commit whose own About box says it carries none — a file whose label and its contents disagree.
+      #
+      # What is checked is the COMMIT'S OWN CHARACTERS. The stamped package.json travels inside the app
+      # archive as plain bytes, so this needs no unpacking and no tool, and the commit id is a string
+      # nothing else in the archive contains — unlike the field NAME `buildCommit`, which is also in the
+      # source of the module that reads it, and so is present in an unstamped build too. (It was: an
+      # unstamped build was run against this step, and only the commit check told the two apart.)
+      - name: Check the packaged app really carries the stamp
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `grep -l` names the archives that contain the bytes; a zero match exits non-zero, hence the
+          # `|| true`, which is why the counts are compared rather than trusted to abort on their own.
+          total=$(find dist -name app.asar | wc -l | tr -d '[:space:]')
+          named=$( (find dist -name app.asar -exec grep -lF "$DOCKVAULT_BUILD_COMMIT" {} + || true) | wc -l | tr -d '[:space:]')
+          echo "app archives: $total, carrying this build's commit: $named"
+          if [ "$total" -eq 0 ]; then
+            echo "::error::no packaged app archive found, so the build stamp could not be checked"
+            exit 1
+          fi
+          if [ "$named" -ne "$total" ]; then
+            echo "::error::a packaged app was built without the build stamp; refusing to ship an installer that cannot say what it is"
+            exit 1
+          fi
+
       # Each leg records whether its installers are signed, so the release job can refuse to publish
       # unsigned ones. Linux has no code signing in this pipeline, so its record is "not-applicable".
       - name: Record signing state
@@ -121,7 +189,7 @@ jobs:
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dockvault-${{ matrix.name }}
+          name: dockvault-${{ matrix.name }}-${{ steps.stamp.outputs.short }}
           if-no-files-found: error
           path: |
             dist/*.exe

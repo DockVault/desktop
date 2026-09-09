@@ -50,12 +50,32 @@ const rcloneResources = (target, binary) => [
   { from: `build/rclone/${target}/`, to: 'rclone', filter: [binary] },
 ];
 
+// The build's IDENTITY, baked in here and nowhere else. `extraMetadata` merges these fields into the
+// package.json that goes inside the app archive, so the running app can say which commit it came from
+// and when (src/main/build-stamp.js reads them back and composes the line the About box and the
+// Computers window show). Until this existed every installer reported the same version and nothing
+// else, and two builds weeks apart were indistinguishable once installed.
+//
+// The environment is the ONLY source: the CI passes the commit it checked out and the day it ran
+// (.github/workflows/build-installers.yml). Deliberately NOT read from the working tree with `git
+// rev-parse` — a working tree can be dirty, so a commit read from it would name code the artifact
+// does not contain, and a stamp that can lie is worse than no stamp. A build made without these
+// (a developer's own `npm run dist`) is simply unstamped, and the app says so.
+//
+// The shapes are checked HERE as well as at read time, so a typo or an empty variable leaves the field
+// out entirely rather than writing a nonsense value into a shipped artifact's metadata. The check is
+// the APP'S OWN (src/main/build-stamp.js) rather than a copy of it: what may be written and what may be
+// read back are then one rule, and cannot drift into a build that bakes in a value the app will refuse.
+const { stampMetadata } = require('./src/main/build-stamp');
+const stamp = () => stampMetadata({ commit: process.env.DOCKVAULT_BUILD_COMMIT, date: process.env.DOCKVAULT_BUILD_DATE });
+
 module.exports = {
   appId: 'io.dockvault.desktop',
   productName: 'DockVault',
   copyright: 'AGPL-3.0-only, see LICENSE',
   directories: { output: 'dist', buildResources: 'build' },
   files,
+  extraMetadata: stamp(),
   beforePack: 'scripts/check-bundled-rclone.js',
 
   // The state database module ships as an N-API prebuilt for every target, so nothing is compiled
