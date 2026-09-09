@@ -47,21 +47,112 @@ const VAULT_FULL = 'vault-full';
 // and is not produced here. It is a distinct typed result surfaced by the credential/prep path.
 const HOST_KEY_UNVERIFIED = 'host-key-unverified';
 
+// Where the run's OWN voice begins on a line. rclone writes one message per line, and a message ABOUT THE RUN
+// starts immediately after the log level — "ERROR : Safety abort: …". A message about a FILE puts the file's
+// own name in that same slot: "ERROR : holiday/max delete list.md: Failed to copy: …". That difference is the
+// only thing separating the run saying something from a file merely being named, so the structural signatures
+// below are anchored to the slot instead of matching a bare phrase anywhere in the output.
+//
+// It matters because the names are not ours. In a shared vault they arrive from other members, and an
+// unanchored phrase let a chosen name make this computer announce a changed server identity — which stops
+// syncing for EVERY vault and needs a person to clear it — or demand a repair that was never owed.
+// A line the LOGGER actually wrote: the start of a line, an optional timestamp, then a level and its colon.
+// Requiring the level raises the bar without settling the matter, and it is worth being exact about which.
+// It stops a name whose break is a carriage return or one of Unicode's own separators, because those are
+// flattened before any of this is read and the name stays inside its own line. It does NOT stop a name
+// containing a real newline: the half after the break starts a line, and the name's author writes all of
+// it, level included. Nothing in a text log can tell that apart from a line the tool wrote — see the
+// residual recorded in the tests, and the note on the log format that would end the question.
+const LOG_LINE = String.raw`(?:^|[\r\n])[^\r\n]{0,32}?(?:ERROR|CRITICAL|NOTICE|INFO|DEBUG)\s*:\s*`;
+// The run's OWN voice: immediately after the level, which is where a verdict about the run is written and
+// where a file name never sits (a name is only ever printed as the subject of a message, after the level).
+const LINE_LEAD = LOG_LINE;
+// Somewhere inside a logged message, for phrases that legitimately appear mid-sentence (an ssh error arrives
+// wrapped in several layers). Still pinned to a real logged line, so a name smuggling in a newline cannot
+// manufacture one. The gap is generous because the text before the phrase can include a whole long path.
+const IN_LOG_LINE = LOG_LINE + String.raw`[^\r\n]{0,500}?`;
+
+// The subject of a per-file message is the file's NAME, and it must not be read as if the run had said it.
+// Two rules decide when the name in front of a message is taken out, and a deny-list decides when neither may.
+//
+// The deny-list comes first and is the important one. Some of the run's OWN verdicts read exactly like a
+// per-file message, because the tool wraps a file-level cause inside them - "Bisync critical error: failed to
+// copy Path1 to Path2: ...". Stripping the front off one of those would throw away the very verdict this file
+// exists to notice, and losing a baseline is far worse than naming a cause wrongly: the vault would go on
+// running delete-capable syncs with no repair ever latched. So anything opening with the run's own words is
+// left whole.
+const VERDICT_OPENER = /^\s*(?:Bisync critical error|Bisync aborted|Safety abort|Fatal error|Failed to create file system|NewFs)\s*$/i;
+// ...but a FILE may be named after one of those words, and then it is still just a file. What separates them
+// is that the run's verdict is never a path: no folder in it, and no extension on the end.
+//
+// Judged on the FIRST token after the level — the subject as written, before the lazy match below grew it. A
+// verdict's own text routinely contains a path further along ("Bisync critical error: open /var/x/v.lst: no
+// such file"), and letting the grown subject decide meant those read as paths, voided the deny-list, and had
+// the verdict stripped: the exact loss this deny-list exists to prevent.
+const LOOKS_LIKE_A_PATH = /[\\\/]|\.[A-Za-z0-9]{1,8}$/;
+const subjectAsWritten = (line, lead) => String(line).slice(String(lead).length).split(': ')[0];
+// Then either rule may take the name out: the message after it is one the tool writes ABOUT A FILE, or the
+// subject simply looks like a path. Two rules rather than one because neither is complete alone - the tool's
+// per-file vocabulary is long and keeps growing, and not every name looks like a path.
+//
+// The subject is matched GREEDILY, which matters more than it looks. A name is free to contain the tool's own
+// per-file wording, and a lazy match would stop at the FIRST one - leaving everything the name said after it
+// sitting in the part that is kept. Taking the LAST split keeps the whole of the name on the name's side.
+const FILE_MESSAGE = /^(.*?(?:ERROR|CRITICAL|NOTICE|INFO|DEBUG)\s*:\s*)(.+): ((?:Failed to \w+|Couldn't \w+|Can't \w+|Not \w+|partial file rename failed|corrupted on transfer|error read\w*|sizes differ|md5 differ|hash differ|Duplicate object|Skipped|Removing|Update|Post request)\b.*)$/i;
+const FILE_SUBJECT = /^(.*?(?:ERROR|CRITICAL|NOTICE|INFO|DEBUG)\s*:\s*)([^\r\n]*?(?:[\\\/][^\r\n]*|\.[A-Za-z0-9]{1,8})): (.+)$/;
+
+/**
+ * The run's output with FILE NAMES taken out of the lines that are about a single file — the name replaced by a
+ * fixed placeholder, the message it carried left untouched. Used as the haystack every signature reads, so what
+ * a file is CALLED can never decide what the run is reported to have done. The raw text is still what the
+ * detail extraction reads, because naming the file to a person is exactly its job.
+ */
+// The characters a NAME can carry that would otherwise end a line here. The tool writes names verbatim, and a
+// lone carriage return, or one of Unicode's own line separators, splits a line for some readers and not for
+// others — which is all an attacker needs: the half after the break looks like a fresh line and can be given
+// any prefix, including the level the logger writes. They are flattened to a space before anything is read, so
+// a message stays one line no matter what the name inside it contains. A real CRLF is left as its newline.
+const NAME_BORNE_BREAKS = /\r(?!\n)|[\u2028\u2029\u0085\v\f]/g;
+
+function maskFileNames(text) {
+  return String(text == null ? '' : text)
+    .replace(NAME_BORNE_BREAKS, ' ')
+    .split('\n')
+    .map((line) => {
+      const m = line.match(FILE_MESSAGE) || line.match(FILE_SUBJECT);
+      if (!m) return line;
+      const head = subjectAsWritten(line, m[1]);
+      if (VERDICT_OPENER.test(head) && !LOOKS_LIKE_A_PATH.test(head)) return line; // the run speaking about itself keeps every word
+      return `${m[1]}<file>: ${m[3]}`;
+    })
+    .join('\n');
+}
+
 const SIG = Object.freeze({
   // "Safety abort: too many deletes (>50%, N of M) ... Run with --force if desired. Bisync aborted." NARROW to
   // the DELETE wording — the bare "safety abort" is shared with the all-changed guard below, a different abort.
-  excessiveDelete: /too many deletes|max delete/i,
+  excessiveDelete: new RegExp(`(?:${LINE_LEAD}Safety abort:` + String.raw`[^\r\n]{0,60}?too many deletes` + `)|(?:${LINE_LEAD}` + String.raw`max delete limit` + `)`, 'i'),
   // "Safety abort: all files were changed on Path1/Path2 ... Run with --force". A DIFFERENT safety guard than the
   // delete cap: every file on one side read as changed (here, mtime drift under set_modtime=false), NOT deletions.
-  allChanged: /all files were changed|all files changed/i,
+  allChanged: new RegExp(`${LINE_LEAD}Safety abort:` + String.raw`[^\r\n]{0,60}?all files (?:were )?changed`, 'i'),
   // "cannot find prior Path1 or Path2 listings ... Must run --resync to recover." / a bisync critical error.
-  needsResync: /must run --resync|cannot find prior|critical error/i,
+  needsResync: new RegExp(`(?:${LINE_LEAD}Bisync critical error)|(?:${LINE_LEAD}` + String.raw`Bisync aborted\.[^\r\n]{0,60}?Must run --resync` + `)|(?:${IN_LOG_LINE}` + String.raw`cannot find prior Path\d` + `)`, 'i'),
+  // NOT anchored to the start of a line, unlike the verdict signatures: this phrase is the ssh library's own
+  // and turns up nowhere by accident, and a changed server identity is the one thing worth a false alarm over —
+  // failing to NAME a real key change would leave a person staring at a generic error. Taking file names out of
+  // the text (maskFileNames) is what stops a file called "knownhosts: key mismatch.txt" reaching it; a per-file
+  // line whose message is not one this recognises would still get through, which is a known and narrow residual.
   // A pinned-host-key failure against the configured host_keys. Deliberately NARROW: it matches an actual
   // key MISMATCH ("knownhosts: key mismatch" matches via `key mismatch`), not a bare mention of knownhosts
   // — a false MITM alarm on a benign line desensitizes users to a real one (anti-cry-wolf).
-  hostKeyMismatch: /host key mismatch|key mismatch|host key .*(changed|does ?n[o']?t match)/i,
+  hostKeyMismatch: new RegExp(String.raw`knownhosts: key mismatch|ssh: handshake failed:[^\r\n]{0,120}?key mismatch` + `|${IN_LOG_LINE}` + String.raw`host key[^\r\n]{0,40}?(?:has changed|does ?n[o']?t match)`, 'i'),
   // SFTP authentication refused — the ssh handshake got past host-key verification but auth failed (e.g. a
   // lapsed/rotated temp-cred): "ssh: unable to authenticate, attempted methods [none password] ...".
+  // The same key-mismatch test, but pinned to a line the logger wrote. Used ONLY when the output actually
+  // contains logged lines, so a file name that smuggles in a newline cannot forge the alarm; when a caller
+  // hands over a bare error string instead (the connection-level check does), the loose one above still
+  // applies and a real mismatch is never missed for want of a prefix.
+  hostKeyMismatchLogged: new RegExp(`${IN_LOG_LINE}` + String.raw`(?:handshake failed|couldn't connect ssh|NewFs)[^\r\n]{0,200}?(?:knownhosts: )?key mismatch` + `|${IN_LOG_LINE}` + String.raw`host key[^\r\n]{0,40}?(?:has changed|does ?n[o']?t match)`, 'i'),
   authFailed: /unable to authenticate|no supported methods remain|permission denied \(publickey,?password/i,
   // The server ANSWERED and then refused the session channel — the door's other way of turning this computer
   // away: a spent single-use credential, a credential or attempt limit, or simply a server with no session slots
@@ -75,7 +166,7 @@ const SIG = Object.freeze({
   // rclone wraps both of those in the same "couldn't connect SSH" prefix, and each has its own honest state.
   connectFailed: /couldn't connect ssh|dial tcp|connection refused|actively refused|i\/o timeout|no such host|network is unreachable|no route to host|connection reset by peer/i,
   // An individual file rejected for path/name length (Windows and POSIX wordings).
-  pathTooLong: /path too long|file ?name too long|filename or extension is too long|name too long/i,
+  pathTooLong: new RegExp(`${IN_LOG_LINE}` + String.raw`(?:path too long|file ?name too long|filename or extension is too long|name too long|ENAMETOOLONG)`, 'i'),
   // A keep-both conflict rename (bisync's safe default): both copies preserved, neither overwritten.
   conflict: /\.conflict\d/i,
   // A file rejected for its SIZE by the SERVER. The vault's SFTP door refuses an over-limit upload in-stream
@@ -210,6 +301,26 @@ function outcomeDetail(text, sig) {
   return (file || maxBytes) ? { file, maxBytes } : null;
 }
 
+/**
+ * The RAW line that a signature decided on, found by matching against the MASKED text and then taking the line
+ * at the same position. Masking never adds or removes lines, so the position carries across.
+ *
+ * Taking it by position is the point. Searching the raw text again would find whichever line matched FIRST
+ * there — and a file NAME can arrange to be that line. A decoy called "partial file rename failed.txt" sitting
+ * above the real failure would be named in its place, and then SIZED in its place: that size is what decides
+ * whether a person is told their vault is out of room. A small decoy hides a real "out of space"; a large one
+ * invents one. So the line that names the file is always the same line that decided the outcome.
+ * @returns {string|null}
+ */
+function decidingRawLine(maskedText, rawText, sig) {
+  const masked = String(maskedText == null ? '' : maskedText).split('\n');
+  const raw = String(rawText == null ? '' : rawText).split('\n');
+  for (let i = 0; i < masked.length; i += 1) {
+    if (sig.test(masked[i])) return raw[i] == null ? masked[i] : raw[i];
+  }
+  return null;
+}
+
 function haystack(stdout, stderr) { return String(stdout == null ? '' : stdout) + '\n' + String(stderr == null ? '' : stderr); }
 
 /**
@@ -220,7 +331,12 @@ function haystack(stdout, stderr) { return String(stdout == null ? '' : stdout) 
  * @returns {string|null} a RESULT value, or null
  */
 function classifyConnectionFailure(stdout, stderr) {
-  const text = haystack(stdout, stderr);
+  // stderr ONLY, and deliberately so. The caller's stdout here is the server's file listing — one name per
+  // line, every one of them chosen by whoever can put a file in the vault. Reading a connection verdict out of
+  // that let a member call a file "knownhosts: key mismatch" and have this computer announce a changed server
+  // identity, which stops syncing for every vault until a person clears it. Errors are written to stderr; the
+  // listing is data, and data never gets a vote on what happened to the connection.
+  const text = haystack('', stderr);
   if (SIG.hostKeyMismatch.test(text)) return RESULT.HOST_KEY_MISMATCH;
   if (SIG.authFailed.test(text)) return RESULT.AUTH_FAILED;
   if (SIG.channelRefused.test(text)) return RESULT.CHANNEL_REFUSED;
@@ -237,7 +353,11 @@ function classifyConnectionFailure(stdout, stderr) {
  *   produces (a checked base file name, a stated maximum in bytes) — never a fragment of the raw output.
  */
 function classifyBisyncOutcome(o) {
-  const text = haystack(o.stdout, o.stderr);
+  // Two different readings of the same run. `text` is what the SIGNATURES see, with the names of individual
+  // files taken out, so nothing a file is called can decide what the run is reported to have done. `rawText`
+  // still carries them, because naming the file to the person is exactly what the detail extraction is for.
+  const rawText = haystack(o.stdout, o.stderr);
+  const text = maskFileNames(rawText);
   // What bisync said about the BASELINE, decided independently of which cause wins the result below. A file
   // the server refused is the honest cause of the run, but bisync may ALSO have aborted and owed a resync;
   // naming the real cause must never quietly drop that latch.
@@ -260,7 +380,9 @@ function classifyBisyncOutcome(o) {
   // it says the machine on the other end may not be the vault at all, and it must be the loud answer whatever
   // else the run also said. It carries the baseline rather than discarding it, so a run that ALSO aborted on a
   // mass delete keeps the repair that abort owes (see below: no verdict here may quietly drop that latch).
-  if (SIG.hostKeyMismatch.test(text)) return { result: RESULT.HOST_KEY_MISMATCH, resyncRequired: safetyLatch(), needsAttention: true };
+  // Where the output carries logged lines at all, the alarm must come from one of them (see the two signatures).
+  const logged = new RegExp(LOG_LINE).test(text);
+  if ((logged ? SIG.hostKeyMismatchLogged : SIG.hostKeyMismatch).test(text)) return { result: RESULT.HOST_KEY_MISMATCH, resyncRequired: safetyLatch(), needsAttention: true };
   if (SIG.excessiveDelete.test(text)) return { result: RESULT.ABORT_EXCESSIVE_DELETE, resyncRequired: true, needsAttention: true };
   // A different safety abort than the delete cap — all files on one side read as changed. Must NOT be labelled as
   // a large DELETE (its own honest status); still a fail-closed abort requiring a deliberate resync.
@@ -304,9 +426,9 @@ function classifyBisyncOutcome(o) {
   // Among themselves they run from the most specific thing the server said to the least: a size it stated, a
   // lack of room it stated, and last the case where it said nothing at all.
   if (o.code !== 0) {
-    if (SIG.fileTooLarge.test(text)) return { result: RESULT.FILE_TOO_LARGE, resyncRequired: baseline(), needsAttention: true, detail: outcomeDetail(text, SIG.fileTooLarge), failedPath: failedRelPath(text, SIG.fileTooLarge) };
-    if (SIG.serverNoSpace.test(text)) return { result: RESULT.SERVER_NO_SPACE, resyncRequired: baseline(), needsAttention: true, detail: outcomeDetail(text, SIG.serverNoSpace), failedPath: failedRelPath(text, SIG.serverNoSpace) };
-    if (SIG.uploadNotStored.test(text)) return { result: RESULT.UPLOAD_NOT_STORED, resyncRequired: baseline(), needsAttention: true, detail: outcomeDetail(text, SIG.uploadNotStored), failedPath: failedRelPath(text, SIG.uploadNotStored) };
+    if (SIG.fileTooLarge.test(text)) return { result: RESULT.FILE_TOO_LARGE, resyncRequired: baseline(), needsAttention: true, detail: outcomeDetail(decidingRawLine(text, rawText, SIG.fileTooLarge) || rawText), failedPath: failedRelPath(decidingRawLine(text, rawText, SIG.fileTooLarge) || rawText) };
+    if (SIG.serverNoSpace.test(text)) return { result: RESULT.SERVER_NO_SPACE, resyncRequired: baseline(), needsAttention: true, detail: outcomeDetail(decidingRawLine(text, rawText, SIG.serverNoSpace) || rawText), failedPath: failedRelPath(decidingRawLine(text, rawText, SIG.serverNoSpace) || rawText) };
+    if (SIG.uploadNotStored.test(text)) return { result: RESULT.UPLOAD_NOT_STORED, resyncRequired: baseline(), needsAttention: true, detail: outcomeDetail(decidingRawLine(text, rawText, SIG.uploadNotStored) || rawText), failedPath: failedRelPath(decidingRawLine(text, rawText, SIG.uploadNotStored) || rawText) };
   }
 
   if (SIG.needsResync.test(text)) return { result: RESULT.NEEDS_RESYNC, resyncRequired: true, needsAttention: true };
@@ -314,15 +436,15 @@ function classifyBisyncOutcome(o) {
   if (o.code !== 0) {
     // A non-zero exit with no recognized safety signature: name path-too-long distinctly if that is the
     // cause, else a generic error. Neither changes the resync block (no new baseline was established).
-    if (SIG.pathTooLong.test(text)) return { result: RESULT.PATH_TOO_LONG, resyncRequired: null, needsAttention: true, detail: outcomeDetail(text) };
+    if (SIG.pathTooLong.test(text)) return { result: RESULT.PATH_TOO_LONG, resyncRequired: null, needsAttention: true, detail: outcomeDetail(decidingRawLine(text, rawText, SIG.pathTooLong) || rawText) };
     return { result: RESULT.ERROR, resyncRequired: null, needsAttention: true };
   }
 
   // code === 0: the run completed and established/refreshed the baseline (clears the resync block), but
   // it may still carry a non-green attention state that must not read as "clean".
-  if (SIG.pathTooLong.test(text)) return { result: RESULT.PATH_TOO_LONG, resyncRequired: false, needsAttention: true, detail: outcomeDetail(text) };
+  if (SIG.pathTooLong.test(text)) return { result: RESULT.PATH_TOO_LONG, resyncRequired: false, needsAttention: true, detail: outcomeDetail(decidingRawLine(text, rawText, SIG.pathTooLong) || rawText) };
   if (SIG.conflict.test(text)) return { result: RESULT.CONFLICT_KEEP_BOTH, resyncRequired: false, needsAttention: true };
   return { result: o.resync ? RESULT.RESYNC_OK : RESULT.OK, resyncRequired: false, needsAttention: false };
 }
 
-module.exports = { classifyBisyncOutcome, classifyConnectionFailure, outcomeDetail, failedFileName, failedRelPath, statedLimitBytes, RESULT, VAULT_FULL, HOST_KEY_UNVERIFIED, SIG };
+module.exports = { classifyBisyncOutcome, maskFileNames, classifyConnectionFailure, outcomeDetail, failedFileName, failedRelPath, statedLimitBytes, RESULT, VAULT_FULL, HOST_KEY_UNVERIFIED, SIG };

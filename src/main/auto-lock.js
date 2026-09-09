@@ -49,7 +49,10 @@ class AutoLock {
     this._degraded = new Set();
     const t = deps.timers || {};
     this.idlePollMs = t.idlePollMs || DEFAULTS.idlePollMs;
-    this.idleThresholdMs = deps.idleThresholdMs || DEFAULTS.idleThresholdMs;
+    // `??`, not `||`: a deployment policy of 0 means "lock the moment the machine goes idle", and `||` read
+    // that as "unset" and quietly substituted the fifteen-minute default — the opposite of what was asked
+    // for, and silently. Only an absent or null value takes the default.
+    this.idleThresholdMs = deps.idleThresholdMs ?? DEFAULTS.idleThresholdMs;
     this.escalateAfterMs = t.escalateAfterMs || DEFAULTS.escalateAfterMs;
     this._setInterval = deps.setIntervalFn || setInterval;
     this._clearInterval = deps.clearIntervalFn || clearInterval;
@@ -103,14 +106,21 @@ class AutoLock {
   _pollIdle() {
     let idleSec = 0;
     try { idleSec = this.power.getSystemIdleTime(); } catch { this._reportDegraded('idle-clock-unavailable'); return; }
-    if (idleSec * 1000 >= this.idleThresholdMs) {
+    const idleMs = idleSec * 1000;
+    // The poll is the finest this can be seen at: a threshold below one interval would fire on a reading
+    // taken while someone is typing, resume on the next, and lock again on the one after — a lock/resume
+    // cycle every poll, each resume drawing a fresh credential. "Lock as soon as it goes idle" therefore
+    // means "idle for as long as it takes to notice", which is what an idle poller can honestly promise.
+    const threshold = Math.max(this.idleThresholdMs, this.idlePollMs);
+    if (idleMs >= threshold) {
       // Fire the idle lock when EITHER tier is active: the ZK key present, OR the account tier usable. A Standard-only
       // user has no ZK key (isUnlocked() is always false), so without the account-tier condition the idle lock would
       // never fire for them and account sync + its credential would live on unattended. lock() is safe with no ZK key
       // (the purge no-ops) and still pauses dispatch + drops the account credential via onChange('locked').
       if (!this._idleLatched && (this.lockState.isUnlocked() || this.lockState.isAccountUsable())) this._trigger('idle');
       this._idleLatched = true; // don't re-fire until OS input resumes
-    } else {
+    }
+    if (idleMs < threshold) {
       this._idleLatched = false;
       // Input is happening again. That reverses an IDLE lock — the idle clock is exactly what armed it. It must NOT
       // reverse a screen lock or a sleep: input at a lock screen (a person typing their password, or anything else

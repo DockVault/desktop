@@ -102,10 +102,13 @@ test('the real cause outranks the generic "needs a repair" bisync also reports, 
 });
 
 test('a data-safety abort still outranks a file refusal — a mass delete is the more serious event', () => {
-  const both = `${SERVER_SAYS.tooLargeBuffered}\nSafety abort: too many deletes (>50%, 9 of 10). Bisync aborted.`;
+  // The abort carries the log level the tool actually writes: a verdict about the run is believed only
+  // when it comes from a line the logger wrote, so a file NAME carrying a newline cannot forge one.
+  const both = `${SERVER_SAYS.tooLargeBuffered}\nERROR : Safety abort: too many deletes (>50%, 9 of 10). Bisync aborted.`;
   assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: both }).result, RESULT.ABORT_EXCESSIVE_DELETE);
   // as does a changed server identity
-  const mitm = `${SERVER_SAYS.notKept}\nknownhosts: key mismatch`;
+  const mitm = `${SERVER_SAYS.notKept}
+ERROR : Failed to create file system: NewFs: couldn't connect SSH: ssh: handshake failed: knownhosts: key mismatch`;
   assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: mitm }).result, RESULT.HOST_KEY_MISMATCH);
 });
 

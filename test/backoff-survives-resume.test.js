@@ -24,10 +24,10 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { SyncScheduler, REFUSAL_BACKOFF_BASE_MS } = require('../src/main/sync-scheduler');
+const { SyncScheduler, REFUSAL_BACKOFF_BASE_MS, REFUSAL_BACKOFF_MAX_MS } = require('../src/main/sync-scheduler');
 const { LockState } = require('../src/main/lock-state');
 const { AutoLock } = require('../src/main/auto-lock');
-const { classifyBisyncOutcome, classifyConnectionFailure, RESULT } = require('../src/daemon/bisync-outcome');
+const { classifyBisyncOutcome, classifyConnectionFailure, maskFileNames, RESULT } = require('../src/daemon/bisync-outcome');
 const { turnedAwayBody } = require('../src/main/manual-sync-copy');
 
 const vault = (id) => ({ vaultId: id, vaultName: id.toUpperCase(), localFolder: `/folders/${id}`, remotePath: id.toUpperCase(), enabled: true });
@@ -258,6 +258,133 @@ test('the shell wires it that way: the presence resume releases holds only, and 
   assert.strictEqual(direct.length, 3, 'the resume, and the helper’s own two calls — nothing else');
 });
 
+test('a FLAPPING door keeps escalating: only a run the door demonstrably served clears the wait', async () => {
+  // The bound is an escalating wait — 5, 10, 20, 40, then an hour — and it only escalates while the door's
+  // refusals stay on record. Deciding "the door accepted a credential" by exclusion meant every result that
+  // proves nothing wiped the record: unreachable, a changed identity, our own safety guard, the catch-all
+  // error. A door alternating refuse/unreachable therefore never got past the first step, and the whole bound
+  // degraded to one credential every five minutes for as long as the flapping lasted.
+  const lockState = new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+  let result = 'channel-refused';
+  const h = harness(lockState, { runSync: async () => ({ result, ran: true, resyncRequired: null, needsAttention: true }) });
+  const { sch } = h;
+
+  const waits = [];
+  for (const flap of ['connect-failed', 'error', 'host-key-mismatch', 'needs-resync', 'path-too-long']) {
+    result = 'channel-refused';
+    h.advance(REFUSAL_BACKOFF_MAX_MS + 1);           // let whatever window stands lapse, so a tick may try
+    sch.tickAll(); await settle(sch);
+    const st = sch.refusalState('a');
+    assert.ok(st, `the refusal is on record after a refusal (before a ${flap})`);
+    waits.push(st.until - h.now());
+    // ...and now the door flaps to something that says nothing about whether it would serve a credential.
+    result = flap;
+    h.advance(REFUSAL_BACKOFF_MAX_MS + 1);
+    sch.tickAll(); await settle(sch);
+    assert.ok(sch.refusalState('a'), `a ${flap} proves nothing about the door, so the wait stands`);
+  }
+  // Each refusal lengthened the wait rather than starting over. Asserted as the actual schedule rather than
+  // "non-decreasing", which a run of identical values would also satisfy — including the flat five minutes
+  // this test exists to rule out.
+  const shown = waits.map((w) => `${Math.round(w / 60000)}m`).join(' -> ');
+  assert.strictEqual(waits[0], REFUSAL_BACKOFF_BASE_MS, `the first wait is one step (${shown})`);
+  for (let i = 1; i < waits.length; i += 1) {
+    const doubled = Math.min(waits[i - 1] * 2, REFUSAL_BACKOFF_MAX_MS);
+    assert.strictEqual(waits[i], doubled, `each refusal doubles the wait, to the hour and no further (${shown})`);
+  }
+  assert.ok(waits[waits.length - 1] >= REFUSAL_BACKOFF_BASE_MS * 4, `and it climbed well past the first step, which the old rule never did (${shown})`);
+
+  // The one thing that does clear it is a run the door actually served.
+  result = 'ok';
+  h.advance(REFUSAL_BACKOFF_MAX_MS + 1);
+  sch.tickAll(); await settle(sch);
+  assert.strictEqual(sch.refusalState('a'), null, 'a served run clears it');
+});
+
+test('a run that finished cleanly serves, whatever else it had to say about a file', async () => {
+  // Not every green run is called "ok". A run can finish, refresh the baseline, and still report that one file
+  // was skipped for the length of its path. Naming only the happy results meant such a run left a vault waiting
+  // out an hour it had already earned its way out of — and the shared connection gate shut behind it.
+  const lockState = new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+  let outcome = { result: 'channel-refused', ran: true, code: 1, resyncRequired: null, needsAttention: true };
+  const h = harness(lockState, { runSync: async () => outcome });
+  const { sch } = h;
+  sch.requestSync('a'); await settle(sch);
+  assert.ok(sch.refusalState('a'), 'the door refused: on record');
+
+  outcome = { result: 'path-too-long', ran: true, code: 0, resyncRequired: false, needsAttention: true };
+  h.advance(REFUSAL_BACKOFF_MAX_MS + 1);
+  sch.tickAll(); await settle(sch);
+  assert.strictEqual(sch.refusalState('a'), null, 'a run that exited cleanly served, so the wait is over');
+  assert.strictEqual(sch.endpointState().failures, 0, 'and the server was plainly reached');
+});
+
+test("a data-safety abort proves the server was REACHED, even though it never proves the door served", async () => {
+  // Deciding more than half the files would be deleted takes a full listing of the far side, which cannot be
+  // had without talking to the server. Leaving these out of the reachability answer left the connection gate
+  // shut — and every routine tick saying "can't reach the sync server" — about a server just listed.
+  const lockState = new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+  let outcome = { result: 'connect-failed', ran: true, code: 1, resyncRequired: null, needsAttention: true };
+  const h = harness(lockState, { runSync: async () => outcome });
+  const { sch } = h;
+  sch.requestSync('a'); await settle(sch);
+  assert.ok(sch.endpointState().failures > 0, 'unreachable: the gate closed');
+
+  outcome = { result: 'abort-excessive-delete', ran: true, code: 1, resyncRequired: true, needsAttention: true };
+  h.advance(REFUSAL_BACKOFF_MAX_MS + 1);
+  sch.tickAll(); await settle(sch);
+  assert.strictEqual(sch.endpointState().failures, 0, 'the abort required a listing, so the server was reached');
+  // (this vault never had a refusal on record; the point of the test is the gate, above)
+});
+
+test('a check that answers lets the next attempt through, but does not restart the wait from the beginning', async () => {
+  // The credential-free check and a real run are not the same test: the check is a bare connection, a run has
+  // to authenticate and open the file subsystem as well. A server that answers one while refusing the other is
+  // exactly what this gate is for — so treating a passing check as proof the door works held the wait at its
+  // first step for as long as that lasted, which is the same collapse the per-vault wait was just fixed for.
+  const lockState = new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+  const h = harness(lockState, { runSync: async () => ({ result: 'connect-failed', ran: true, code: 1, resyncRequired: null, needsAttention: true }) });
+  const { sch } = h;
+  sch._io.probeEndpoint = async () => ({ ok: true }); // the check keeps saying the server is there
+  const waits = [];
+  for (let i = 0; i < 5; i += 1) {
+    h.advance(REFUSAL_BACKOFF_MAX_MS + 1);
+    sch.tickAll(); await settle(sch);
+    waits.push(sch.endpointState().until - h.now());
+  }
+  const shown = waits.map((w) => `${Math.round(w / 60000)}m`).join(' -> ');
+  for (let i = 1; i < waits.length; i += 1) {
+    assert.ok(waits[i] > waits[i - 1] || waits[i - 1] >= 60 * 60 * 1000, `the wait keeps climbing while the runs keep failing (${shown})`);
+  }
+  assert.ok(waits[waits.length - 1] > waits[0], `and never sits at its first step (${shown})`);
+
+  // And once a run genuinely works, the tally is gone.
+  h.sch._io.runSync = async () => ({ result: 'ok', ran: true, code: 0, resyncRequired: false, needsAttention: false });
+  h.advance(REFUSAL_BACKOFF_MAX_MS + 1);
+  sch.tickAll(); await settle(sch);
+  assert.strictEqual(sch.endpointState().failures, 0, 'a run the server served clears it');
+});
+
+test('the endpoint gate is opened only by a run that demonstrably REACHED the server', async () => {
+  // A weaker fact than "served", and deliberately so: a door that turned a credential away was plainly
+  // reached. But a generic error proves nothing here either, and must not re-open the gate.
+  const lockState = new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+  let result = 'connect-failed';
+  const h = harness(lockState, { runSync: async () => ({ result, ran: true, resyncRequired: null, needsAttention: true }) });
+  const { sch } = h;
+  sch.requestSync('a'); await settle(sch);
+  assert.ok(sch.endpointState().failures > 0, 'the door could not be reached: the gate closed');
+
+  result = 'error';
+  h.advance(REFUSAL_BACKOFF_MAX_MS + 1); sch.tickAll(); await settle(sch);
+  assert.ok(sch.endpointState().failures > 0, 'an unclassified failure says nothing about reachability, so the gate stays shut');
+
+  result = 'channel-refused';
+  h.advance(REFUSAL_BACKOFF_MAX_MS + 1); sch.tickAll(); await settle(sch);
+  assert.strictEqual(sch.endpointState().failures, 0, 'but a door that ANSWERED and refused was plainly reached');
+  assert.ok(sch.refusalState('a'), 'and that same answer is what puts it on the refusal record');
+});
+
 test("a run stopped by this computer's OWN safety guard neither opens the refusal window nor tears it down", async () => {
   // Naming the abort (the more serious event) must not cost the refusing door its place on record. Otherwise
   // each deliberate Repair press starts the wait again from the bottom of the schedule and mints against a
@@ -284,6 +411,262 @@ test("a run stopped by this computer's OWN safety guard neither opens the refusa
   h.advance(REFUSAL_BACKOFF_BASE_MS * 8);
   sch.tickAll(); await settle(sch);
   assert.strictEqual(sch.refusalState('a'), null, 'the one answer that does clear it');
+});
+
+// --- what a file is CALLED must never decide what the run is reported to have done ------------------------
+
+test('re-entering the vault password lets it try at once — and clears nothing else', async () => {
+  // The app says, in as many words, "if its status asks you to sign in or enter the vault password, doing that
+  // lets it try at once". The sign-in half became true in the last change; this is the other half. A person who
+  // does exactly what the status asks must not watch nothing happen.
+  const ls = () => new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+  const h = harness(ls(), { credentialPath: null, vaultHasPassword: () => true });
+  h.sch._noteRefusal('a', false, 'auth-failed');
+  assert.ok(h.sch.refusalState('a'), 'the vault is waiting');
+
+  h.sch.clearVaultPasswordRefusals(['a']);
+  assert.strictEqual(h.sch.refusalState('a'), null, 'the password it was waiting on has been given, so the wait is over');
+
+  // And it is narrow. Each of these was waiting on something else, and a vault password answers none of them.
+  const others = [
+    ['a server limiting attempts', harness(ls()), 'channel-refused'],
+    ["this computer's device identity", harness(ls()), 'auth-failed'],
+    ['the account session', harness(ls(), { credentialPath: null }), 'auth-failed'],
+  ];
+  for (const [what, other, reason] of others) {
+    other.sch._noteRefusal('a', false, reason);
+    other.sch.clearVaultPasswordRefusals(['a']);
+    assert.ok(other.sch.refusalState('a'), `${what}: a vault password is no answer to this, so the wait stands`);
+  }
+  // A vault that was never waiting, and a caller with nothing to say, are both no-ops rather than errors.
+  const quiet = harness(ls());
+  quiet.sch.clearVaultPasswordRefusals(['a', 'b']);
+  quiet.sch.clearVaultPasswordRefusals(undefined);
+  assert.strictEqual(quiet.sch.refusalState('a'), null);
+});
+
+test('a vault waiting on its password is offered up so the shell can notice the password being given', async () => {
+  // There is no event for "a vault was unlocked" — the page simply holds an unlock and main asks for the proof
+  // only when it is about to spend it. So the wait has to be visible from outside, with the moment it started,
+  // and what is handed over is an id and a timestamp: nothing secret leaves the scheduler.
+  const ls = () => new LockState({ getWindow: () => null, getDaemon: () => null, onChange: () => {}, timeouts: { rendererTimeoutMs: 5, daemonTimeoutMs: 5, daemonAttempts: 1 } });
+  const h = harness(ls(), { credentialPath: null, vaultHasPassword: () => true });
+  const at = h.now();
+  h.sch._noteRefusal('a', false, 'auth-failed');
+
+  const waiting = h.sch.vaultsAwaitingPassword();
+  assert.deepStrictEqual(waiting, [{ vaultId: 'a', since: at }], 'the vault, and when it started waiting');
+  assert.deepStrictEqual(Object.keys(waiting[0]).sort(), ['since', 'vaultId'], 'and nothing else — no secret rides along');
+
+  // A wait that has lapsed is not offered: there is nothing left to shorten.
+  h.advance(REFUSAL_BACKOFF_MAX_MS + 1);
+  assert.deepStrictEqual(h.sch.vaultsAwaitingPassword(), [], 'a lapsed wait needs no answer');
+
+  // Nor are the waits that a password could not answer.
+  for (const [what, other, reason] of [
+    ['a server limiting attempts', harness(ls()), 'channel-refused'],
+    ["this computer's device identity", harness(ls()), 'auth-failed'],
+    ['the account session', harness(ls(), { credentialPath: null }), 'auth-failed'],
+  ]) {
+    other.sch._noteRefusal('a', false, reason);
+    assert.deepStrictEqual(other.sch.vaultsAwaitingPassword(), [], `${what}: a vault password is no answer to it`);
+  }
+});
+
+test('the shell asks only WHEN a vault was unlocked, never for the password, and acts only on a newer unlock', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.js'), 'utf8');
+  const at = src.indexOf('async function pullVaultUnlockStamp(');
+  assert.ok(at > 0, 'the stamp-only probe exists');
+  const body = src.slice(at, src.indexOf('\n}', at));
+  assert.match(body, /vaultPasswordTimestamp/, 'it reads the moment of the unlock');
+  // The probe must hand back a NUMBER and nothing else. Asserting the shape it returns, rather than that one
+  // particular way of returning a password is absent, is what actually holds the line here.
+  assert.match(body, /return typeof ts === 'number'/, 'it answers with a number');
+  //  excludes vaultPasswordTimestamp, which it does legitimately return: the moment, never the secret.
+  assert.doesNotMatch(body, /return[^;]*vaultPassword/, 'and the password itself never leaves the page');
+  assert.match(body, /JSON\.stringify\(vaultId\)/, 'the vault id is bound into the page, not spliced as text');
+
+  const clearAt = src.indexOf('async function clearWaitsAnsweredByAnUnlock(');
+  assert.ok(clearAt > 0, 'and the wait is ended where that is noticed');
+  const clearBody = src.slice(clearAt, src.indexOf('\n}', clearAt));
+  assert.match(clearBody, /stamp > since/, 'strictly newer: the unlock the door already refused is not a fresh answer');
+  assert.match(clearBody, /clearVaultPasswordRefusals\(\[vaultId\]\)/, 'and only that vault stops waiting');
+  // It has to actually run on the routine pass, or none of the above happens.
+  assert.match(src, /await clearWaitsAnsweredByAnUnlock\(\);/, 'the routine pass looks before it dispatches');
+});
+
+test('the shell clears the wait at the moment the re-proof lands', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.js'), 'utf8');
+  const at = src.indexOf('if (out.granted.length)');
+  assert.ok(at > 0, 'the re-proof success branch is there');
+  const branch = src.slice(at, at + 600);
+  assert.match(branch, /clearVaultPasswordRefusals\(out\.granted\)/, 'the vaults whose password was just re-proved stop waiting');
+});
+
+test('a hostile FILE NAME cannot make the run report a changed server, a mass delete, or a repair', () => {
+  // The names in a vault are not ours. In a shared vault they arrive from other members, and the sync tool
+  // logs each one verbatim in its own per-file error lines. A bare-substring signature therefore handed anyone
+  // who could add a file the power to decide this computer's verdict about the RUN — worst of all a changed
+  // server identity, which stops syncing for every vault at once and needs a person to clear it.
+  const attacks = {
+    'docs/key mismatch.txt': RESULT.HOST_KEY_MISMATCH,
+    'knownhosts: key mismatch.txt': RESULT.HOST_KEY_MISMATCH,
+    'docs/max delete list.md': RESULT.ABORT_EXCESSIVE_DELETE,
+    'notes/all files were changed.doc': RESULT.ABORT_ALL_CHANGED,
+    'logs/critical error.log': RESULT.NEEDS_RESYNC,
+    'archive/must run --resync notes.txt': RESULT.NEEDS_RESYNC,
+    'a/path too long.txt': RESULT.PATH_TOO_LONG,
+  };
+  for (const [name, wouldHaveBeen] of Object.entries(attacks)) {
+    for (const line of [
+      `2026/09/03 02:00:07 ERROR : ${name}: Failed to copy: permission denied`,   // the shapes rclone really writes
+      `ERROR : ${name}: Failed to delete: permission denied`,                  // and a different one
+    ]) {
+      const o = classifyBisyncOutcome({ code: 1, stderr: line });
+      assert.strictEqual(o.result, RESULT.ERROR, `a file called "${name}" is just a failed run, not ${wouldHaveBeen}`);
+      assert.strictEqual(o.resyncRequired, null, `and it fabricates no repair: "${name}"`);
+    }
+  }
+});
+
+test('the run wrapping a FILE cause in its own verdict keeps that verdict — the dangerous direction', () => {
+  // The tool reports a run-level failure by wrapping whatever caused it: "Bisync critical error: failed to copy
+  // Path1 to Path2: ...". That reads exactly like a message about one file, so taking the name off the front of
+  // it would throw away the verdict itself. Losing a baseline is far worse than naming a cause wrongly: nothing
+  // would latch the repair, and the vault would go on running delete-capable syncs as if all were well.
+  for (const wrapped of [
+    'ERROR : Bisync critical error: failed to copy Path1 to Path2: context canceled',
+    'ERROR : Bisync critical error: failed to delete file: connection lost',
+    'ERROR : Bisync critical error: Failed to update listing: i/o error',
+    'ERROR : Bisync aborted. Must run --resync to recover.',
+  ]) {
+    const o = classifyBisyncOutcome({ code: 1, stderr: wrapped });
+    assert.strictEqual(o.result, RESULT.NEEDS_RESYNC, `the run's own verdict survives: ${wrapped.slice(0, 56)}`);
+    assert.strictEqual(o.resyncRequired, true, 'and the repair it owes is latched');
+    assert.strictEqual(maskFileNames(wrapped), wrapped, 'the verdict line is left whole');
+  }
+  // A safety abort wrapping a file cause the same way.
+  const abort = 'ERROR : Safety abort: too many deletes (>50%, 3 of 4). Bisync aborted.';
+  assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: abort }).resyncRequired, true);
+  // But a FILE merely NAMED after one of those words is still just a file: what tells them apart is that the
+  // run's own verdict is never a path — no folder in it, and no extension on the end.
+  for (const name of ['Bisync critical error.log', 'shared/Bisync aborted.md']) {
+    const line = `2026/09/03 02:00:07 ERROR : ${name}: corrupted on transfer: sizes differ 5 vs 6`;
+    assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: line }).result, RESULT.ERROR, `a file called "${name}" says nothing about the run`);
+  }
+});
+
+test('a planted name cannot steer WHICH file is named — or how big it is said to be', () => {
+  // The file named to a person is also the file whose size is read, and that size is what decides whether the
+  // app says a vault is out of room. Finding the name by searching the text again would find whichever line
+  // matched first — and someone who can add a file to a shared vault chooses that. A small decoy would hide a
+  // genuine "out of space"; a large one would invent it. The name now always comes from the SAME line that
+  // decided the outcome.
+  const decoy = 'ERROR : shared/partial file rename failed.txt: Failed to copy: permission denied';
+  const real = 'ERROR : holiday/video.bin.58de1a09.partial: partial file rename failed: Move Rename failed: file does not exist';
+  const o = classifyBisyncOutcome({ code: 1, stderr: `${decoy}\n${real}` });
+  assert.strictEqual(o.result, RESULT.UPLOAD_NOT_STORED);
+  assert.strictEqual(o.detail.file, 'video.bin', 'the file the run actually failed on');
+  assert.strictEqual(o.failedPath, 'holiday/video.bin', 'and its real path, not the decoy sitting above it');
+
+  // The same for a stated size limit: the number quoted must come from the failure that was classified.
+  const sizeDecoy = 'ERROR : notes/exceeds the 1 MB upload limit.txt: Failed to copy: permission denied';
+  const sizeReal = 'ERROR : big.bin: Failed to copy: sftp: "file exceeds the 25 MB per-file limit" (SSH_FX_FAILURE)';
+  const p = classifyBisyncOutcome({ code: 1, stderr: `${sizeDecoy}\n${sizeReal}` });
+  assert.strictEqual(p.result, RESULT.FILE_TOO_LARGE);
+  assert.strictEqual(p.detail.file, 'big.bin', 'the file the server refused');
+  assert.strictEqual(p.detail.maxBytes, 25 * 1024 * 1024, 'and the limit IT stated, not the one a name spelled out');
+});
+
+test('KNOWN RESIDUAL: a name that mimics the run\'s own verdict can only ever ask for a repair, never silence one', () => {
+  // Where this stops. A line reading `ERROR : Safety abort: all files were changed.txt: corrupted on transfer`
+  // and the real `ERROR : Safety abort: all files were changed on Path1 "..."` are the SAME shape: the tool
+  // writes names into its lines unescaped, so at this point they are genuinely indistinguishable. Protecting
+  // the real verdict — which must never be lost, or a mass delete goes unlatched — necessarily protects a name
+  // spelled to look like one.
+  //
+  // What matters is WHICH WAY it fails, and the answer is the safe one: such a name can only fabricate a
+  // repair that was not owed. It can never drop a repair that was, and never raise the changed-server alarm
+  // that would stop syncing for every vault. Both of those are pinned below.
+  //
+  // The real fix is structural — a log format that separates the name from the message and escapes what a name
+  // contains — and is out of this change's scope.
+  const mimic = 'ERROR : Safety abort: all files were changed.txt: corrupted on transfer: sizes differ 5 vs 6';
+  const o = classifyBisyncOutcome({ code: 1, stderr: mimic });
+  assert.strictEqual(o.resyncRequired, true, 'at worst it asks for a repair — the cautious direction');
+  assert.notStrictEqual(o.result, RESULT.HOST_KEY_MISMATCH, 'and never the alarm that stops every vault');
+
+  // The two that must hold whatever a name says:
+  //   a real abort keeps its latch even with a mimicking name in the same run,
+  const withMimic = `${mimic}\nERROR : Safety abort: too many deletes (>50%, 3 of 4). Bisync aborted.`;
+  assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: withMimic }).resyncRequired, true, 'a genuine abort is never silenced by a name');
+  //   and no name reaches the changed-server alarm, because that one is not protected by the deny-list.
+  // A name reaches the alarm only by BOTH opening with one of the run's exact verdict phrases AND carrying a
+  // whole ssh handshake chain — at which point it is word for word what a real one looks like, because a
+  // genuine critical error can itself be a failed handshake. Everything short of that is stopped:
+  for (const name of ['knownhosts: key mismatch.txt', 'shared/knownhosts: key mismatch', 'Bisync: knownhosts: key mismatch.log', 'ssh: handshake failed: knownhosts: key mismatch.txt']) {
+    const line = `ERROR : ${name}: corrupted on transfer: sizes differ 5 vs 6`;
+    assert.notStrictEqual(classifyBisyncOutcome({ code: 1, stderr: line }).result, RESULT.HOST_KEY_MISMATCH, `no name raises the alarm: ${name}`);
+  }
+});
+
+test('a name whose break is a carriage return or a unicode separator stays inside its own line', () => {
+  // A name can carry characters that end a line for some readers and not others. Those are flattened first, so
+  // the name stays inside its own message and the half after the break cannot pose as a fresh line.
+  //
+  // Note what this does NOT cover: a name containing a real newline genuinely does start a line, and its
+  // author writes every character of it, the level included. That one is recorded as a residual below —
+  // asserting it here would be claiming a guarantee this does not have.
+  // Two defences, both real. A break that is a carriage return or a unicode separator is flattened, so the
+  // name never leaves its own message:
+  for (const name of ['a\rknownhosts: key mismatch', 'a\rERROR : Safety abort: too many deletes (>50%, 9 of 9). Bisync aborted.', 'a\u2028ERROR : Bisync critical error', 'a\u0085ERROR : cannot find prior Path1']) {
+    const o = classifyBisyncOutcome({ code: 1, stderr: `ERROR : ${name}: Failed to copy: permission denied` });
+    assert.strictEqual(o.result, RESULT.ERROR, `flattened, so still just a name: ${JSON.stringify(name)}`);
+    assert.strictEqual(o.resyncRequired, null, 'and fabricates no repair');
+  }
+  // And a real newline that does start a line still says nothing, so long as it does not carry the level:
+  for (const name of ['evil\nknownhosts: key mismatch.txt', 'evil\nSafety abort: too many deletes (>50%, 9 of 9). Bisync aborted..txt', 'x\nBisync critical error.log', 'y\ncannot find prior Path1.txt']) {
+    const o = classifyBisyncOutcome({ code: 1, stderr: `ERROR : ${name}: Failed to copy: permission denied` });
+    assert.strictEqual(o.result, RESULT.ERROR, `a split name is still just a name: ${JSON.stringify(name)}`);
+    assert.strictEqual(o.resyncRequired, null, 'and fabricates no repair');
+  }
+});
+
+test('taking the name out is what stops the ones an anchor cannot: the two layers cover each other', () => {
+  // Some signatures are distinctive enough to be matched anywhere ("knownhosts: key mismatch" is not a phrase
+  // that turns up by accident), so they are not anchored to the start of a line — and a file can be named
+  // exactly that. Masking is what answers those. Conversely a per-file message the mask does not recognise
+  // leaves the name in place, and the anchor is what answers that. Neither layer is redundant.
+  // This one no anchor can help with: "knownhosts: key mismatch" is the ssh library's own phrase and is
+  // matched wherever it appears on purpose, because failing to NAME a real key change is worse than a false
+  // alarm. Taking the file name out is the only thing between a file called that and a changed-server alarm
+  // across every vault.
+  const named = 'ERROR : knownhosts: key mismatch.txt: Failed to copy: permission denied';
+  assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: named }).result, RESULT.ERROR, 'the name is taken out before any signature reads it');
+  assert.strictEqual(maskFileNames(named), 'ERROR : <file>: Failed to copy: permission denied');
+  // The run's own verdict lines are NOT file messages and are left exactly as they are.
+  const verdict = 'ERROR : Safety abort: too many deletes (>50%, 3 of 4). Bisync aborted.';
+  assert.strictEqual(maskFileNames(verdict), verdict, "a verdict about the run keeps every word");
+  assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: verdict }).result, RESULT.ABORT_EXCESSIVE_DELETE);
+});
+
+test('the real signatures still fire, and still name the file they were about', () => {
+  const real = {
+    'ERROR : Safety abort: too many deletes (>50%, 3 of 4). Run with --force if desired. Bisync aborted.': RESULT.ABORT_EXCESSIVE_DELETE,
+    '2026/09/03 02:00:07 ERROR : Safety abort: too many deletes (>50%, 5 of 7). Bisync aborted.': RESULT.ABORT_EXCESSIVE_DELETE,
+    'ERROR : Safety abort: all files were changed on Path2 "vault:v/". Bisync aborted.': RESULT.ABORT_ALL_CHANGED,
+    'ERROR : Bisync critical error: cannot find prior Path1 listing': RESULT.NEEDS_RESYNC,
+    "ERROR : Failed to create file system: NewFs: couldn't connect SSH: ssh: handshake failed: knownhosts: key mismatch": RESULT.HOST_KEY_MISMATCH,
+  };
+  for (const [line, expected] of Object.entries(real)) {
+    assert.strictEqual(classifyBisyncOutcome({ code: 1, stderr: line }).result, expected, line.slice(0, 60));
+  }
+  // And the detail a person is shown still comes from the untouched text, so the file is still named.
+  const outOfRoom = 'ERROR : holiday.bin.58de1a09.partial: partial file rename failed: Move Rename failed: file does not exist\nERROR : Bisync aborted. Must run --resync to recover.';
+  const o = classifyBisyncOutcome({ code: 1, stderr: outOfRoom });
+  assert.strictEqual(o.result, RESULT.UPLOAD_NOT_STORED);
+  assert.strictEqual(o.detail && o.detail.file, 'holiday.bin', 'masking is for the verdict, never for what the person is told');
+  assert.strictEqual(o.resyncRequired, true, 'and the repair the run owes is still kept');
 });
 
 test('a green run is never given a repair it did not earn', () => {
@@ -341,7 +724,7 @@ const ALL_CHANGED = 'ERROR : Safety abort: all files were changed on Path2 "vaul
 const NEEDS_RESYNC = 'ERROR : Bisync critical error: cannot find prior Path1 listing. Bisync aborted. Must run --resync to recover.';
 const AUTH_REFUSED = 'ssh: unable to authenticate, attempted methods [none password]';
 const CONN_RESET = 'NOTICE : connection reset by peer during an earlier list';
-const HOST_KEY = 'knownhosts: key mismatch';
+const HOST_KEY = "ERROR : Failed to create file system: NewFs: couldn't connect SSH: ssh: handshake failed: knownhosts: key mismatch";
 
 test('NO connection verdict can drop a repair the run also owes — every combination keeps the latch', () => {
   // The latch (resyncRequired: true) is what holds a vault until a person deliberately repairs it. Losing it

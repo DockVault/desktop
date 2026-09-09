@@ -358,10 +358,7 @@ app.whenReady().then(async () => {
       powerMonitor,                                  // the REAL OS input-idle clock
       lockState,
       getWindow: () => null,
-      idleThresholdMs: 1,                            // any idle fires on the first real poll (this run IS idle).
-                                                     // 1, not 0: the constructor takes `deps.idleThresholdMs ||
-                                                     // DEFAULT`, so a 0 would silently become the 15-minute policy
-                                                     // and this phase would measure nothing at all.
+      idleThresholdMs: 1,                            // any idle at all, once a poll has been able to see it.
       timers: { idlePollMs: 100, escalateAfterMs: 10 * 60 * 1000 },
     });
     al.start();

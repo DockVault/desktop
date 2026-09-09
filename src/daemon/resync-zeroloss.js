@@ -200,9 +200,12 @@ async function zeroLossResync(o) {
   const keptConflict = plan.some((a) => a.kind === 'conflict-keep-both');
   if (r.ran && keptConflict) {
     if (o.db) recordRun(o.db, o.vault, { result: RESULT.CONFLICT_KEEP_BOTH, resyncRequired: r.resyncRequired, atUtc: now() });
-    return { ran: r.ran, result: RESULT.CONFLICT_KEEP_BOTH, preserved, resyncRequired: r.resyncRequired, needsAttention: true };
+    return { ran: r.ran, code: r.code, result: RESULT.CONFLICT_KEEP_BOTH, preserved, resyncRequired: r.resyncRequired, needsAttention: true };
   }
-  return { ran: r.ran, result: r.result, preserved, resyncRequired: r.resyncRequired, needsAttention: r.needsAttention, detail: r.detail || null };
+  // The exit code travels too: the scheduler reads "this run exited cleanly" as proof the door served it, and
+  // without it every Repair looked like a run that proved nothing — leaving a vault waiting out an hour it had
+  // already earned its way out of, and the shared connection gate shut behind it.
+  return { ran: r.ran, code: r.code, result: r.result, preserved, resyncRequired: r.resyncRequired, needsAttention: r.needsAttention, detail: r.detail || null };
 }
 
 module.exports = { zeroLossResync, parseLsf, parseCheckDiffering, walkLocal, reserveLocalPath };

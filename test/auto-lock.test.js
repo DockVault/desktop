@@ -222,3 +222,49 @@ test('input alone never un-pauses a SCREEN LOCK or a SLEEP: only the OS unlock d
   captured.poll();
   assert.strictEqual(lock.isAccountUsable(), true, 'returning input reverses the idle lock');
 });
+
+test('an explicit "lock the moment it goes idle" policy is honoured, not read as unset', () => {
+  // 0 is a real policy — lock as soon as the machine is idle at all — and it is falsy, so reading it with `||`
+  // silently substituted the fifteen-minute default: the opposite of what was asked for, and with no complaint.
+  // A deployment that asked for the strictest setting would have quietly got the loosest.
+  const { al, captured, power, lock } = harness({ overrides: { idleThresholdMs: 0 } });
+  al.start();
+  // A reading taken while someone is typing must NOT lock. Nothing finer than the poll can be observed, so
+  // firing below that would lock, resume on the next reading, and lock again on the one after — a cycle every
+  // poll, each resume drawing a fresh credential.
+  power.idle = 0;
+  captured.poll();
+  assert.deepStrictEqual(lock.reasons, [], 'a machine in active use is not idle');
+  // But the moment it has actually been idle for as long as it takes to notice, it locks.
+  power.idle = 1;
+  captured.poll();
+  assert.deepStrictEqual(lock.reasons, ['idle'], 'idle for a whole poll fires the lock at once');
+
+  // And the default still applies when nothing was asked for.
+  const bare = harness({ overrides: { idleThresholdMs: undefined } });
+  bare.al.start();
+  bare.power.idle = 60; // a minute idle, far short of the default
+  bare.captured.poll();
+  assert.deepStrictEqual(bare.lock.reasons, [], 'with no policy given, the default still waits');
+});
+
+test('"lock the moment it goes idle" still notices when the person comes back', () => {
+  // Honouring 0 is only half of it. The reverse edge used to be "the idle reading is UNDER the threshold", and
+  // with a threshold of 0 no reading ever is — so the strictest policy would have meant "lock now, and never
+  // resume on its own again". What actually says someone is here is the OS idle clock resetting.
+  const { al, captured, power, lock } = harness({ overrides: { idleThresholdMs: 0 } });
+  al.start();
+  power.idle = 5; captured.poll();
+  assert.deepStrictEqual(lock.reasons, ['idle'], 'idle at all -> locked');
+  assert.strictEqual(lock.appLocked, true);
+
+  power.idle = 0; captured.poll();                    // a key pressed: the OS clock resets
+  assert.ok((lock.resumes || 0) >= 1, 'the reverse edge fires on the clock dropping, not on being under a threshold');
+  assert.strictEqual(lock.appLocked, false, 'and the person is back at their computer');
+
+  // Still latched correctly afterwards: a fresh idle stretch locks again, exactly once.
+  power.idle = 9; captured.poll();
+  assert.deepStrictEqual(lock.reasons, ['idle', 'idle'], 'a new idle stretch locks again');
+  power.idle = 12; captured.poll();
+  assert.deepStrictEqual(lock.reasons, ['idle', 'idle'], 'and does not re-fire while it stays idle');
+});

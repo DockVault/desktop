@@ -67,9 +67,37 @@ const ENDPOINT_BACKOFF_MAX_MS = 60 * 60 * 1000;
 // The refusal class that backs off PER VAULT: the door answered, and turned this computer's credential away.
 // (A connect-class failure is the shared endpoint gate above; a settled device-side refusal is a hold.)
 const REFUSAL_RESULTS = new Set(['auth-failed', 'channel-refused']);
-// The run results that are this computer's OWN safety guard stopping the run, not the server's answer to a
-// credential. They teach the refusal back-off nothing either way, so they must neither open it nor clear it.
-const SELF_ABORT_RESULTS = new Set(['abort-excessive-delete', 'abort-all-changed']);
+// The run results that PROVE the door served the run: it took a credential, opened a channel, and did the
+// work — or answered about a particular file it would not take, which is the same proof about the door. Only
+// these clear a vault's refusal back-off.
+//
+// Decided as a POSITIVE list, because the alternative was deciding it by exclusion — anything that executed
+// and was not itself a refusal — and that quietly included every result that proves nothing: a door that could
+// not be reached, a changed server identity, this computer's own safety guard stopping the run, and the
+// catch-all error. A door alternating "refuse" and "unreachable" therefore wiped the record on every flap, so
+// the 5→10→20→40→60-minute escalation never got past its first step and the bound settled at one credential
+// every five minutes for as long as the flapping went on. A result nobody has classified yet lands outside
+// this list and keeps the wait, which is the safe direction to be wrong in.
+const DOOR_SERVED_RESULTS = new Set([
+  'ok', 'resync-ok', 'conflict-keep-both',
+  // The server answered ABOUT A FILE — it refused one for its size, said it had no room, or took the bytes and
+  // did not keep them. Whatever that says about the file, the door itself plainly served this run.
+  'file-too-large', 'server-no-space', 'upload-not-stored', 'vault-full',
+]);
+// And, whatever it is called, a run that EXITED CLEANLY served: it walked both sides and finished. That covers
+// the outcomes which are green but not silent — a file skipped for the length of its path, say — without
+// having to name each one here and risk forgetting the next.
+const doorServed = (o) => !!o && o.ran === true && (o.code === 0 || DOOR_SERVED_RESULTS.has(o.result));
+// The weaker fact the shared endpoint gate needs: the server was REACHED at all. A door that turned a
+// credential or a channel away was plainly reached — it answered — so those count here, though they are
+// exactly the ones that must never clear a refusal back-off. So do this computer's own safety aborts: deciding
+// that more than half the files would be deleted, or that everything on one side changed, takes a full listing
+// of the far side, which cannot be had without talking to the server. Leaving them out left the gate shut —
+// and every routine tick answered "can't reach the sync server" — about a server the app had just listed.
+const DOOR_REACHED_RESULTS = new Set([
+  ...DOOR_SERVED_RESULTS, 'auth-failed', 'channel-refused', 'abort-excessive-delete', 'abort-all-changed',
+]);
+const doorReached = (o) => !!o && o.ran === true && (o.code === 0 || DOOR_REACHED_RESULTS.has(o.result));
 // The run results that MIGHT be the vault running out of room, and are worth one read of the vault's own
 // record to find out. The SFTP door decides at close whether to keep an upload and the protocol gives a close
 // no way to say no, so the client sees only that the file is not there ('upload-not-stored'), or a bare
@@ -148,15 +176,21 @@ class SyncScheduler {
     r.reason = reason;
     r.until = this._now() + Math.min(REFUSAL_BACKOFF_BASE_MS * (2 ** (r.failures - 1)), REFUSAL_BACKOFF_MAX_MS);
     r.manualAllowed = !manual;
-    // Whether SIGNING IN could plausibly change this particular answer — decided here, while the two facts that
-    // settle it are still to hand, because the refusal outlives the run. Only a plain account-session refusal
-    // qualifies. A door refusing this computer's DEVICE identity is never an account matter (the app does not
-    // even ask for a sign-in there, it re-checks the device's own standing), and a vault whose password may have
-    // rotated wants that password, not a session. Recorded alongside the reason rather than folded into it, so
-    // every existing reader of `reason` — the glance, the card, the answer a press earns — is untouched.
-    r.signInMayHelp = reason === 'auth-failed'
-      && !(typeof this._io.credentialPath === 'function' && this._io.credentialPath(vaultId) === 'device')
-      && !(typeof this._io.vaultHasPassword === 'function' && this._io.vaultHasPassword(vaultId));
+    r.at = this._now(); // when this refusal was recorded, so a later action can be told from an earlier one
+    // WHICH ACTION, if any, could change this particular answer — decided here, while the two facts that settle
+    // it are still to hand, because the refusal outlives the run. Recorded alongside the reason rather than
+    // folded into it, so every existing reader of `reason` — the glance, the card, the answer a press earns —
+    // is untouched.
+    //   'sign-in'        a plain account-session refusal: a new session genuinely may be accepted.
+    //   'vault-password' the vault's password may have rotated under the grant; that password is what is wanted.
+    //   'device'         this computer's own identity was refused. Neither of the above is an answer to it; its
+    //                    standing is re-checked on its own and surfaces as its own state.
+    //   null             the door refused the CHANNEL — it is limiting what it accepts, and only waiting helps.
+    // Nothing outside this list may clear the wait early, which is why the default is the one that clears nothing.
+    r.remedy = reason !== 'auth-failed' ? null
+      : (typeof this._io.credentialPath === 'function' && this._io.credentialPath(vaultId) === 'device') ? 'device'
+        : (typeof this._io.vaultHasPassword === 'function' && this._io.vaultHasPassword(vaultId)) ? 'vault-password'
+          : 'sign-in';
     this._refusal.set(vaultId, r);
   }
 
@@ -195,7 +229,13 @@ class SyncScheduler {
     if (typeof this._io.probeEndpoint !== 'function') return null;
     let p;
     try { p = await this._io.probeEndpoint(); } catch { p = { ok: false, reason: 'sync-server-unreachable' }; }
-    if (p && p.ok === true) return null;
+    // A probe that answers lets THIS dispatch through, and re-opens the door to routine ticks — but it does
+    // not count as the door working. The probe is a bare connection; a run needs to authenticate and open
+    // the file subsystem too, and a server that answers one while refusing the other is exactly the case
+    // this gate exists for. Zeroing the count there held the wait at its first step for as long as that
+    // lasted, which is the same collapse the per-vault back-off was just fixed for. So the WAIT is lifted
+    // and the tally is kept: if the run fails again, the schedule carries on from where it was.
+    if (p && p.ok === true) { ep.until = 0; return null; }
     const reason = (p && typeof p.reason === 'string' && p.reason) ? p.reason : 'sync-server-unreachable';
     this._noteConnectFailure(reason);
     // A changed server identity is a settled refusal (HELD_REASONS): routine ticks stop until a person acts.
@@ -252,7 +292,7 @@ class SyncScheduler {
    * what a sign-in is entitled to; it is not an identity change, so it is deliberately narrower than
    * clearRefusalBackoff().
    *
-   * Which refusals those are is decided when each one is recorded (see `signInMayHelp` in _noteRefusal): a
+   * Which refusals those are is decided when each one is recorded (see `remedy` in _noteRefusal): a
    * device identity refused at the door, and a vault whose password may have rotated, are both left standing
    * too — a new account session says nothing about either, and the app never offers a sign-in for them.
    *
@@ -264,7 +304,39 @@ class SyncScheduler {
    * would both re-open the flood and make our own sentence a lie.
    */
   clearCredentialRefusals() {
-    for (const [vaultId, r] of this._refusal) if (r && r.signInMayHelp === true) this._refusal.delete(vaultId);
+    for (const [vaultId, r] of this._refusal) if (r && r.remedy === 'sign-in') this._refusal.delete(vaultId);
+  }
+
+  /**
+   * The vaults whose wait is waiting on a VAULT PASSWORD, with the moment each refusal was recorded. Handed out
+   * so the shell can notice that the password has since been given — there is no event for that, the renderer
+   * simply holds an unlock — and end exactly those waits. Nothing here is secret: an id and a timestamp.
+   * @returns {Array<{vaultId:string, since:number}>}
+   */
+  vaultsAwaitingPassword() {
+    const out = [];
+    for (const [vaultId, r] of this._refusal) {
+      if (r && r.remedy === 'vault-password' && this._now() < r.until) out.push({ vaultId, since: r.at || 0 });
+    }
+    return out;
+  }
+
+  /**
+   * The vault password was just re-proved for these vaults, so a wait that was WAITING on that password has had
+   * its answer: forget it and let the next tick try. Nothing else is touched — a door limiting attempts, a
+   * refused device identity, and an account-session refusal all still stand, because re-entering a vault's
+   * password says nothing about any of them.
+   *
+   * This is the other half of a promise the app makes out loud. Its own words, when the door refuses a
+   * credential, are "if its status asks you to sign in or enter the vault password, doing that lets it try at
+   * once" — and until the password half was wired, a person who did exactly as asked watched nothing happen.
+   * @param {string[]} vaultIds
+   */
+  clearVaultPasswordRefusals(vaultIds) {
+    for (const vaultId of Array.isArray(vaultIds) ? vaultIds : []) {
+      const r = this._refusal.get(vaultId);
+      if (r && r.remedy === 'vault-password') this._refusal.delete(vaultId);
+    }
   }
 
   // Enqueue a request, coalescing per vault. A request for the IN-FLIGHT vault is dropped (the running
@@ -548,18 +620,15 @@ class SyncScheduler {
         return outcome;
       }
       // What the run taught the two minting bounds, learned BEFORE the outcome is routed to its state (several
-      // routes below return early). The refusal back-off: a refused run opens or lengthens this vault's window;
-      // any other run that executed clears it (the door took a credential again). The endpoint gate: a
-      // connect-class result closes it (the next dispatch probes instead of minting); any run that actually
-      // reached the server — refused or not — opens it again.
+      // routes below return early). The refusal back-off: a refused run opens or lengthens this vault's window,
+      // and only a run the door demonstrably SERVED clears it. The endpoint gate: a connect-class result closes
+      // it (the next dispatch probes instead of minting), and a run that demonstrably REACHED the server —
+      // refused or not — opens it again. Both are positive lists: a run that proves neither leaves both bounds
+      // exactly as it found them.
       if (refused) this._noteRefusal(vaultId, !!item.manual, outcome.result);
-      // A data-safety abort is NOT the door accepting a credential — it is this computer's own guard refusing to
-      // carry the run out. Since a refused run whose log also carries an abort is named for the abort (the more
-      // serious event), tearing the window down here would let each deliberate Repair press mint afresh at the
-      // bottom of the schedule, against a door that is still refusing.
-      else if (outcome && outcome.ran === true && !SELF_ABORT_RESULTS.has(outcome.result)) this._refusal.delete(vaultId);
+      else if (doorServed(outcome)) this._refusal.delete(vaultId);
       if (outcome && CONNECT_RESULTS.has(outcome.result)) this._noteConnectFailure(outcome.result === 'host-key-mismatch' ? 'host-key-mismatch' : 'sync-server-unreachable');
-      else if (outcome && outcome.ran === true) this._clearConnectFailures();
+      else if (doorReached(outcome)) this._clearConnectFailures();
       // a persistent auth-failed (past its one retry) for a PASSWORD-PROTECTED vault is far more likely a
       // server-side vault-password ROTATION — the mint's password proof was voided — than a dead account session.
       // Route it to the "needs unlock" must-act (re-enter the vault password), NOT the sign-in latch, by rewriting

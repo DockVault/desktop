@@ -509,6 +509,47 @@ async function seedRestoredSession(win) {
 // and surfaces 'needs-unlock' WITHOUT calling the server — so no attempt is spent on the shared limiter).
 const VAULT_PW_MAX_LEN = 1024;              // a generous upper bound; longer -> reject as malformed
 const VAULT_PW_WINDOW_MS = 15 * 60 * 1000;  // main-enforced freshness, matching the renderer's own window
+// WHEN a vault was last unlocked, and nothing else — no password crosses this boundary. Used to notice that
+// someone has done the very thing the app asked them to do, since there is no event for it: the renderer just
+// holds an unlock, and main pulls the proof only when it is about to spend it. Asking for the instant instead
+// keeps a secret out of a question that is only about a clock.
+const UNLOCK_STAMP_TIMEOUT_MS = 1500; // how long the page gets to answer "when was this unlocked"
+async function pullVaultUnlockStamp(vaultId) {
+  const win = mainWindow;
+  if (!win || win.isDestroyed() || typeof vaultId !== 'string' || !vaultId) return 0;
+  try {
+    // Bounded, because this now runs AHEAD of the sync pass: a page that is busy or wedged must not be able
+    // to hold up the scheduler behind it. A read that does not answer in time is simply "no unlock seen".
+    const ts = await Promise.race([
+      win.webContents.executeJavaScript(
+      `(() => { try {`
+      + ` if (typeof state === 'undefined' || !state) return 0;`
+      + ` const want = ${JSON.stringify(vaultId)};`
+      + ` if (!state.currentVaultId || String(state.currentVaultId) !== String(want)) return 0;`
+      + ` if (typeof state.vaultPassword !== 'string' || state.vaultPassword.length === 0) return 0;`
+      + ` return typeof state.vaultPasswordTimestamp === 'number' ? state.vaultPasswordTimestamp : 0;`
+      + ` } catch (e) { return 0; } })()`, true),
+      new Promise((resolve) => { const t = setTimeout(() => resolve(0), UNLOCK_STAMP_TIMEOUT_MS); if (t.unref) t.unref(); }),
+    ]);
+    return typeof ts === 'number' && Number.isFinite(ts) ? ts : 0;
+  } catch { return 0; } // a failed read is simply "no unlock seen", never a reason to stop waiting
+}
+
+// A vault waiting on its password stops waiting once that password has been given. The app tells people so in
+// as many words, and until this there was no path from doing it to the wait ending: a person did exactly what
+// the status asked and watched nothing happen for up to an hour.
+async function clearWaitsAnsweredByAnUnlock() {
+  if (!syncScheduler || typeof syncScheduler.vaultsAwaitingPassword !== 'function') return;
+  let waiting = [];
+  try { waiting = syncScheduler.vaultsAwaitingPassword(); } catch { return; }
+  for (const { vaultId, since } of waiting) {
+    const stamp = await pullVaultUnlockStamp(vaultId);
+    // Strictly newer than the refusal: the unlock that was already in hand when the door refused is the one
+    // that was refused, and re-offering it would just spend another credential on the same answer.
+    if (stamp > since) syncScheduler.clearVaultPasswordRefusals([vaultId]);
+  }
+}
+
 async function pullVaultUnlock(vaultId) {
   const win = mainWindow;
   if (!win || win.isDestroyed() || typeof vaultId !== 'string' || !vaultId) return null;
@@ -1255,6 +1296,7 @@ async function tickSync({ manual = false } = {}) {
   // failed offline, or a freshly-switched server): fill the door within one routine tick rather than only on a
   // lock->unlock cycle. Fail-quiet + idempotent; the one-time notification stays governed by the origin flag.
   try { const o = serverConfig.readServerOrigin(app.getPath('userData')); if (o && (!deviceMigrateSupport || deviceMigrateSupport.origin !== o)) void maybeOfferDeviceMigration(); } catch { /* best-effort */ }
+  await clearWaitsAnsweredByAnUnlock(); // before dispatch, so a vault whose password has been given goes this pass
   await runStateSnapshot.refresh(syncConfiguredIds()); // a failed refresh keeps it not-fresh → the scheduler skips
   // A deliberate pass (a folder just found again) also looks afresh for a moved folder. It is deliberate but it is
   // NOT a person pressing each vault's button, so it is marked press:false: it neither starts nor is held by the
@@ -2097,7 +2139,11 @@ async function maybeResumeDeviceGrants() {
       clearPending: (id) => { devicePending.clearPending(safeStorage, dir, id); },
       ackComplete: (id) => { const entry = syncConfigList().find((e) => e.vaultId === id); ackDeviceSetupComplete(entry ? entry.vaultName : ''); },
     });
-    if (out.granted.length) { invalidateMigrationView(); try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ } refreshTray(); } // a resumed grant wrote a record → the door drops that vault; reflect it, the next mint uses the device path
+    if (out.granted.length) {
+      // A re-proof that landed IS the answer these vaults were waiting on, so stop making them wait: the app
+      // tells people that entering the vault password lets it try at once, and this is what makes that true.
+      if (syncScheduler) syncScheduler.clearVaultPasswordRefusals(out.granted);
+      invalidateMigrationView(); try { if (syncHub) syncHub.setDeviceLive(deviceIdentityLive()); } catch { /* best-effort */ } refreshTray(); } // a resumed grant wrote a record → the door drops that vault; reflect it, the next mint uses the device path
   } finally { deviceGrantResumeBusy = false; }
 }
 
