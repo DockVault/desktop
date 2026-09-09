@@ -2016,7 +2016,46 @@ function buildEnableIo() {
     // Give the folder its identity: the hidden marker in its root (folder-marker.js). A marker already there
     // for this same vault is kept, so a folder set up again keeps the identity it had; anything else (none, or
     // a leftover from another sync) is replaced with a fresh id. Returns the sync id the config records.
+    //
+    // The REPLACEMENT case is no longer silent — see readMarker/confirmReuse below, which run first and give
+    // the person the chance to pick a different folder before another vault's marker is taken over.
     markFolder: (folder, vaultId) => markFolderFor(folder, vaultId),
+    // What the folder has already been used for, read before anything is written to it.
+    readMarker: (folder) => { try { return folderMarker.readMarker(folder); } catch { return { kind: 'absent' }; } },
+    // Where this vault's sync was last pointed, if anywhere: it decides whether a re-link RESUMES from the
+    // existing bisync listings (same path) or starts a fresh baseline (a different one).
+    knownFolderFor: (vaultId) => {
+      try {
+        const e = storedConfig().find((x) => String(x.vaultId).toLowerCase() === String(vaultId).toLowerCase());
+        return (e && e.localFolder) || null;
+      } catch { return null; }
+    },
+    // The other vault's NAME, so the warning can say whose folder this is rather than quoting an id at a
+    // person. A vault that is no longer in the config has no name here, and the copy falls back to
+    // "another vault" rather than inventing one.
+    vaultNameFor: (vaultId) => {
+      try {
+        const e = storedConfig().find((x) => String(x.vaultId).toLowerCase() === String(vaultId).toLowerCase());
+        return (e && e.vaultName) || null;
+      } catch { return null; }
+    },
+    confirmReuse: async ({ title, detail, reuse }) => {
+      // Taking over another vault's marker is the one case that costs something, so its default button is
+      // the safe one — the same rule the folder-privacy gate follows.
+      const takeover = reuse && reuse.takesOverMarker;
+      const buttons = takeover
+        ? ['Choose a different folder', 'Use this folder anyway']
+        : ['Continue', 'Choose a different folder'];
+      const r = await dialog.showMessageBox(mainWindow, {
+        type: takeover ? 'warning' : 'info',
+        title, message: title, detail, buttons, noLink: true,
+        defaultId: takeover ? 0 : 0,
+        cancelId: takeover ? 0 : 1,
+      });
+      const chose = buttons[r.response];
+      if (chose === 'Choose a different folder') return 'choose-different';
+      return true;
+    },
     onRefuse: async (reason) => {
       await dialog.showMessageBox(mainWindow, {
         type: 'warning', title: "That folder can't be used", noLink: true,

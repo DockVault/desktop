@@ -20,6 +20,7 @@
  */
 
 const { remotePathForVault, makeConfigEntry, classifyLocalTarget } = require('./sync-config');
+const relink = require('./relink');
 
 /**
  * @param {object} io injected input/output surface
@@ -89,6 +90,35 @@ async function runEnableFlow(io) {
       if (decision !== 'make-private') return { enabled: false, cancelled: true }; // declined -> no strip, nothing saved
       const made = io.makePrivate ? await io.makePrivate(resolved) : { ok: false, reason: 'folder-problem' };
       if (!made.ok) { await io.onRefuse(made.reason || 'folder-problem'); continue; } // couldn't secure -> re-pick, never a dead-end
+    }
+
+    // WHAT THIS FOLDER HAS ALREADY BEEN USED FOR, said before anything is written to it.
+    //
+    // A folder can arrive carrying a marker from an earlier sync — this vault's, or another vault's, or one
+    // that cannot be read. Setting up used to act on all three silently: it kept the sync id when the vault
+    // matched and otherwise overwrote the marker without a word, which quietly took another vault's folder
+    // identity away. It also said nothing about the sync BASELINE, so a person re-linking a folder they
+    // synced last month got "waiting to start" and a long first run with nothing to explain either.
+    //
+    // Asked BEFORE the consent below, because it can change the answer to it: someone told that this folder
+    // belongs to another vault may well pick a different one.
+    if (typeof io.readMarker === 'function') {
+      const reuse = relink.classifyPick({
+        marker: io.readMarker(resolved),
+        vaultId: vault.vaultId,
+        folder: resolved,
+        knownFolder: typeof io.knownFolderFor === 'function' ? io.knownFolderFor(vault.vaultId) : null,
+      });
+      const say = relink.pickMessage(reuse, {
+        vaultName: vault.vaultName,
+        otherVaultName: reuse.otherVaultId && typeof io.vaultNameFor === 'function' ? io.vaultNameFor(reuse.otherVaultId) : null,
+      });
+      // 'fresh' says nothing — a first setup should not be interrupted to be told it is one.
+      if (say && typeof io.confirmReuse === 'function') {
+        const go = await io.confirmReuse({ ...say, reuse, folder: resolved });
+        if (go === 'choose-different') continue;   // re-pick, nothing written, no marker taken over
+        if (go !== true) return { enabled: false, cancelled: true };
+      }
     }
 
     // Consent is two-way and folder-aware: a bisync uploads the folder's existing (and future)

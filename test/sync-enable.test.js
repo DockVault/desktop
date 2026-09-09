@@ -215,3 +215,96 @@ test('without a markFolder (an older io) the entry is saved without a sync id, t
   assert.strictEqual(r.enabled, true);
   assert.strictEqual(log.saved.syncId, undefined);
 });
+
+// ---------------------------------------------------------------------------------------------
+// RE-LINKING A FOLDER THAT HAS BEEN SYNCED BEFORE
+//
+// A picked folder can already carry a marker: this vault's, another vault's, or one that cannot be read.
+// The flow used to act on all three without a word — keeping the sync id when the vault matched and
+// otherwise overwriting the marker, which takes another vault's folder identity away. And it said nothing
+// about the sync baseline, so a re-link that starts a full first comparison looked like an unexplained
+// "waiting to start".
+// ---------------------------------------------------------------------------------------------
+
+// The marker-aware callbacks are attached only when a test asks for them, mirroring makeIo's own rule for
+// the privacy gate — so the tests above keep exercising the shape production has when a folder is fresh.
+function withMarker(over = {}) {
+  const { io, log } = makeIo(over);
+  log.reuseAsked = [];
+  io.readMarker = over.readMarker || (() => ({ kind: 'absent' }));
+  io.knownFolderFor = over.knownFolderFor || (() => null);
+  io.vaultNameFor = over.vaultNameFor || (() => null);
+  io.confirmReuse = over.confirmReuse || (async (info) => { log.reuseAsked.push(info); return true; });
+  return { io, log };
+}
+
+test('a fresh folder is not interrupted to be told it is fresh', async () => {
+  const { io, log } = withMarker({ folders: [abs('/Users/tester/Vaults/Marketing')] });
+  const r = await runEnableFlow(io);
+  assert.strictEqual(r.enabled, true);
+  assert.strictEqual(log.reuseAsked.length, 0, 'nothing to say about a folder that has never been used');
+});
+
+test('re-linking the same vault to the same folder says it resumes, and still saves', async () => {
+  const folder = abs('/Users/tester/Vaults/Marketing');
+  const { io, log } = withMarker({
+    folders: [folder],
+    readMarker: () => ({ kind: 'ok', vaultId: 'v1', syncId: 'sync-1' }),
+    knownFolderFor: () => folder,
+  });
+  const r = await runEnableFlow(io);
+  assert.strictEqual(r.enabled, true);
+  assert.strictEqual(log.reuseAsked.length, 1, 'the person is told');
+  assert.match(log.reuseAsked[0].detail, /carry on from where that left off/);
+  assert.ok(!/resetting/i.test(log.reuseAsked[0].title), 'and is not told the baseline resets, because it does not');
+});
+
+test('re-linking from a different place states the baseline reset before anything is written', async () => {
+  const { io, log } = withMarker({
+    folders: [abs('/Users/tester/Moved/Marketing')],
+    readMarker: () => ({ kind: 'ok', vaultId: 'v1', syncId: 'sync-1' }),
+    knownFolderFor: () => abs('/Users/tester/Vaults/Marketing'),
+  });
+  const r = await runEnableFlow(io);
+  assert.strictEqual(r.enabled, true);
+  assert.match(log.reuseAsked[0].title, /resetting the sync baseline/i);
+});
+
+test("another vault's folder is offered back, and declining writes nothing and takes no marker", async () => {
+  const { io, log } = withMarker({
+    folders: [abs('/Users/tester/Vaults/Shared'), abs('/Users/tester/Vaults/Fresh')],
+    readMarker: (f) => (String(f).includes('Shared') ? { kind: 'ok', vaultId: 'v-other', syncId: 's' } : { kind: 'absent' }),
+    vaultNameFor: () => 'Invoices',
+    confirmReuse: async (info) => { log.reuseAsked.push(info); return info.reuse.takesOverMarker ? 'choose-different' : true; },
+  });
+  const r = await runEnableFlow(io);
+  assert.strictEqual(r.enabled, true, 'the person picked another folder and finished');
+  assert.match(log.reuseAsked[0].title, /Invoices/, "the other vault is named, not its id");
+  assert.strictEqual(log.saved.localFolder, abs('/Users/tester/Vaults/Fresh'), 'the shared folder was NOT saved');
+  assert.strictEqual(log.folderPicks, 2, 'it went back to the picker rather than dead-ending');
+});
+
+test('cancelling at the re-use question leaves no config behind', async () => {
+  const { io, log } = withMarker({
+    folders: [abs('/Users/tester/Vaults/Shared')],
+    readMarker: () => ({ kind: 'ok', vaultId: 'v-other', syncId: 's' }),
+    confirmReuse: async () => false,
+  });
+  const r = await runEnableFlow(io);
+  assert.strictEqual(r.enabled, false);
+  assert.strictEqual(r.cancelled, true);
+  assert.strictEqual(log.saved, null, 'nothing written');
+  assert.strictEqual(log.ensured, null, 'and the folder was never even created');
+});
+
+test('the re-use question comes BEFORE the consent, because it can change the answer to it', async () => {
+  const order = [];
+  const { io } = withMarker({
+    folders: [abs('/Users/tester/Vaults/Shared')],
+    readMarker: () => ({ kind: 'ok', vaultId: 'v-other', syncId: 's' }),
+    confirmReuse: async () => { order.push('reuse'); return true; },
+    confirmConsent: async () => { order.push('consent'); return true; },
+  });
+  await runEnableFlow(io);
+  assert.deepStrictEqual(order, ['reuse', 'consent']);
+});
