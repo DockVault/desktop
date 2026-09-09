@@ -180,11 +180,11 @@
         ? 'The sync server is temporarily limiting sync attempts from this computer, so DockVault is waiting before it tries again (' + waitWords(action && action.retryInSec) + "). Signing in again or deactivating credentials won't help — the wait is what clears it."
         : "The sync server is refusing this computer's sync credentials, so DockVault is waiting before it tries again (" + waitWords(action && action.retryInSec) + '). If the status above asks you to sign in or enter the vault password, doing that lets it try at once.';
       case 'not-found': return 'The server no longer lists that, so there was nothing to change here. Refresh to see the current state.';
-      case 'auth': case 'no-session': return 'Your sign-in has ended. Open DockVault and sign in, then try again.';
+      case 'auth': case 'no-session': return 'Your sign-in has ended. Open the DockVault window from the tray and sign in, then try again.';
       case 'network': return "Couldn't reach the server, so nothing was changed. Check your connection and try again.";
       case 'indeterminate': return "The server answered, but not in a way DockVault could confirm, so nothing was changed here. Refresh to see the current state, then try again.";
       case 'busy': return 'Another sync set-up or change is in progress. Finish it, then try again.';
-      case 'config-unreadable': return 'Your sync settings could not be read, so nothing was changed. This usually clears up after unlocking your login keychain and reopening DockVault.';
+      case 'config-unreadable': return 'Your sync settings could not be read, so nothing was changed. This usually clears up after unlocking your login keychain, then closing DockVault and starting it again.';
       case 'bad-request': return `Something went wrong on this computer's side; nothing was changed. Refresh and try again.`;
       default: return `The server refused to ${what}. Nothing was changed here.`;
     }
@@ -313,7 +313,7 @@
       wrap.appendChild(el('div', 'note', {
         stale: "This computer's sync identity was retired by the server, so its vaults are held. Run Set up sync… to set it up again.",
         rechecking: "This computer's sync identity is being re-checked with the server. Its vaults are held until that finishes.",
-        unreadable: "This computer's sync identity can't be read right now, so its vaults are held. This usually clears up after unlocking your login keychain and reopening DockVault.",
+        unreadable: "This computer's sync identity can't be read right now, so its vaults are held. This usually clears up after unlocking your login keychain, then closing DockVault and starting it again.",
       }[cmp.identityNote] || "This computer's sync identity is unavailable right now, so its vaults are held."));
     }
     if (cmp.isThis) {
@@ -326,7 +326,7 @@
           : "Couldn't list this computer's vaults right now. Refresh to try again."));
       }
     } else if (cmp.isActive) {
-      wrap.appendChild(el('div', 'note', `Open DockVault on ${cmp.label} to see and manage the vaults it syncs — this server can't list them from another computer.`));
+      wrap.appendChild(el('div', 'note', `Open DockVault on ${cmp.label} itself to see and manage the vaults it syncs — this server can't list them from another computer.`));
     }
     return wrap;
   }
@@ -346,7 +346,7 @@
       absent: 'Vaults here sync using your account sign-in. Run Set up sync… to give this computer its own key, so they keep syncing even while DockVault or the screen is locked.',
       stale: "This computer's sync identity was retired by the server. Run Set up sync… to set it up again.",
       rechecking: "This computer's sync identity is being re-checked with the server. Try again in a little while.",
-      unreadable: "This computer's sync identity can't be read right now. This usually clears up after unlocking your login keychain and reopening DockVault.",
+      unreadable: "This computer's sync identity can't be read right now. This usually clears up after unlocking your login keychain, then closing DockVault and starting it again.",
       'absent-for-this-server': 'This computer is set up to sync with a different server. Run Set up sync… to switch it to this one.',
       'no-secure-store': "This computer has no secure place to keep a sync identity, so it can't sync on its own.",
     }[local.status] || "This computer's sync identity is unavailable right now.";
@@ -391,7 +391,7 @@
     if (!m) { body.appendChild(para("Couldn't load. Refresh to try again.")); return; }
     switch (m.kind) {
       case 'sign-in':
-        body.appendChild(para('Sign in first. Open DockVault and sign in to your account, then open this window again.'));
+        body.appendChild(para('Sign in first. Open the DockVault window from the tray and sign in to your account, then open this window again.'));
         return;
       case 'unsupported':
         body.appendChild(para("This server doesn't support syncing folders from your computers, so there is nothing to manage here."));

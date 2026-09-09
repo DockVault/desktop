@@ -140,6 +140,48 @@ function fileWord(detail) {
 // A byte count from a detail, in words, or null — the same formatting as everywhere else in the app.
 function sizeWord(n) { return formatBytes(typeof n === 'number' && Number.isFinite(n) ? n : 0); }
 
+/*
+ * WHERE A PERSON IS SENT WHEN A SYNC NEEDS THEM. One phrase, one place, because it was previously written
+ * out by hand in three files and said the wrong thing in all of them.
+ *
+ * "Open DockVault" is what those messages used to say, and it names the wrong window. To the person using it,
+ * DockVault IS the files app — so "Open DockVault" means the file browser, which is exactly where the tray's
+ * own `Open DockVault` item takes them. Nothing in that window can repair a sync, tell them which folder is
+ * missing, or stop syncing a vault. A notification saying a folder "can't sync until its folder is fixed —
+ * Open DockVault to sort it out" therefore sent someone to a screen with no trace of the problem it had just
+ * told them about, and left them to find the tray on their own.
+ *
+ * Everything that can actually be acted on lives in ONE place — the tray menu's "Computers & synced folders",
+ * where every vault has a card showing its state and what to do about it. So that is what these sentences
+ * name, in the words the menu itself uses, so the instruction and the thing being pointed at read the same.
+ *
+ * MANAGE_ITEM is kept identical to the tray item's own label on purpose: a test asserts they match, because
+ * an instruction that names a menu entry which no longer exists is worse than a vague one.
+ */
+const MANAGE_ITEM = 'Computers & synced folders';
+
+/**
+ * Which window a must-act item opens when it has no action of its own.
+ *
+ * Split out from the shell so it can be ASKED rather than read. The bug this exists to prevent was not in the
+ * words — it was that every unhandled kind fell through to the file browser, so "needs attention" opened a
+ * screen with no mention of the vault, the problem, or any way to act on it. A test over source text could not
+ * have seen that; it is a fallthrough, not a statement.
+ *
+ * 'manage' is the default for a SYNC problem, because Computers & synced folders is where a vault's card,
+ * state and remedies are. 'window' is only for the things that genuinely live in the vault's own web
+ * interface: signing in, unlocking an end-to-end encrypted vault, and reviewing conflicting copies — which are
+ * files, and which the Computers view has no surface for.
+ *
+ * @param {string} kind  a HANDLED_ACTION_KINDS value
+ * @returns {'manage'|'window'} which door to open
+ */
+function destinationFor(kind) {
+  return (kind === 'review' || kind === 'sign-in' || kind === 'unlock' || kind === 'check-identity' || kind === 'reopen')
+    ? 'window'
+    : 'manage';
+}
+
 /**
  * The FULL, plain-English sentence for the reasons whose honest answer needs more than a label: the ones that
  * can name a file, a size the server stated, the room a vault has left, or how long a wait is. It is the ONE
@@ -384,7 +426,7 @@ function itemForVault(v, nameById, opts = {}) {
     case 'folder-moved-rejected': return { kind: 'relocate-folder', vault: v.vault, label: `${name}'s folder was moved somewhere DockVault can't sync — move it, then find it` };
     case 'folder-found-elsewhere': return { kind: 'relocate-folder', vault: v.vault, label: `A folder that looks like ${name}'s was found — confirm it, or stop syncing` };
     case 'folder-marker-unwritable': return { kind: 'relocate-folder', vault: v.vault, label: `${name}'s folder won't let DockVault write its marker file — check the folder, or stop syncing` };
-    case 'config-unwritable': return { kind: 'open', vault: v.vault, label: `${name}'s sync settings couldn't be saved — unlock your login keychain and reopen DockVault` };
+    case 'config-unwritable': return { kind: 'open', vault: v.vault, label: `${name}'s sync settings couldn't be saved — unlock your login keychain, then quit DockVault and start it again` };
     // A code fault in our OWN sync path — own it plainly so the person doesn't go hunting their own
     // connection/sign-in/keychain for a fault only we can fix. (A "Report a problem" action is a follow-up.)
     case 'sync-error': return { kind: 'open', vault: v.vault, label: "Something in DockVault's own sync step failed — this is on our side, not your connection or sign-in." };
@@ -399,7 +441,7 @@ function itemForVault(v, nameById, opts = {}) {
     case 'grant-withdrawn': return { kind: 'open', vault: v.vault, label: `This computer isn't set up to sync ${name} any more` };
     case 'vault-not-standard': return { kind: 'open', vault: v.vault, label: `${name} is end-to-end encrypted, so it stays on the web — only Standard vaults sync here` };
     case 'device-cred-cap': return { kind: 'open', vault: v.vault, label: `${name} can't sync yet: this computer has reached your server's sync-credential limit — try again in a while` };
-    case 'device-refused': return { kind: 'open', vault: v.vault, label: `${name} couldn't sync — your server refused this computer. Open DockVault.` };
+    case 'device-refused': return { kind: 'open', vault: v.vault, label: `${name} couldn't sync — your server refused this computer` };
     // 'error' is the honest name for a run that failed in a way NOTHING here could identify — not the server
     // turning this computer away, not a file, not the account, not the folder. Say exactly that, and say what
     // is being done about it, rather than a bare "sync problem" that leaves a person guessing at their own
@@ -411,7 +453,7 @@ function itemForVault(v, nameById, opts = {}) {
     // is answered above — so it must never leak the symbol itself into a menu: an internal token in front of a
     // person is worse than an honest admission that this one has no words yet.
     default:
-      return { kind: 'open', vault: v.vault, label: `${name} needs attention — open DockVault to see what's wrong.` };
+      return { kind: 'open', vault: v.vault, label: `${name} needs attention — open its card to see what's wrong` };
   }
 }
 
@@ -446,7 +488,7 @@ function mustActItems(model, nameById, opts = {}) {
   // now (no dedicated button needed): unlock the login keychain and reopen. Clicking opens the app (the
   // "reopen" half); the deliberate "Reset sync state" is a follow-up, appended to this copy only when it ships.
   if (model.state === STATE.SYNC_PROBLEM && model.reason === 'state-unreadable') {
-    items.push({ kind: 'reopen', label: "The saved sync state can't be unlocked on this machine — your files are safe and sync is paused. Try unlocking your login keychain and reopening DockVault." });
+    items.push({ kind: 'reopen', label: "The saved sync state can't be unlocked on this machine — your files are safe and sync is paused. Try unlocking your login keychain, then closing DockVault and starting it again." });
   }
   // The sync helper (rclone) isn't ready — an APP-scoped problem (one shared binary), so it surfaces as ONE
   // must-act with the "Set up the sync helper" fix even if several vaults hit it, carrying the sub/installed
@@ -600,4 +642,4 @@ function changeServerConsent(host) {
   };
 }
 
-module.exports = { tooltip, lockedGlance, mustActItems, itemForVault, reasonSentence, waitWords, waitUntilWords, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, formatBytes, progressDetail, helperDetail, REASON_DETAIL, HANDLED_ACTION_KINDS, helperRemedy, setPackaged, installedNotification, loginItemMenu, serverMenuItems, changeServerConsent };
+module.exports = { tooltip, lockedGlance, mustActItems, itemForVault, reasonSentence, destinationFor, MANAGE_ITEM, waitWords, waitUntilWords, pendingSetupItems, deviceResetItem, syncNowItem, lastSyncedLabel, formatBytes, progressDetail, helperDetail, REASON_DETAIL, HANDLED_ACTION_KINDS, helperRemedy, setPackaged, installedNotification, loginItemMenu, serverMenuItems, changeServerConsent };

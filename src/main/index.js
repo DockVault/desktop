@@ -943,6 +943,17 @@ function handleMustAct(item) {
   // Set this computer up again after its identity ended (revoked / expired / not-recognized) or was reset:
   // re-register and re-establish the recorded vaults.
   if (item && item.kind === 'set-up-again') { void runDeviceSetupAgain(); return; }
+  // Everything left opens a window, and WHICH window is decided by tray-presentation rather than here, so the
+  // sentence a person was shown and the door it opens come from one place.
+  //
+  // This used to fall through to the main window unconditionally. That window is the vault's own file browser
+  // — and to the person using it, that IS DockVault, which is exactly why it was the wrong answer: they
+  // clicked "needs attention" and arrived somewhere with no mention of the vault, the problem, or any way to
+  // act on it, and were left to find the tray themselves. A sync problem now opens Computers & synced folders,
+  // where the vault's card carries its state and its remedies. The window still gets the things that genuinely
+  // live in it: signing in, unlocking an end-to-end encrypted vault, and reviewing conflicting copies, which
+  // ARE files and which the Computers view has no surface for.
+  if (trayPresentation.destinationFor(item && item.kind) === 'manage') { void openManageView(); return; }
   void showOrCreateWindow();
 }
 
@@ -997,7 +1008,7 @@ async function runDeviceSetupAgain() {
     const origin = serverConfig.readServerOrigin(dir);
     const accountToken = await resolveAccountToken();
     const info = (detail) => { try { return dialog.showMessageBox(mainWindow, { type: 'info', title: 'Set up this computer', noLink: true, message: 'Set up this computer', detail, buttons: ['OK'] }); } catch { return Promise.resolve(); } };
-    if (!origin || !accountToken) { await info('Open DockVault and sign in to your account, then set this computer up again from the tray.'); return; }
+    if (!origin || !accountToken) { await info('Open the DockVault window from the tray and sign in to your account, then set this computer up again from the tray.'); return; }
     // The vaults recorded under the OLD identity — the set to re-establish. The record carries no identity, so
     // it survives the forget; read it up front so a set-up-again always knows which vaults to bring back.
     let recorded = [];
@@ -1095,7 +1106,9 @@ async function recoverSharedFolder(vaultId) {
   if (!entry || !entry.localFolder) { void showOrCreateWindow(); return; }
   let decision = 'choose-different';
   try { decision = await confirmMakePrivateDialog(entry.localFolder); } catch { decision = 'choose-different'; }
-  if (decision !== 'make-private') { void showOrCreateWindow(); return; } // declined — nothing stripped
+  // Declined — nothing stripped. Opens Computers & synced folders, not the file browser: what someone who
+  // declines this needs is to point the vault at a different folder, and that is on its card.
+  if (decision !== 'make-private') { void openManageView(); return; }
   const made = await recoverOwnerOnly(entry.localFolder, folderSecureIo());
   if (made && made.ok) { if (syncScheduler) notifyTurnedAway(vaultId, syncScheduler.requestSync(vaultId, { manual: true })); } // secured — retry this vault (a retry the scheduler turns away says why)
   else {
@@ -1103,7 +1116,7 @@ async function recoverSharedFolder(vaultId) {
       await dialog.showMessageBox(mainWindow, {
         type: 'warning', title: "That folder can't be made private", noLink: true,
         message: "That folder can't be made private right now",
-        detail: 'You can try again, or open DockVault to choose a different folder for this vault.',
+        detail: 'You can try again, or open Computers & synced folders in the DockVault tray menu to choose a different folder for this vault.',
         buttons: ['OK'],
       });
     } catch { /* best-effort */ }
@@ -1238,7 +1251,9 @@ function notifyMustAct(item) {
 }
 
 function mustActBody(item) {
-  if (item && item.kind === 'restart') return 'Sync stopped working. Your files are safe. Open DockVault to restart it.';
+  // The restart is a tray action — "Open DockVault" pointed at the file browser, which cannot restart
+  // anything, for a fix that is one click away in the menu this notification came from.
+  if (item && item.kind === 'restart') return 'Sync stopped working. Your files are safe. Use Restart sync in the DockVault tray menu.';
   // A per-vault must-act: compose the body from the SAME source the tray menu and the Computers card use, with
   // this vault's own outcome detail, so the one message a person gets WITHOUT opening anything names the real
   // cause instead of falling through to "something needs your attention". (The hub carries the detail on the
@@ -2590,7 +2605,7 @@ function infoBox(title, detail) {
 // Why the sync settings could not be written: the one known cause has its own remedy (the same sentence the
 // Computers window shows); anything else is a plain try-again.
 function configWriteTrouble(e) {
-  if (e && e.code === 'CONFIG_UNREADABLE') return 'Your sync settings could not be read, so nothing was changed. This usually clears up after unlocking your login keychain and reopening DockVault.';
+  if (e && e.code === 'CONFIG_UNREADABLE') return 'Your sync settings could not be read, so nothing was changed. This usually clears up after unlocking your login keychain, then closing DockVault and starting it again.';
   return "DockVault couldn't update its sync settings just now. Nothing was changed. Try again in a moment.";
 }
 

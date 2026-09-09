@@ -38,27 +38,30 @@ function bodyForConditionReason(reason, name, opts = {}) {
     case 'host-key-mismatch':
       // A CHANGED server identity — a security must-act, at least as loud as the hub alert this replaces on a
       // manual press. Never the vague "couldn't sync": the user must be told to stop and check.
-      return `${name}'s server identity has changed — don't sync until you've confirmed this is really your server. Open DockVault.`;
+      return `${name}'s server identity has changed — don't sync until you've confirmed this is really your server. Open Computers & synced folders in the DockVault tray menu to check it.`;
     case 'sign-in-needed': return `Sign in to keep ${name} syncing.`;
     case 'needs-unlock': return `Unlock ${name} to sync it.`; // password-protected vault: unlock it in DockVault so its password reaches the sync (provisional copy)
     case 'needs-repair':
-    case 'confirm-large-delete': return `${name} needs a repair before it can sync. Open DockVault to fix it.`;
-    case 'path-too-long': return `A file in ${name} needs a shorter path. Open DockVault to fix it.`;
+    case 'confirm-large-delete': return `${name} needs a repair before it can sync. Open Computers & synced folders in the DockVault tray menu and use Repair.`;
+    case 'path-too-long': return `A file in ${name} needs a shorter path. Open Computers & synced folders in the DockVault tray menu to see which one.`;
     case 'folder-insecure':
     case 'folder-rejected':
-    case 'folder-problem': return `${name} can't sync until its folder is fixed. Open DockVault to sort it out.`;
-    case 'vault-unavailable': return `${name} can't be synced any more. Open DockVault for details.`;
+    case 'folder-problem': return `${name} can't sync until its folder is fixed. Open Computers & synced folders in the DockVault tray menu to sort it out.`;
+    case 'vault-unavailable': return `${name} can't be synced any more. Open Computers & synced folders in the DockVault tray menu for details.`;
+    // DELIBERATELY still the file browser, and the only line here that is. Conflicting copies ARE files, and
+    // that window is where they can be seen; Computers & synced folders has no conflict surface at all, so
+    // sending someone there would repeat the mistake this phase exists to fix, just at a different door.
     case 'conflict-keep-both': return `${name} has conflicting copies — open DockVault to review them.`;
-    case 'not-syncing': return `${name} hasn't synced for a while. Open DockVault to check your connection.`;
+    case 'not-syncing': return `${name} hasn't synced for a while. Open Computers & synced folders in the DockVault tray menu to check on it.`;
     // The SYNC SERVER (the SFTP address), not the account or the network in general — named as such, with the
     // one thing that helps: Troubleshoot checks the saved server and SFTP address separately.
-    case 'sync-server-unreachable': return `${name} can't sync: the sync server can't be reached right now. Open DockVault and run Troubleshoot to check the address.`;
-    case 'sync-server-unverified': return `${name} can't sync: what's at the sync server address isn't answering as a sync server. Open DockVault and run Troubleshoot to check it.`;
+    case 'sync-server-unreachable': return `${name} can't sync: the sync server can't be reached right now. Run Troubleshoot in the DockVault tray menu to check the address.`;
+    case 'sync-server-unverified': return `${name} can't sync: what's at the sync server address isn't answering as a sync server. Run Troubleshoot in the DockVault tray menu to check it.`;
     case 'helper-not-ready':
       // The sync helper (rclone) isn't ready — a NON-retrying must-act (a wrong/missing/blocked binary, or one
       // that won't start), so NEVER the calm "try again in a moment" that would tell a different story than the
       // tray. Points at the same how-to the tray offers; the per-sub specifics live on the glance/dialog.
-      return `${name} can't sync — the sync helper isn't ready. Open DockVault to see how to fix it.`;
+      return `${name} can't sync — the sync helper isn't ready. Open Computers & synced folders in the DockVault tray menu to see how to fix it.`;
     case 'helper-unavailable':
       // The sync helper did NOT answer (the daemon is down / restarting) — DISTINCT from 'helper-not-ready'
       // (a misconfigured helper): this one self-recovers, so it is a calm, retryable line, NEVER the "how to
@@ -74,16 +77,16 @@ function bodyForConditionReason(reason, name, opts = {}) {
     case 'grant-withdrawn': return `This computer isn't set up to sync ${name} any more.`;
     case 'vault-not-standard': return `${name} is end-to-end encrypted, so it stays on the web — only Standard vaults sync here.`;
     case 'device-cred-cap': return `${name} can't sync yet: this computer has reached your server's sync-credential limit. Try again in a while.`;
-    case 'device-refused': return `${name} couldn't sync — your server refused this computer. Open DockVault.`;
+    case 'device-refused': return `${name} couldn't sync — your server refused this computer. Open Computers & synced folders in the DockVault tray menu for details.`;
     case 'device-identity-unreadable': return `${name} will sync once this computer's sync identity can be read again.`;
     case 'grant-details-pending': return `Sign in once to finish setting up ${name} on this computer.`;
     case 'device-access-check': return `${name} couldn't sync just now — this computer's access is being re-checked.`;
     // NOTHING here could identify what went wrong — not the server turning this computer away, not a file, not
     // the account, not the folder. Say that plainly (and that nothing was changed), rather than a bare
     // "couldn't sync" that sends a person hunting through their own account and connection.
-    case 'error': return `${name} couldn't sync and DockVault couldn't tell why. Nothing here was changed and it will keep trying — open DockVault and run Troubleshoot to check the server.`;
+    case 'error': return `${name} couldn't sync and DockVault couldn't tell why. Nothing here was changed and it will keep trying — run Troubleshoot in the DockVault tray menu to check the server.`;
     // A fault in our OWN sync step (not the connection, not sign-in) — own it, and never promise a retry.
-    case 'sync-error': return `Something in DockVault's own sync step failed for ${name} — this is on our side. Open DockVault.`;
+    case 'sync-error': return `Something in DockVault's own sync step failed for ${name} — this is on our side. Open Computers & synced folders in the DockVault tray menu for details.`;
     case 'retrying':
     default: return `${name} couldn't sync just now. Try again in a moment.`;
   }
@@ -112,7 +115,7 @@ function manualCompletionBody(ev, name) {
     // 'done' with no typed result, or an unrecognised error: an honest, non-specific line for each.
     return { body: phase === 'error'
       ? bodyForConditionReason('error', name)
-      : `${name} finished, but it needs your attention. Open DockVault to review.` };
+      : `${name} finished, but it needs your attention. Open DockVault to review.` };  // conflicting copies: see above
   }
   if (phase === 'blocked') return { body: bodyForConditionReason('needs-repair', name) };
 
@@ -128,7 +131,7 @@ function manualCompletionBody(ev, name) {
   switch (reason) {
     case 'waiting-to-reconnect': return { body: `Can't reach the server right now — ${name} will sync as soon as you're back online.` };
     case 'paused-locked': return { body: `${name} will sync after you unlock DockVault.` };
-    case 'ineligible': return { body: `${name} can't be synced any more. Open DockVault for details.` };
+    case 'ineligible': return { body: `${name} can't be synced any more. Open Computers & synced folders in the DockVault tray menu for details.` };
     default: return { body: `${name} couldn't sync just now. Try again in a moment.` };
   }
 }

@@ -105,7 +105,7 @@
     'sign-in': () => {
       setSteps({});
       title.textContent = 'Sign in first';
-      body.appendChild(para('Open DockVault and sign in to your account, then set up sync again from the tray menu.'));
+      body.appendChild(para('Sign in to your account, then set up sync again from the tray menu.'));
       footer.appendChild(button('Close', { onClick: closeWindow, escape: true }));
       footer.appendChild(button('Open DockVault', { primary: true, onClick: () => { openApp(); closeWindow(); }, autofocus: true }));
     },
@@ -127,7 +127,7 @@
         ? "This computer has no secure place to keep a sync identity, so it can't sync on its own."
         : (q.status === 'stale' || q.status === 'rechecking')
           ? "This computer's sync identity is being re-checked with the server. Try again in a little while."
-          : "DockVault can't read this computer's sync identity right now. This usually clears up after unlocking your login keychain and reopening DockVault.";
+          : "DockVault can't read this computer's sync identity right now. This usually clears up after unlocking your login keychain, then closing DockVault and starting it again.";
       body.appendChild(para(why));
       doneFooter();
     },
@@ -135,7 +135,7 @@
       setSteps({});
       if (q && q.reason === 'config-unreadable') {
         title.textContent = 'Your sync settings could not be read';
-        body.appendChild(para('DockVault will not overwrite them. This usually clears up after unlocking your login keychain and reopening DockVault.'));
+        body.appendChild(para('DockVault will not overwrite them. This usually clears up after unlocking your login keychain, then closing DockVault and starting it again.'));
       } else if (q && q.reason === 'bad-vault-name') {
         title.textContent = "That vault can't be synced to a folder";
         body.appendChild(para("Its name contains characters that can't be used as a folder name. Rename the vault, then try again."));
@@ -149,7 +149,7 @@
     'no-vaults': (q) => {
       setSteps({ computer: 'done', vault: 'current' });
       title.textContent = 'No vaults can be synced to this computer yet';
-      body.appendChild(para('Syncing to a folder is available for standard vaults. Open DockVault to create one, then set up sync again.'));
+      body.appendChild(para('Syncing to a folder is available for standard vaults. Create one, then set up sync again from the tray menu.'));
       if (Array.isArray(q.moved) && q.moved.length) body.appendChild(movedList(q.moved));
       footer.appendChild(button('Close', { onClick: closeWindow, escape: true }));
       footer.appendChild(button('Open DockVault', { primary: true, onClick: () => { openApp(); closeWindow(); }, autofocus: true }));

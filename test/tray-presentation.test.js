@@ -121,7 +121,11 @@ test('state-unreadable surfaces the unlock-and-reopen guidance as a must-act ite
   const m = computeStatus({ hasSecureStore: true, daemon: 'init-failed', vaults: [vault({ lastResult: 'ok' })] });
   const it = mustActItems(m).find((x) => x.kind === 'reopen');
   assert.ok(it, 'a reopen-guidance must-act item is present (a real next step now)');
-  assert.match(it.label, /unlocking your login keychain and reopening/);
+  // It names the keychain AND says what to do with the app afterwards. "reopening DockVault" used to stand
+  // here and meant a third thing again — not the file browser, not the Computers window, but quit-and-start —
+  // which is why it now says that plainly.
+  assert.match(it.label, /unlocking your login keychain/);
+  assert.match(it.label, /closing DockVault and starting it again/);
   assert.doesNotMatch(it.label, /reset/i); // no dangling reset reference until that button ships
 });
 
