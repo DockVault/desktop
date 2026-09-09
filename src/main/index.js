@@ -516,8 +516,13 @@ async function captureSession() {
     // a window in which the page could not be asked never reads as a sign-out and then a sign-in.
     if (signedIn && hadAccountSession === false && syncScheduler) syncScheduler.clearCredentialRefusals();
     hadAccountSession = signedIn;
-    if (signedIn) tokenStore.persistSession(safeStorage, dir, bundle);
-    else {
+    if (signedIn) {
+      // BOTH, and the pair is the point. The sign-OUT branch below drops the in-memory snapshot, so
+      // the sign-IN branch has to set it, or the two edges are not symmetric and everything that
+      // reads the snapshot first stays on whatever boot loaded until this has been to disk and back.
+      tokenStore.persistSession(safeStorage, dir, bundle);
+      sessionBundle = bundle;
+    } else {
       // Sign-out: the account session ended, so the SFTP credential derived from it is now invalid — clear
       // the persisted session AND the sync credential (main cache + the helper's prepared config), and drop
       // the in-memory session snapshot so the scheduler reads "signed out" and never mints against a dead session.
@@ -2220,7 +2225,20 @@ function closeSyncWizard() {
   if (win && !win.isDestroyed()) { try { win.close(); } catch { /* already gone */ } }
 }
 
+// Everything that asks "is someone signed in?" reads a snapshot that a THIRTY-SECOND poll keeps up to
+// date (captureSession, scheduled at boot). That is fine for a background question and wrong for a
+// window someone just opened: sign in, open the Computers window within that window of time, and it
+// says to sign in — which is the one screen that is certainly false, because they just did. The owner
+// hit exactly this and watched it correct itself half a minute later.
+// So a window that gates on the session asks the page for it first. It is the same read the poll makes,
+// simply made now instead of up to thirty seconds from now; best-effort, because a window failing to
+// open would be a worse answer than a stale one.
+async function refreshSessionBeforeOpening() {
+  try { await captureSession(); } catch { /* the poll will catch up; never block the window */ }
+}
+
 async function openSyncWizard() {
+  await refreshSessionBeforeOpening();
   const existing = wizardWindow;
   if (existing && !existing.isDestroyed()) {
     // A wizard still asking: bring it forward. One that has finished (its last screen left open) is closed so
@@ -2300,6 +2318,7 @@ function notifyManageChanged() {
 }
 
 async function openManageView() {
+  await refreshSessionBeforeOpening();
   const existing = manageWindow;
   if (existing && !existing.isDestroyed()) { try { existing.show(); existing.focus(); } catch { /* gone */ } return; }
   let win = null;
