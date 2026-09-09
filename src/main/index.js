@@ -78,6 +78,7 @@ const { decideMigration } = require('./device-migrate');
 const { createSyncWizard } = require('./sync-wizard');
 const { createManageView } = require('./manage-view');
 const { createStatusView } = require('./status-view');
+const appMenu = require('./app-menu');
 const { createTroubleshoot } = require('./troubleshoot');
 const { verifySetup } = require('./setup-verify');
 const { deviceRemotePath } = require('./mint-path');
@@ -303,6 +304,12 @@ async function boot() {
   bootSelfTest = await selftest.runInMain();
   status.mainSelfTest = bootSelfTest;
 
+  // The application menubar, installed before any window exists so no window is ever shown with Electron's
+  // default one. That default is built for a document editor and, on a shipped build, offered Reload and
+  // Toggle Developer Tools on the window that holds a signed-in session. What stays is the Edit menu: its
+  // clipboard ROLES are what bind Ctrl+C/V/A inside text inputs, so removing the menu outright would leave
+  // the server-address field unable to accept a pasted address.
+  installApplicationMenu();
   uiSession = session.fromPartition(UI_PARTITION); // in-memory; created once, reused by every window
   hardenSession(uiSession);
   // Restore the account session from the encrypted store (null on a non-secure keychain or none):
@@ -929,6 +936,25 @@ function buildTrayMenu(items, model, migration = null) {
     { label: 'Quit DockVault', click: () => { isQuitting = true; app.quit(); } },
   );
   return Menu.buildFromTemplate(template);
+}
+
+// Build and install the slim application menu. The doors are the same ones the tray offers - one place to
+// change them, and no menu entry that leads somewhere the tray does not.
+function installApplicationMenu() {
+  try {
+    Menu.setApplicationMenu(Menu.buildFromTemplate(appMenu.buildMenuTemplate({
+      isPackaged: app.isPackaged,
+      platform: process.platform,
+      appName: 'DockVault',
+      actions: {
+        status: () => { void openStatusView(); },
+        computers: () => { void openManageView(); },
+        troubleshoot: () => { void openTroubleshoot(); },
+        about: () => { void showAbout(); },
+        quit: () => { isQuitting = true; app.quit(); },
+      },
+    })));
+  } catch { /* a menu that cannot be built must not stop the app starting */ }
 }
 
 // Restarting a stuck helper is the one deliberate action that lives entirely in the shell. Every
