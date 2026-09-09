@@ -63,9 +63,19 @@ test('the Computers surface hands over a kind and two ids, nothing that names a 
     assert.ok(!/url|host|port|address|path|folder|file/i.test(call), `troubleshoot passes only a check id: ${call}`);
     assert.match(call, /id: String\(id\)/);
   }
-  // The only sync-controlling channels are the gated pages' own; nothing generic.
+  // The only sync-controlling channels are the gated pages' own; nothing generic. The namespace list is an
+  // ALLOWLIST on purpose: a new one cannot appear without someone deciding it should, which is what caught
+  // `status` being added and made this line the place to say what it is.
+  //
+  // `status.` is the dedicated sync-status view, and it is READ-ONLY — one `model` call and no companion
+  // action channel. It exists separately from `sync.` because the sentence it carries is composed from a
+  // vault's outcome detail, which `sync.status()` deliberately strips before any renderer sees it: that one
+  // is reachable from the window hosting the vault's own web interface, and this one is gated to its page.
   const channels = [...CODE.matchAll(/ipcRenderer\.invoke\(\s*['"](dockvault:[a-z.-]+)['"]/g)].map((m) => m[1]);
-  for (const ch of channels) assert.match(ch, /^dockvault:(app|server|sync|wizard|manage|troubleshoot)\./, ch);
+  for (const ch of channels) assert.match(ch, /^dockvault:(app|server|sync|wizard|manage|troubleshoot|status)\./, ch);
+  // And it really is read-only: no channel in that namespace does anything but fetch the model.
+  const statusChannels = channels.filter((c) => c.startsWith('dockvault:status.'));
+  assert.deepEqual(statusChannels, ['dockvault:status.model'], `the status page reads and nothing else: ${statusChannels}`);
   assert.ok(!channels.includes('dockvault:sync.setup') && !channels.includes('dockvault:sync.list'));
 });
 

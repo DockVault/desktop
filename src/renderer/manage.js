@@ -14,6 +14,7 @@
   const body = document.getElementById('body');
   const sub = document.getElementById('sub');
   const btnRefresh = document.getElementById('refresh');
+  const btnStatus = document.getElementById('status');
   const btnSetup = document.getElementById('setup');
   const btnClose = document.getElementById('close');
   const buildEl = document.getElementById('build');
@@ -417,6 +418,9 @@
   }
 
   btnRefresh.addEventListener('click', () => { if (!busy) void load(); });
+  // The dedicated status view. Reachable from the app itself and not only from the tray, because a person
+  // looking at these cards for a problem should not have to know the tray exists to see the detail.
+  btnStatus.addEventListener('click', () => { if (api && api.openStatus) void api.openStatus(); });
   btnSetup.addEventListener('click', () => { if (api) void api.openSetup(); });
   btnClose.addEventListener('click', () => { if (!busy && api) void api.close(); });
   document.addEventListener('keydown', (e) => {

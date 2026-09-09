@@ -77,6 +77,7 @@ const { resumePendingGrants, markerActionForRunReason, runSetupAgainGrants } = r
 const { decideMigration } = require('./device-migrate');
 const { createSyncWizard } = require('./sync-wizard');
 const { createManageView } = require('./manage-view');
+const { createStatusView } = require('./status-view');
 const { createTroubleshoot } = require('./troubleshoot');
 const { verifySetup } = require('./setup-verify');
 const { deviceRemotePath } = require('./mint-path');
@@ -100,6 +101,7 @@ const SETUP_PAGE = 'server-setup.html'; // the first thing an installed app show
 const WIZARD_PAGE = 'sync-wizard.html'; // the in-app "Set up sync" window
 const MANAGE_PAGE = 'manage.html';      // the in-app "Computers" window
 const TROUBLESHOOT_PAGE = 'troubleshoot.html'; // the in-app Troubleshoot window
+const STATUS_PAGE = 'status.html';      // the in-app dedicated sync-status window
 // Forgetting this computer on the OLD server when the person switches servers (revoke the device by id under
 // the old session when reachable, then drop the device secret). The device registration lives in its own
 // modules, which wire this hook; until then it is a documented no-op and the rest of the forget path runs.
@@ -500,8 +502,19 @@ function registerIpc() {
     appOrigin: APP_ORIGIN, pagePath: schemeMod.SHELL_PATH + MANAGE_PAGE,
   });
   ipcMain.handle('dockvault:manage.model', (e) => (fromManagePage(e) ? manageModel() : null));
+  // The dedicated sync-status view, gated to its own window and page the same way. It is READ-ONLY: there is
+  // no companion 'act' channel, because starting or changing a sync from a renderer would be attack surface
+  // for something the tray already does. The model carries the composed reason sentence, which is why it may
+  // not travel on the general sync.status() channel — that one is reachable from the window hosting the
+  // vault's own web interface, and it strips the outcome detail this sentence is built from.
+  const fromStatusPage = (e) => serverSetupMod.isTrustedSetupSender(e, {
+    webContents: (statusWindow && !statusWindow.isDestroyed()) ? statusWindow.webContents : null,
+    appOrigin: APP_ORIGIN, pagePath: schemeMod.SHELL_PATH + STATUS_PAGE,
+  });
+  ipcMain.handle('dockvault:status.model', (e) => (fromStatusPage(e) ? statusModel() : null));
   ipcMain.handle('dockvault:manage.act', (e, args) => (fromManagePage(e) ? manageAct(args) : { ok: false, reason: 'refused' }));
   ipcMain.handle('dockvault:manage.open-setup', (e) => { if (fromManagePage(e)) void openSyncWizard(); return null; });
+  ipcMain.handle('dockvault:manage.open-status', (e) => { if (fromManagePage(e)) void openStatusView(); return null; });
   ipcMain.handle('dockvault:manage.close', (e) => { if (fromManagePage(e)) closeManageView(); return null; });
   // The Troubleshoot view's intents, gated to its own window and page. A probe reaches only the saved server
   // setting (main reads it; the page names a check, never an address), and nothing here writes.
@@ -879,6 +892,7 @@ function buildTrayMenu(items, model, migration = null) {
     // Everything that is set up — this computer's synced folders, the other computers, and the actions that
     // end a sync — lives in the Computers window; the tray only opens it.
     template.push({ label: 'Computers & synced folders…', click: () => { void openManageView(); } });
+    template.push({ label: 'Sync status…', click: () => { void openStatusView(); } });
     template.push({ type: 'separator' });
   }
   // Which server is in force, honestly: a note when the environment overrides a saved setting, a way to
@@ -2407,6 +2421,28 @@ async function openSyncWizard() {
 // window, the io over the real stores and routes, and the refresh push.
 let manageWindow = null;
 let manageInstance = null;
+let statusWindow = null;
+
+/*
+ * The dedicated sync-status window's model. Built from the SAME io the Computers view is built from — the
+ * one cached above — so the two windows cannot describe one vault differently. That is not tidiness: two
+ * surfaces disagreeing about a vault is the failure this whole area has been fighting, and the only fix that
+ * survives contact is one source rather than two careful ones.
+ *
+ * `lastSyncedLabel` is the tray's own, for the same reason.
+ */
+function statusModel() {
+  const io = manageReasonIo || (manageReasonIo = buildManageIo());
+  if (!io) return null;
+  try {
+    return createStatusView({
+      configured: io.configured,
+      liveStatus: io.liveStatus,
+      reasonText: io.reasonText,
+      lastSyncedLabel: (ts) => trayPresentation.lastSyncedLabel(ts),
+    }).model();
+  } catch { return null; }
+}
 
 function closeManageView() {
   const win = manageWindow;
@@ -2428,6 +2464,42 @@ async function manageAct(args) {
 function notifyManageChanged() {
   const win = manageWindow;
   if (win && !win.isDestroyed()) { try { win.webContents.send('dockvault:evt:manage', { at: Date.now() }); } catch { /* gone */ } }
+}
+
+/*
+ * The dedicated sync-status window. Its own window, its own page, its own gated channel — the same shape
+ * every other first-party page here has, and the reason the shared preload is not a hole: it is the
+ * per-page sender check, not the preload, that keeps the vault's own web interface out of these channels.
+ *
+ * It needs no session and makes no network call, deliberately. The Computers view fetches the account's
+ * devices and grants and can answer "sign in first"; the person watching a sync misbehave is very often the
+ * person whose session or server is the problem, and a status window that refuses them in that moment is
+ * worth nothing. Everything here comes from local configuration and the status the scheduler already
+ * publishes.
+ */
+async function openStatusView() {
+  const existing = statusWindow;
+  if (existing && !existing.isDestroyed()) { try { existing.show(); existing.focus(); } catch { /* gone */ } return; }
+  let win = null;
+  try {
+    win = new BrowserWindow({
+      width: 620, height: 640, minWidth: 460, minHeight: 360, show: false,
+      title: 'DockVault — Sync status', icon: APP_ICON, backgroundColor: '#0a0f18', autoHideMenuBar: true,
+      webPreferences: {
+        partition: UI_PARTITION, preload: PRELOAD, contextIsolation: true, sandbox: true, nodeIntegration: false,
+        nodeIntegrationInWorker: false, webSecurity: true, allowRunningInsecureContent: false, spellcheck: false,
+      },
+    });
+    statusWindow = win;
+    win.setMenuBarVisibility(false);
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    win.webContents.on('will-navigate', (e) => e.preventDefault());
+    win.on('closed', () => { if (statusWindow === win) statusWindow = null; });
+    await win.loadURL(schemeMod.shellPageUrl(APP_ORIGIN, STATUS_PAGE));
+    win.show();
+  } catch {
+    try { if (win && !win.isDestroyed()) win.close(); } catch { /* best-effort */ }
+  }
 }
 
 async function openManageView() {

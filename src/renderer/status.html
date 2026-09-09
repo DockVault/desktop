@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- Shell-owned screen: the dedicated sync-status view, in its own window. Its script talks only to the
+       typed preload surface (window.dockvault.status): it asks main for a model and renders it. It fetches
+       nothing, names nothing, and sends nothing back — this window is read-only by design, because a page
+       that could start or change a sync would be attack surface for a benefit the tray already provides.
+
+       The honest sentence under each row is composed in MAIN, not here. It is built from a vault's outcome
+       detail, which the general status channel deliberately strips before any renderer sees it. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'">
+  <title>DockVault — Sync status</title>
+  <style>
+    :root { color-scheme: light dark; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #0a0f18; color: #e6edf6;
+      display: flex; flex-direction: column; box-sizing: border-box; min-height: 100%;
+    }
+    header { padding: 1.25rem 2rem .75rem; border-bottom: 1px solid #1a2538; }
+    h1 { font-size: 1.35rem; margin: 0 0 .15rem; }
+    .headline { color: #8aa0bd; font-size: .92rem; }
+    main { flex: 1; overflow: auto; padding: .5rem 2rem 1.5rem; min-height: 0; }
+
+    /* One row per synced folder. EVERY child that can hold long text gets min-width:0 — without it a grid or
+       flex child refuses to shrink below its content, which is what makes a long folder path push a state
+       badge out of its own row and produce the overlapping the old surface had. Nothing here is positioned
+       absolutely and nothing has a fixed height: the row grows to fit its own contents. */
+    .item { padding: 1rem 0; border-bottom: 1px solid #141d2e; }
+    .item:last-child { border-bottom: 0; }
+    .top { display: flex; align-items: baseline; gap: .75rem; min-width: 0; }
+    .name { font-weight: 600; font-size: 1.02rem; min-width: 0; overflow-wrap: anywhere; }
+    .badge {
+      margin-left: auto; flex: none; white-space: nowrap;
+      font-size: .8rem; padding: .12rem .55rem; border-radius: 999px;
+      border: 1px solid #24344f; color: #b9c4d4; background: #0e1626;
+    }
+    .badge.ok   { color: #7fe0a8; border-color: #1f4b34; }
+    .badge.run  { color: #8fc0ff; border-color: #1e3a63; }
+    .badge.warn { color: #f0c674; border-color: #4d3c17; }
+    .badge.bad  { color: #ff9a90; border-color: #5a2420; }
+    .badge.off  { color: #6f849f; }
+
+    /* The folder. Truncated to one line with the whole path in the tooltip: a path is long, and letting it
+       wrap to four lines is most of what made the old view feel crowded. */
+    .folder {
+      color: #6f849f; font-size: .86rem; margin-top: .2rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+    }
+    /* The honest sentence. Wraps freely — it is the one thing here that must never be cut off. */
+    .note { margin: .45rem 0 0; color: #cbd6e6; font-size: .92rem; }
+    .when { margin-top: .3rem; color: #6f849f; font-size: .82rem; }
+
+    /* The progress bar, shown only when there is a real fraction to fill it with. */
+    .bar { margin-top: .55rem; height: .4rem; border-radius: 999px; background: #16203200; box-shadow: inset 0 0 0 1px #1e2b42; overflow: hidden; }
+    .bar > i { display: block; height: 100%; background: #2f6fed; border-radius: 999px; transition: width .3s ease; }
+    /* A run with no measurable fraction still shows movement, rather than an empty bar that reads as stuck. */
+    .bar.indeterminate > i { width: 35%; animation: slide 1.4s ease-in-out infinite; }
+    @keyframes slide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+    @media (prefers-reduced-motion: reduce) { .bar.indeterminate > i { animation: none; width: 100%; opacity: .35; } }
+    .nums { margin-top: .3rem; color: #8aa0bd; font-size: .82rem; font-variant-numeric: tabular-nums; }
+
+    .empty { color: #8aa0bd; padding: 2rem 0; }
+    .empty b { color: #e6edf6; font-weight: 600; display: block; margin-bottom: .3rem; }
+    footer { padding: .75rem 2rem 1rem; border-top: 1px solid #1a2538; color: #6f849f; font-size: .82rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Sync status</h1>
+    <div class="headline" id="headline"></div>
+  </header>
+  <main id="list" aria-live="polite"></main>
+  <footer id="foot"></footer>
+  <script src="status.js"></script>
+</body>
+</html>

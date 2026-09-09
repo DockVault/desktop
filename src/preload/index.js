@@ -118,8 +118,26 @@ const api = Object.freeze({
     act: (action) => ipcRenderer.invoke('dockvault:manage.act', { kind: String(action && action.kind), deviceId: action && action.deviceId != null ? String(action.deviceId) : undefined, vaultId: action && action.vaultId != null ? String(action.vaultId) : undefined }),
     // Open the sync setup wizard (the app's own window), and close this one.
     openSetup: () => ipcRenderer.invoke('dockvault:manage.open-setup'),
+    // Open the dedicated sync-status window (main owns it; this only asks).
+    openStatus: () => ipcRenderer.invoke('dockvault:manage.open-status'),
     close: () => ipcRenderer.invoke('dockvault:manage.close'),
     // Something the view shows changed (a sync ran, a set-up finished): reload. Returns an unsubscribe fn.
+    onChanged: (cb) => subscribe('manage', cb),
+  }),
+  status: Object.freeze({
+    // The dedicated sync-status view's model, built by main (status-view.js): one row per synced folder with
+    // its state, the honest sentence for that state, its transfer numbers and when it last finished.
+    //
+    // A SEPARATE CHANNEL from `sync.status()` on purpose. That one is reachable from the window hosting the
+    // vault's own web interface, which is why it strips each vault's outcome DETAIL — the file that would not
+    // go, the size the server stated. The sentence below is composed FROM that detail, so it travels only
+    // here, on a channel main gates to this page and this window.
+    //
+    // Read-only, like the Computers model. There is deliberately no way from this page to start, stop or
+    // change a sync: those live in the tray, and a renderer that could reach them would be attack surface
+    // for a convenience that already exists.
+    model: () => ipcRenderer.invoke('dockvault:status.model'),
+    // A sync ran, or a set-up finished: re-ask for the model. Returns an unsubscribe fn.
     onChanged: (cb) => subscribe('manage', cb),
   }),
   troubleshoot: Object.freeze({
