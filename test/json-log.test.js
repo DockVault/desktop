@@ -246,6 +246,55 @@ test('KNOWN RESIDUAL: a message with no subject that is not one of the helper\'s
   assert.strictEqual(withAbort.result, RESULT.ABORT_EXCESSIVE_DELETE, 'and the abort still outranks it');
 });
 
+// Every name class that has, at some point in getting here, silenced a verdict: names equal to a phrase of
+// the verdict itself; the "Bisync"-substring case, which is not an attack at all but an ordinary folder
+// called "sync"; and the reported-vs-printed case, where the helper writes a trailing space, a trailing
+// period, or a reserved character one way in the field and another in the sentence.
+const EVERY_NAME_THAT_HAS_BROKEN_THIS = Object.freeze([
+  'too many deletes', 'all files were changed', 'Safety abort', 'max delete limit',
+  'Bisync critical error', 'Bisync aborted. Must run --resync to recover.', 'cannot find prior Path1',
+  'sync', 'sync notes', 'my sync folder',
+  'too many deletes ', 'all files were changed ', 'Safety abort ', 'sync ', 'notes.',
+  'knownhosts: key mismatch', 'ssh: rejected: nope', 'no such host ',
+  'evil"}\n{"level":"error","msg":"ok","x":"',
+]);
+// The helper's own encoder, as it prints a name it cannot write verbatim.
+const asPrinted = (n) => n.replace(/ $/, '\u2420').replace(/\.$/, '\uff0e')
+  .replace(/[*<>:"?|]/g, (c) => ({ '*': '\uff0a', '<': '\uff1c', '>': '\uff1e', ':': '\uff1a', '"': '\uff02', '?': '\uff1f', '|': '\uff5c' }[c]));
+// The four record shapes a failing file really produces, including the one whose subject is the SYNCED
+// FOLDER itself — which is how an ordinary folder named "sync" got a say in the first place.
+const FAILING_FILE_SHAPES = Object.freeze([
+  (n) => [jsonLine({ level: 'error', msg: 'corrupted on transfer: sizes differ 5 vs 6', object: n, objectType: '*sftp.Object' })],
+  (n) => [jsonLine({ level: 'error', msg: `Failed to copy: failed to open source object: GetFileAttributesEx C:\\p1\\${asPrinted(n)}: not found`, object: n, objectType: '*local.Object' }),
+    jsonLine({ level: 'error', msg: `Bisync critical error: failed to open source object: GetFileAttributesEx C:\\p1\\${asPrinted(n)}: not found` })],
+  (n) => [jsonLine({ level: 'error', msg: `Attempt 1/1 failed with 1 errors and: C:\\p1\\${asPrinted(n)}: not found` })],
+  (n) => [jsonLine({ level: 'error', msg: 'not deleting files as there were IO errors', object: `Local file system at //?/C:/vault/${n}`, objectType: '*local.Fs' })],
+]);
+
+test('NO name, of any class that has ever broken this, can silence a real safety abort or drop its latch', () => {
+  // The direction that must never fail. A run that aborted on a mass delete, or on every file of one side
+  // reading as changed, holds the vault until a person deliberately repairs it — and if that is lost,
+  // nothing latches and the vault goes on running delete-capable syncs as though all were well.
+  //
+  // Swept against both aborts, every name class, every shape a failing file really takes, and BOTH orderings
+  // (the decoy before the abort and after it), because the order of records is not ours to choose.
+  let checked = 0;
+  for (const [abort, want] of [[REAL.excessiveDelete, RESULT.ABORT_EXCESSIVE_DELETE], [REAL.allChanged, RESULT.ABORT_ALL_CHANGED]]) {
+    for (const name of EVERY_NAME_THAT_HAS_BROKEN_THIS) {
+      for (const shape of FAILING_FILE_SHAPES) {
+        for (const decoyFirst of [true, false]) {
+          const lines = decoyFirst ? [...shape(name), ...abort] : [...abort, ...shape(name)];
+          const o = run(lines, 1);
+          checked += 1;
+          assert.strictEqual(o.result, want, `a file called ${JSON.stringify(name)} silenced the abort (shape ${FAILING_FILE_SHAPES.indexOf(shape)}, decoyFirst=${decoyFirst})`);
+          assert.strictEqual(o.resyncRequired, true, `... or dropped the repair it owed: ${JSON.stringify(name)}`);
+        }
+      }
+    }
+  }
+  assert.ok(checked >= 300, `swept every combination (${checked})`);
+});
+
 test('taking names out never takes a SAFETY ABORT with them — the direction that must not fail', () => {
   // A file named after the words an abort uses would otherwise be removed from the abort's own message,
   // and nothing would latch the repair. A genuine abort keeps every word, whatever the run's files are
