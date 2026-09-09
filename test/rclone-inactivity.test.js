@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const { EventEmitter } = require('node:events');
 const { RcloneRunner } = require('../src/daemon/rclone-runner');
-const { buildBisyncArgs, SYNC_STATS_ARGS } = require('../src/daemon/sync-engine');
+const { buildBisyncArgs, SYNC_LOG_ARGS, JSON_LOG_ARGS } = require('../src/daemon/sync-engine');
 
 // A fake child the test drives by hand: it does NOT auto-emit or auto-exit.
 function controllableChild() {
@@ -27,12 +27,15 @@ async function withKeepalive(fn) {
   try { return await fn(); } finally { clearInterval(ka); }
 }
 
-test('the bisync argv carries the fixed stats flags that feed the inactivity timer + the progress glance', () => {
+test('the bisync argv carries the fixed log flags that feed the inactivity timer + the progress glance', () => {
   const args = buildBisyncArgs({ local: '/l', remote: 'vault:V', workdir: '/w' });
   // 5s: the stats period doubles as the "Syncing…" visibility threshold (a UX decision), decoupled from the
   // 120s inactivity window. A shorter period only widens the idle margin.
-  assert.deepStrictEqual(SYNC_STATS_ARGS, ['--stats', '5s', '--stats-log-level', 'NOTICE']);
-  for (const f of SYNC_STATS_ARGS) assert.ok(args.includes(f), `bisync args include ${f}`);
+  assert.deepStrictEqual(SYNC_LOG_ARGS, ['--use-json-log', '--stats', '5s', '--stats-log-level', 'NOTICE']);
+  for (const f of SYNC_LOG_ARGS) assert.ok(args.includes(f), `bisync args include ${f}`);
+  // The structured format is asked for BY the same constant the classifier's reader is built around, so the
+  // run and the reading of it can never drift apart into "asked for text, read as structure".
+  assert.deepStrictEqual(JSON_LOG_ARGS, ['--use-json-log']);
 });
 
 test('inactivity: a run that keeps emitting stats (on stderr) is NOT killed — it survives to completion', async () => {

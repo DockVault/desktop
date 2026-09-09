@@ -11,6 +11,17 @@
  * Progress is worth showing; a filename is not, and a filename is exactly what an attacker (or a bug) would
  * harvest from a progress feed. Of a per-file line, ONLY its percentage (an integer 0..100) is kept.
  *
+ * TWO FORMATS, ONE JOB. The daemon asks the helper for its STRUCTURED log (see rclone-log.js), where each
+ * line is an object: the run's own words in one field, the file a message is about in another, and the
+ * progress block's numbers as actual numbers in a third. This parser tries that first, and it is strictly
+ * better on both counts:
+ *   - progress is READ FROM NUMBER FIELDS rather than parsed back out of a rendered block, so the
+ *     integers-only promise stops depending on a regex holding its ground against a path;
+ *   - the stats record's own message renders that block, per-file paths and all, and is DROPPED whole —
+ *     the numbers come from beside it, never from it.
+ * A line that is NOT structured takes the text path below, unchanged, so a helper that cannot produce the
+ * format degrades to exactly today's behaviour rather than to silence.
+ *
  * The design is leak-safe BY CONSTRUCTION, not by after-the-fact scrubbing:
  *   - Lines are assembled across chunk boundaries in a PRIVATE buffer that is never returned, forwarded,
  *     or logged while it holds an incomplete line. A "Transferring:" path line split across two reads is
@@ -22,15 +33,22 @@
  *     dropped; every other stats-block line (the "Transferring:" header, Checks:/Deleted:/Elapsed/…) is
  *     DROPPED; anything that is NOT a stats-block line is KEPT as genuine non-stats stderr for the run's
  *     typed-outcome classification.
- *   - The only things that ever leave this module are integers (counts()) and the KEPT non-stats stderr
- *     (stderr()) — which holds no stats/path line by construction, so it stays a safe input to the outcome
- *     classifier and bounded on a long run. The raw stats text and the incomplete-line buffer are never
- *     exposed. The per-file list is bounded (MAX_FILE_PROGRESS entries) so a run with thousands of small
- *     files cannot balloon a progress message.
+ *   - The only things that ever leave this module are integers (counts()), the KEPT structured records
+ *     (records(), each already carrying its own file's name out of its message), and the KEPT non-structured
+ *     stderr (stderr()). No STATS line is in either, by construction. A path can still be inside a record's
+ *     message — the helper writes its own progress notices with the path in the sentence — which is why the
+ *     classifier reads those under the rules in bisync-outcome.js rather than trusting this to be path-free;
+ *     what this guarantees is that no path reaches the PROGRESS feed, which is the thing that travels. The
+ *     raw stats text and the incomplete-line buffer are never exposed. The per-file list is bounded
+ *     (MAX_FILE_PROGRESS entries) so a run with thousands of small files cannot balloon a progress message.
+ *   - Both kinds of kept line share ONE retention budget, in arrival order, so adding the structured form
+ *     did not add a second buffer to grow: what the daemon holds for a run is bounded exactly as before.
  *
  * Pure and dependency-free so the whole thing is exercised by feeding fixture bytes through it (including
  * a path line split across a chunk boundary) and asserting on the actual output.
  */
+
+const { parseLogRecord, recordSize } = require('./rclone-log');
 
 // A leading rclone log prefix, e.g. "2026/09/03 02:00:05 NOTICE : ". Stripped only to TEST a line for a
 // stats keyword; kept lines keep their original text.
@@ -92,12 +110,17 @@ class StatsStderrParser {
     this._percent = null;  // rclone's own overall percentage (0..100) or null
     this._inFlight = [];   // the percentage of each file in flight in the CURRENT block (ints only, bounded)
     this._inFlightCount = 0; // how many files are in flight in the current block (exact, even past the bound)
-    this._keptHead = '';   // NON-stats stderr only (for the typed-outcome classifier): the first half-budget ...
-    this._keptTail = [];   // ... and a rolling window of the most recent lines within the second half-budget
+    this._checks = null;   // how many files the run has compared, and of how many — watched ONLY so the
+    this._checksTotal = null; // ... glance keeps moving through a long listing phase; never shown, never sent
+    // What is KEPT for the typed-outcome classifier, in arrival order: the first half-budget of it ...
+    this._keptHead = [];   // ... and a rolling window of the most recent within the second half-budget.
+    this._keptHeadBytes = 0;
+    this._keptTail = [];
     this._keptTailBytes = 0;
     this._headSealed = false; // once a line has gone to the tail, the head takes no more (keeps the kept text in order)
     this._skipLine = false;   // an over-long partial line was dropped: the rest of it (to its newline) goes too
-    this._truncated = false; // some non-stats stderr was dropped to stay within MAX_KEPT_STDERR_BYTES
+    this._truncated = false; // something kept for the classifier was dropped to stay within the budget
+    this._textTruncated = false; // ... and some of it was non-structured text (see _dropped)
   }
 
   /**
@@ -139,22 +162,38 @@ class StatsStderrParser {
   }
 
   _consume(line) {
+    // The STRUCTURED form first. A file name cannot produce one of these: it lives inside a JSON string and
+    // the encoder escapes whatever would end it, so nothing a name contains can close a record or open one.
+    const rec = parseLogRecord(line);
+    if (rec) return this._consumeRecord(rec);
     const body = line.replace(LOG_PREFIX, '');
     if (isPerFileLine(body)) return this._readPerFile(body);   // path line: keep ONE integer, then DROP it
     if (isStatsLine(body)) return this._readCounts(body); // stats line: read any counts, then DROP it
-    if (body.trim() !== '') this._keep(line + '\n');      // genuine non-stats stderr: keep (bounded) for classification
+    if (body.trim() !== '') this._keep({ size: line.length + 1, text: line + '\n' }); // genuine non-stats stderr: keep (bounded)
     return false;
   }
 
-  // Retain a non-stats line within the fixed budget: the head fills first (a run's first real error), then
-  // a rolling tail keeps the most recent lines (rclone's final verdict), evicting the oldest tail lines.
-  _keep(text) {
+  // One structured record. A stats record carries the progress NUMBERS in their own field and RENDERS the
+  // stats block — per-file paths included — in its message: the numbers are read, the message is dropped
+  // whole, and nothing of it is ever retained. Every other record is kept for the outcome classifier with
+  // its own file's name already taken out of its message (see rclone-log.js).
+  _consumeRecord(rec) {
+    if (rec.stats) return this._readJsonStats(rec.stats);
+    if (rec.msg.trim() === '') return false;
+    this._keep({ size: recordSize(rec), rec });
+    return false;
+  }
+
+  // Retain one kept item within the fixed budget: the head fills first (a run's first real error), then a
+  // rolling tail keeps the most recent items (rclone's final verdict), evicting the oldest tail items.
+  // Structured records and non-structured lines share this ONE budget, in arrival order.
+  _keep(item) {
     const half = MAX_KEPT_STDERR_BYTES / 2;
-    if (!this._headSealed && this._keptHead.length + text.length <= half) { this._keptHead += text; return; }
+    if (!this._headSealed && this._keptHeadBytes + item.size <= half) { this._keptHead.push(item); this._keptHeadBytes += item.size; return; }
     this._headSealed = true; // from here on everything goes to the tail, so head + tail stay in arrival order
-    if (text.length > half) { this._truncated = true; return; } // a single line past the whole tail budget: drop it
-    this._keptTail.push(text); this._keptTailBytes += text.length;
-    while (this._keptTailBytes > half) { const gone = this._keptTail.shift(); this._keptTailBytes -= gone.length; this._truncated = true; }
+    if (item.size > half) { this._dropped(item); return; } // a single item past the whole tail budget: drop it
+    this._keptTail.push(item); this._keptTailBytes += item.size;
+    while (this._keptTailBytes > half) { const gone = this._keptTail.shift(); this._keptTailBytes -= gone.size; this._dropped(gone); }
   }
 
   // Read the aggregate counts from a "Transferred:" line. The bytes line ("4.521 MiB / 10 MiB, 45%, …")
@@ -183,6 +222,51 @@ class StatsStderrParser {
     return advanced;
   }
 
+  /**
+   * The progress numbers of one STRUCTURED stats record. Every value taken here is already a number in the
+   * helper's own field — nothing is parsed out of rendered text, and no field that could hold a name or a
+   * path (the in-flight entries also carry `name`, `srcFs`, `dstFs`) is read at all.
+   *
+   * The overall percentage is COMPUTED from the two byte counters rather than taken from the rendered
+   * block, which is where the text path read it; rounding matches what the helper renders.
+   */
+  _readJsonStats(s) {
+    const int = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : null);
+    let advanced = false;
+    const bytes = int(s.bytes);
+    const bytesTotal = int(s.totalBytes);
+    const files = int(s.transfers);
+    const filesTotal = int(s.totalTransfers);
+    if (bytes != null && bytes !== this._bytes) { this._bytes = bytes; advanced = true; }
+    if (bytesTotal != null && bytesTotal !== this._bytesTotal) { this._bytesTotal = bytesTotal; advanced = true; }
+    if (files != null && files !== this._files) { this._files = files; advanced = true; }
+    if (filesTotal != null && filesTotal !== this._filesTotal) { this._filesTotal = filesTotal; advanced = true; }
+    const pct = (this._bytes != null && this._bytesTotal != null && this._bytesTotal > 0)
+      ? Math.max(0, Math.min(100, Math.round((this._bytes * 100) / this._bytesTotal)))
+      : null;
+    if (pct != null && pct !== this._percent) { this._percent = pct; advanced = true; }
+    // The files in flight: how MANY (exact), and the percentage of each (bounded, integers, in the
+    // helper's order). Each entry also names the file and both ends of the transfer; none of that is read.
+    // The run is also DOING something while it lists and compares, and that phase can run for minutes on a
+    // large vault. The text format reported every block, so the glance kept moving; reading only the transfer
+    // counters made those minutes look frozen. The check counters are watched for that reason alone — they
+    // are integers like the rest, and nothing about them is shown.
+    const checks = int(s.checks);
+    const checksTotal = int(s.totalChecks);
+    if (checks != null && checks !== this._checks) { this._checks = checks; advanced = true; }
+    if (checksTotal != null && checksTotal !== this._checksTotal) { this._checksTotal = checksTotal; advanced = true; }
+    const list = Array.isArray(s.transferring) ? s.transferring : [];
+    const inFlight = [];
+    for (let i = 0; i < list.length && inFlight.length < MAX_FILE_PROGRESS; i += 1) {
+      const p = list[i] && int(list[i].percentage);
+      if (p != null && p >= 0 && p <= 100) inFlight.push(p);
+    }
+    if (list.length !== this._inFlightCount || inFlight.join(',') !== this._inFlight.join(',')) {
+      this._inFlightCount = list.length; this._inFlight = inFlight; advanced = true;
+    }
+    return advanced;
+  }
+
   // One file in flight: count it, keep its percentage (bounded), and let the line die here.
   _readPerFile(body) {
     this._inFlightCount += 1;
@@ -206,18 +290,36 @@ class StatsStderrParser {
     };
   }
 
+  // Something was dropped to stay inside the budget. Which KIND matters only for the marker below: it stands
+  // in the text for lines that were dropped, and it would be a lie in either direction if it were written for
+  // records instead — a run whose text was kept whole would claim it was trimmed, and one whose text was
+  // trimmed would not say so once the tail held only records.
+  _dropped(item) { this._truncated = true; if (item.text) this._textTruncated = true; }
+
   /**
-   * The KEPT non-stats stderr, for the run's typed-outcome classifier. Holds no stats/path line by
-   * construction, and never the incomplete-line buffer — an unterminated (possibly path-bearing) line is
-   * never handed out.
+   * The KEPT stderr that was NOT structured, for the run's typed-outcome classifier. Holds no stats/path
+   * line by construction, and never the incomplete-line buffer — an unterminated (possibly path-bearing)
+   * line is never handed out. Under the structured format this is normally empty and records() carries
+   * the run; it is what a helper that cannot produce that format falls back to.
    */
   stderr() {
-    const tail = this._keptTail.join('');
-    if (!tail) return this._keptHead;
-    return this._keptHead + (this._truncated ? '[... stderr trimmed ...]\n' : '') + tail;
+    const text = (items) => items.map((i) => i.text || '').join('');
+    const head = text(this._keptHead);
+    const tail = text(this._keptTail);
+    if (!this._textTruncated) return head + tail;
+    return `${head}[... stderr trimmed ...]\n${tail}`;
   }
 
-  // Whether any non-stats stderr was dropped to stay within the retention budget.
+  /**
+   * The KEPT STRUCTURED records, in arrival order, for the run's typed-outcome classifier. Each carries
+   * the tool's own words (colour stripped, line breaks flattened, the file's own name taken out of them),
+   * the level the tool logged it at, and the file the message was about as its own field — so the
+   * classifier reads a verdict from a message and never from a name. No stats record is ever among them.
+   */
+  records() { return [...this._keptHead, ...this._keptTail].filter((i) => i.rec).map((i) => i.rec); }
+
+  // Whether anything kept for the classifier — a record or a non-structured line — was dropped to stay
+  // within the retention budget. A run that says so did not necessarily lose a verdict, but it may have.
   truncated() { return this._truncated; }
 }
 

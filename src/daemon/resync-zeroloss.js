@@ -28,7 +28,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { planPreservation } = require('./resync-plan');
 const { keepBothName } = require('./keepboth-name');
-const { runBisync, credPrepareOutcome, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS, CONNECT_BOUND_ARGS, SINGLE_CONNECTION_ARGS } = require('./sync-engine');
+const { runBisync, credPrepareOutcome, SYNC_LOG_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS, CONNECT_BOUND_ARGS, SINGLE_CONNECTION_ARGS } = require('./sync-engine');
 // Every step's connection discipline in one place: bounded connect, ONE SSH connection, single-stream transfers
 // (see sync-engine SINGLE_CONNECTION_ARGS — a single-use credential must never be presented a second time), and
 // the same one-transfer/one-checker concurrency the bisync run uses, so nothing ever queues up on the one connection.
@@ -142,7 +142,7 @@ async function zeroLossResync(o) {
 
   // 1. FAIL-CLOSED enumeration of the server side.
   { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved: 0 }; }
-  const ls = await o.runner.run(['lsf', '-R', '--files-only', o.remote, ...REMOTE_ARGS, ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts);
+  const ls = await o.runner.run(['lsf', '-R', '--files-only', o.remote, ...REMOTE_ARGS, ...MARKER_FILTER_ARGS, ...SYNC_LOG_ARGS], scanOpts);
   // The runner retains stdout BOUNDED; a server list too large to keep whole is a list we do not have. Acting on
   // a partial one could skip a preserve and let the resync overwrite a file it never saw — refuse instead.
   if (ls.stdoutTruncated) throw new Error('zero-loss resync: the server file list is too large to hold whole — refusing to resync');
@@ -151,7 +151,7 @@ async function zeroLossResync(o) {
     // left as it was — never a "repair owed" for a door that did not open) —
     // an unreachable door or a changed server identity must read as exactly that, not as a generic error that
     // is retried with a fresh credential every tick. Anything else stays the fail-closed refusal.
-    const conn = classifyConnectionFailure(ls.stdout, ls.stderr);
+    const conn = classifyConnectionFailure(ls.stdout, ls.stderr, ls.logRecords);
     if (conn) return { ran: true, result: conn, preserved: 0, resyncRequired: null, needsAttention: true };
     throw new Error('zero-loss resync: could not enumerate the server — refusing to resync');
   }
@@ -166,7 +166,7 @@ async function zeroLossResync(o) {
   let differing = [];
   if (onBoth.length) {
     { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved: 0 }; }
-    const chk = await o.runner.run(['check', o.local, o.remote, '--download', '--combined', '-', ...REMOTE_ARGS, ...MARKER_FILTER_ARGS, ...SYNC_STATS_ARGS], scanOpts)
+    const chk = await o.runner.run(['check', o.local, o.remote, '--download', '--combined', '-', ...REMOTE_ARGS, ...MARKER_FILTER_ARGS, ...SYNC_LOG_ARGS], scanOpts)
       .catch((e) => ({ code: -1, stdout: '', stderr: String(e) }));
     const parsed = parseCheckDiffering(chk.stdout, onBoth);
     // A compare report cut short by the retention bound is an incomplete compare — the same fail-closed refusal
@@ -183,7 +183,7 @@ async function zeroLossResync(o) {
   for (const action of plan) {
     { const p = await prepare(); if (!p.ok) return { ...credPrepareOutcome(p.reason, true), preserved }; }
     const { full, rel } = reserveLocalPath(o.local, action, source, at);
-    const cp = await o.runner.run(['copyto', `${o.remote}/${action.from}`, full, ...REMOTE_ARGS, ...SYNC_STATS_ARGS], scanOpts)
+    const cp = await o.runner.run(['copyto', `${o.remote}/${action.from}`, full, ...REMOTE_ARGS, ...SYNC_LOG_ARGS], scanOpts)
       .catch((e) => ({ code: -1, stderr: String(e) }));
     if (cp.code !== 0) { try { fs.rmSync(full, { force: true }); } catch { /* best effort */ } throw new Error(`zero-loss resync: failed to preserve ${action.from} -> ${rel}`); }
     preserved += 1;

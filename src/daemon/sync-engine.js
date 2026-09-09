@@ -26,6 +26,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { getRunState, recordRun } = require('../main/state-db');
 const { classifyBisyncOutcome } = require('./bisync-outcome');
+const { JSON_LOG_ARGS } = require('./rclone-log');
 
 // The excessive-delete guard: bisync aborts the run if more than this percentage of files on either side
 // would be deleted. (bisync interprets --max-delete as a PERCENTAGE, unlike plain `sync`, where it is a
@@ -51,7 +52,7 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 // work). 5s is a deliberate UX choice — responsive enough that an everyday few-files transfer is visible,
 // tunable up to 10s if a rendered pass shows flicker — and it is DECOUPLED from the inactivity window below
 // (a shorter period only widens the margin). The flags are fixed here — never caller/renderer-supplied.
-const SYNC_STATS_ARGS = Object.freeze(['--stats', '5s', '--stats-log-level', 'NOTICE']);
+const SYNC_LOG_ARGS = Object.freeze([...JSON_LOG_ARGS, '--stats', '5s', '--stats-log-level', 'NOTICE']);
 // Bound the CONNECTION itself so a door that won't talk fails FAST with a definitive, classifiable error rather
 // than hanging the run. rclone's defaults are generous (a 5-minute IO idle timeout, ten low-level retries), so a
 // server that completes the SSH transport but then refuses or stalls the SFTP channel — exactly what the server's
@@ -132,7 +133,7 @@ function buildBisyncArgs({ local, remote, workdir, resync = false }) {
     ...CONNECT_BOUND_ARGS, // a door that won't talk fails fast, never hangs the run
     ...SINGLE_CONNECTION_ARGS, // one SSH connection, single-stream transfers: a single-use credential is never re-presented
     ...MARKER_FILTER_ARGS, // the folder's own identity marker stays home
-    ...SYNC_STATS_ARGS]; // periodic progress so the inactivity timeout can tell a long run from a hung one
+    ...SYNC_LOG_ARGS]; // periodic progress so the inactivity timeout can tell a long run from a hung one, in the format the classifier reads
   if (resync) args.push('--resync'); // a deliberate resync, or the one automatic empty-baseline refresh (see runBisync)
   return args;
 }
@@ -325,7 +326,7 @@ async function runBisync(o) {
   // The one automatic re-baseline: an empty pair (see emptyPairBaseline). Nothing local can be lost by it.
   const resync = !!o.resync || (!o.resync && emptyPairBaseline({ local: o.local, remote: o.remote, workdir: o.workdir }));
   const args = buildBisyncArgs({ local: o.local, remote: o.remote, workdir: o.workdir, resync });
-  const { code, stdout, stderr } = await o.runner.run(args, {
+  const { code, stdout, stderr, logRecords } = await o.runner.run(args, {
     config: o.config,
     // bisync prints nothing to stdout in normal operation (its log goes to stderr); retain only a small
     // bounded amount for the outcome classifier's haystack so the run can never grow the daemon by its output.
@@ -342,7 +343,7 @@ async function runBisync(o) {
   // plain error leaves the prior block untouched (resyncRequired=null => keep the prior value). Nothing
   // here auto-forces, and nothing auto-clears a latched abort — the one automatic resync above runs only
   // for an empty baseline with an empty local side, where nothing can be lost.
-  const outcome = classifyBisyncOutcome({ code, stdout, stderr, resync });
+  const outcome = classifyBisyncOutcome({ code, stdout, stderr, records: logRecords, resync });
   const resyncRequired = outcome.resyncRequired === null ? state.resyncRequired : outcome.resyncRequired;
   if (o.db) recordRun(o.db, o.vault, { result: outcome.result, resyncRequired, atUtc: now() });
   // `detail` is the bounded pair the classifier built (a checked base file name, a stated maximum in bytes) and
@@ -353,4 +354,4 @@ async function runBisync(o) {
   return { ran: true, code, result: outcome.result, resyncRequired, needsAttention: outcome.needsAttention, detail: detail || null, stdout, stderr };
 }
 
-module.exports = { CONNECT_BOUND_ARGS, SINGLE_CONNECTION_ARGS, BISYNC_MAX_STDOUT_BYTES, buildBisyncArgs, runBisync, credPrepareOutcome, bisyncWorkdir, emptyPairBaseline, needsZeroLossBaseline, localHasNoFiles, priorListingEmpty, canonicalPath, carryListings, pairKey, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS, SYNC_STATS_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS };
+module.exports = { CONNECT_BOUND_ARGS, SINGLE_CONNECTION_ARGS, BISYNC_MAX_STDOUT_BYTES, buildBisyncArgs, runBisync, credPrepareOutcome, bisyncWorkdir, emptyPairBaseline, needsZeroLossBaseline, localHasNoFiles, priorListingEmpty, canonicalPath, carryListings, pairKey, MAX_DELETE_PERCENT, DEFAULT_TIMEOUT_MS, SYNC_LOG_ARGS, JSON_LOG_ARGS, SYNC_INACTIVITY_MS, SYNC_HARD_CEILING_MS, MARKER_NAME, MARKER_FILTER_ARGS };

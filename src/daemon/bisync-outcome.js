@@ -14,7 +14,48 @@
  * The signatures key on rclone's own emitted phrases (observed against a real server). They are matched
  * defensively — case-insensitive substrings — and evaluated in SEVERITY order so the most serious event
  * wins when a run emits more than one.
+ *
+ * WHERE THE PHRASES ARE READ FROM. The daemon runs the helper with its STRUCTURED log (rclone-log.js), and
+ * a verdict is read from the MESSAGE field of a record — never from a line, because under that format a
+ * line is not a thing a file name can be part of. That is what closes, rather than narrows, the question
+ * of a name deciding what a run is reported to have done:
+ *   - a name lives in its own field, so it can never occupy the start of a message, where a verdict sits;
+ *   - a name that reaches a message anyway (the tool interpolates a file's path into some error text) is
+ *     removed from it by EXACT match, because the record states that name — no guessing where it ends;
+ *   - a name arrives ESCAPED, so it can never end a line, start a line, or forge a record of its own;
+ *   - and a verdict about the RUN is read only from records the tool logged at error or critical, which is
+ *     where every real verdict lands and where the tool's own path-echoing progress lines do not.
+ * Text output is still read the same way it was before — a helper that cannot produce the structured
+ * format degrades to that, with the masking and line-anchoring below as its defence, rather than to
+ * silence. Both readings feed one signature set, so the two formats can never disagree about a verdict.
  */
+
+const { isVerdictLevel, recordLine } = require('./rclone-log');
+
+// WHERE THE TOOL QUOTES A CAUSE INSTEAD OF STATING ONE.
+//
+// Some of what the tool writes is a wrapper: its own words, a colon, and then whatever it was quoting —
+// "Bisync critical error: failed to open source object: GetFileAttributesEx <the whole path>: ...", or
+// "Attempt 1/1 failed with 1 errors and: <the same thing again>". Both are logged at ERROR level with NO
+// subject of their own, so the file they name is not a field that can be taken out of them: the path is
+// simply part of the sentence. That is the last way a file's name could still speak for the run, and it is
+// not hypothetical — it is what the helper writes whenever a run fails on a file.
+//
+// So a wrapper is read only for the words the TOOL wrote: the message is cut at the end of its own opener,
+// and the cause it was quoting is dropped. Nothing is lost by that. The opener is itself a verdict where it
+// is one ("Bisync critical error" still asks for a repair), and the cause is never only here — the tool
+// logged it first on its own record, against the file it happened to, where the name IS a field.
+//
+// Anchored at the start of a message, which is the one place a name can never be.
+const QUOTES_A_CAUSE = /^(?:Bisync critical error|Attempt \d+\/\d+ failed with \d+ errors?(?: and)?|Failed to (?:bisync|copy|sync|check|move|delete)(?: with \d+ errors?)?(?:: last error was)?)\s*:/i;
+function cutToItsOpener(rec) {
+  // Only where the tool named NO subject. A message that IS about a file carries the reason the server or
+  // the filesystem gave for that file, which is real evidence and the only place it appears — and the name
+  // in it is a field, already taken out. Cutting those would lose what a person needs to be told.
+  if (rec.object != null) return rec;
+  const m = QUOTES_A_CAUSE.exec(rec.msg);
+  return m ? { ...rec, msg: m[0] } : rec;
+}
 
 // Typed run-state `result` values. Green = a clean run; every other value is a non-green attention state.
 const RESULT = Object.freeze({
@@ -204,6 +245,34 @@ const SIG = Object.freeze({
   uploadNotStored: /partial file rename failed|rename failed: file does not exist|failed to copy: object not found|setmodtime stat failed: object not found/i,
 });
 
+/*
+ * Signature alternatives that are only valid against a STRUCTURED message, and why any exist.
+ *
+ * Under the structured format the tool splits some of what it writes across two fields: the >50%-delete
+ * abort logs "Safety abort" as the subject and "too many deletes …" as the message. The message alone is
+ * therefore what a real abort says, and the shared signature — which expects the whole sentence on one
+ * line — would no longer recognise it. Losing that would be the worst direction there is: nothing would
+ * latch the repair, and the vault would go on running delete-capable syncs as if all were well.
+ *
+ * These are ANCHORED TO THE START OF THE MESSAGE and are read ONLY from structured records, never from
+ * text. That is the whole reason they can be this short: a file name cannot begin a message (it is a
+ * different field), and one interpolated into a message has already been removed from it by exact match.
+ * The same phrase anchored to a text LINE would be a real widening, because there a name can start one.
+ */
+// The `m` flag is what makes "the start of a message" mean it: the messages are joined one per line and
+// each has had its own line breaks flattened, so a `^` here is the first character the tool wrote and
+// nothing else. Without it only the run's FIRST message could ever match, and an abort reported after any
+// other message would go unnoticed — a lost latch, which is the direction that must not fail.
+const JSON_SIG = Object.freeze({
+  excessiveDelete: /^too many deletes\b/im,
+  // The all-changed abort still states its own label today, so this is not needed to recognise it. It is
+  // here because the two aborts are one refactor apart: the tool already puts that label in the subject
+  // field for the delete abort, and if it ever does the same for this one, the shared signature — which
+  // expects the whole sentence — would stop matching and nothing would latch the repair. Covering the
+  // second costs a line; noticing that it had stopped being covered would cost a vault.
+  allChanged: /^all files (?:were )?changed\b/im,
+});
+
 // The remote-relative path rclone names on the line that FAILED. Only the file's own name is kept (never the
 // folders above it), so what travels to the status layer is the one word a person needs to find the file.
 const FAILED_FILE_LINE = /(?:^|\n)[^\n]{0,60}?\b(?:ERROR|NOTICE)\s*:\s*([^\n]+?)\s*:\s*(?:Failed to copy|Failed to transfer|Failed to update|Failed to set modification time|partial file rename failed|error reading)/i;
@@ -232,13 +301,24 @@ const SIZE_UNIT = Object.freeze({ b: 1, k: 1024, m: MB, g: 1024 * MB, t: 1024 * 
  */
 function failedRelPath(text, sig) {
   const m = FAILED_FILE_LINE.exec(String((sig && decidingLine(text, sig)) || (text == null ? '' : text)));
-  if (!m || !m[1]) return null;
-  const raw = String(m[1]).replace(PARTIAL_SUFFIX, '');
+  return m && m[1] ? safeRelPath(m[1]) : null;
+}
+
+/**
+ * The same fail-closed check applied to a path that was NAMED rather than parsed out of a sentence — the
+ * file field of a structured record. Shared with failedRelPath so both readings of a run apply exactly one
+ * rule about what may be joined to a local folder.
+ */
+function safeRelPath(named) {
+  const raw = String(named == null ? '' : named).replace(PARTIAL_SUFFIX, '');
   if (!raw || raw.length > 1024) return null;
   if (/[\u0000-\u001f\u007f]/.test(raw)) return null;
   if (/^[a-zA-Z]:|^[\\/]|^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)) return null;
   const parts = raw.split(/[\\/]/);
-  if (parts.some((seg) => seg === '' || seg === '.' || seg === '..')) return null;
+  // A colon inside a segment is not part of a file's name on Windows — it names an alternate data stream of
+  // one ("notes.txt:hidden"), so reading a size there would be reading something other than the file that
+  // failed. Refused rather than resolved; a name that legitimately contains one simply yields no size.
+  if (parts.some((seg) => seg === '' || seg === '.' || seg === '..' || seg.includes(':'))) return null;
   return parts.join('/');
 }
 
@@ -249,8 +329,16 @@ function failedRelPath(text, sig) {
  */
 function failedFileName(text) {
   const m = FAILED_FILE_LINE.exec(String(text == null ? '' : text));
-  if (!m || !m[1]) return null;
-  const leaf = String(m[1]).split(/[\\/]/).pop().replace(PARTIAL_SUFFIX, '');
+  return m && m[1] ? showableFileName(m[1]) : null;
+}
+
+/**
+ * The same check applied to a file the record NAMED rather than one parsed out of a sentence. Under the
+ * structured log the failing file arrives as its own field, so naming it to a person stops depending on
+ * finding where a name ended inside a message — which is the thing that could never be done reliably.
+ */
+function showableFileName(named) {
+  const leaf = String(named == null ? '' : named).split(/[\\/]/).pop().replace(PARTIAL_SUFFIX, '');
   if (!leaf || !SHOWABLE_NAME.test(leaf)) return null;
   return leaf;
 }
@@ -323,6 +411,90 @@ function decidingRawLine(maskedText, rawText, sig) {
 
 function haystack(stdout, stderr) { return String(stdout == null ? '' : stdout) + '\n' + String(stderr == null ? '' : stderr); }
 
+/*
+ * A NOTE ON WHAT IS DELIBERATELY *NOT* DONE HERE, because it was tried and it was wrong.
+ *
+ * The helper writes messages that carry a file's path with no file attached to them — its retry summary is
+ * the one we have seen (RESTATED_MSG above), and a later version could add another. The obvious answer is to
+ * take the run's own file names out of EVERY message of that run: the names are knowable, because each file
+ * was logged as the subject of a message somewhere, so they could be removed by exact match.
+ *
+ * That answer is worse than the problem. It hands whoever chooses a name a way to DELETE the run's words:
+ * name a file "knownhosts: key mismatch" and have it fail in the same run, and those characters are removed
+ * from the genuine key-mismatch message too — the alarm goes quiet. The same trick took the repair latch off
+ * a genuine lost baseline. Removing a verdict is the direction that must never fail, and this was a way to do
+ * it on demand.
+ *
+ * Nor can it be guarded. Protecting a message that would lose a verdict keeps the phrase whether the tool
+ * wrote it or a name spelled it — the two are the same characters — so the guard turns the removal into a
+ * no-op in exactly the cases it was for. A name equal to a verdict phrase is not decidable by removal, in
+ * either direction, and pretending otherwise only chooses which way to be wrong.
+ *
+ * So names are taken only out of the message they are the SUBJECT of (rclone-log.js), where the tool's own
+ * words are what remains by construction. What is left is recorded in the tests as the phase's residual: an
+ * error-level message that carries a path and has no subject, other than the retry summary. None is known in
+ * the pinned helper — every message it emits was read — and it is the loud, recoverable direction.
+ */
+
+/**
+ * The four readings of ONE run, built once and shared by both classifiers.
+ *
+ * `verdict`  — every structured record the tool logged at error or critical, each rendered as its message
+ *              under its level so the existing line-anchored signatures read it unchanged, followed by
+ *              whatever was NOT structured (masked and anchored exactly as before). This is the haystack a
+ *              verdict about the run is read from.
+ * `message`  — the same records' MESSAGES alone, one per line, for the few signatures that must anchor to
+ *              where a message starts (JSON_SIG). Nothing but a structured message is ever in here.
+ * `runVoice` — `verdict` minus every record that was ABOUT A FILE. Used for the changed-server alarm only:
+ *              that verdict stops syncing for every vault until a person clears it, so it is read solely
+ *              from the run speaking about itself. A real key change is announced when the connection is
+ *              built, with no file in hand; one that only shows up mid-transfer still stops the run as a
+ *              connection failure, and the next run meets it at the door and names it.
+ * `everything` — every record, whatever its level, plus the text. Used ONLY for the keep-both conflict
+ *              signature, whose evidence the tool logs below error level. Nothing latching or alarming is
+ *              read from it (see the note at the conflict check).
+ */
+function readings(stdout, stderr, records) {
+  // Flattened again here, defensively. A message is anchored at its START by the signatures above, and that
+  // only means what it should while one message is one line. The parser guarantees that; this module is
+  // where the guarantee is DEPENDED on, so a record that arrived by any other route is made to honour it too.
+  const recs = (Array.isArray(records) ? records.filter((r) => r && typeof r.msg === 'string') : [])
+    .map((r) => (/[\r\n\u2028\u2029\u0085]/.test(r.msg) ? { ...r, msg: r.msg.replace(/[\r\n\u2028\u2029\u0085]/g, ' ') } : r));
+  const verdictRecs = recs.filter(isVerdictLevel).map(cutToItsOpener);
+  const rawText = haystack(stdout, stderr);
+  const textPart = maskFileNames(rawText);
+  const join = (lines) => (lines.length ? `${lines.join('\n')}\n${textPart}` : textPart);
+  const reading = (list) => ({ lines: join(list.map(recordLine)), messages: list.map((r) => r.msg).join('\n') });
+  return {
+    recs,
+    verdictRecs,
+    rawText,
+    textPart,
+    verdict: reading(verdictRecs),
+    runVoice: reading(verdictRecs.filter((r) => r.object == null)),
+    everything: reading(recs.map(cutToItsOpener)),
+  };
+}
+
+/**
+ * Whether `name`'s signature fires on this run, over the reading that signature is allowed.
+ *
+ * BOTH halves read the same reading. They must: a signature restricted to the run's own voice whose
+ * message-anchored alternative still read every record would not be restricted at all, and the guarantee
+ * would hold only for as long as that alternative happened not to exist.
+ */
+function fires(name, v, reading = v.verdict) {
+  return SIG[name].test(reading.lines) || (JSON_SIG[name] ? JSON_SIG[name].test(reading.messages) : false);
+}
+
+/** The first structured record `name`'s signature fires on — the record that decided the outcome. */
+function decidingRecord(name, v) {
+  for (const r of v.verdictRecs) {
+    if (SIG[name].test(recordLine(r)) || (JSON_SIG[name] && JSON_SIG[name].test(r.msg))) return r;
+  }
+  return null;
+}
+
 /**
  * The connection-level verdict of ANY failed rclone process against the vault (not only bisync): a changed
  * server identity, an auth refusal, or an unreachable door — or null when the failure is something else. Used by
@@ -330,17 +502,18 @@ function haystack(stdout, stderr) { return String(stdout == null ? '' : stdout) 
  * state (and the same stop on minting) as it does on a routine run.
  * @returns {string|null} a RESULT value, or null
  */
-function classifyConnectionFailure(stdout, stderr) {
+function classifyConnectionFailure(stdout, stderr, records) {
   // stderr ONLY, and deliberately so. The caller's stdout here is the server's file listing — one name per
   // line, every one of them chosen by whoever can put a file in the vault. Reading a connection verdict out of
   // that let a member call a file "knownhosts: key mismatch" and have this computer announce a changed server
   // identity, which stops syncing for every vault until a person clears it. Errors are written to stderr; the
-  // listing is data, and data never gets a vote on what happened to the connection.
-  const text = haystack('', stderr);
-  if (SIG.hostKeyMismatch.test(text)) return RESULT.HOST_KEY_MISMATCH;
-  if (SIG.authFailed.test(text)) return RESULT.AUTH_FAILED;
-  if (SIG.channelRefused.test(text)) return RESULT.CHANNEL_REFUSED;
-  if (SIG.connectFailed.test(text)) return RESULT.CONNECT_FAILED;
+  // listing is data, and data never gets a vote on what happened to the connection. `records` come from
+  // stderr by construction (the helper's log), so the same rule holds for them.
+  const v = readings('', stderr, records);
+  if (fires('hostKeyMismatch', v, v.runVoice)) return RESULT.HOST_KEY_MISMATCH;
+  if (fires('authFailed', v)) return RESULT.AUTH_FAILED;
+  if (fires('channelRefused', v)) return RESULT.CHANNEL_REFUSED;
+  if (fires('connectFailed', v)) return RESULT.CONNECT_FAILED;
   return null;
 }
 
@@ -353,15 +526,29 @@ function classifyConnectionFailure(stdout, stderr) {
  *   produces (a checked base file name, a stated maximum in bytes) — never a fragment of the raw output.
  */
 function classifyBisyncOutcome(o) {
-  // Two different readings of the same run. `text` is what the SIGNATURES see, with the names of individual
-  // files taken out, so nothing a file is called can decide what the run is reported to have done. `rawText`
-  // still carries them, because naming the file to the person is exactly what the detail extraction is for.
-  const rawText = haystack(o.stdout, o.stderr);
-  const text = maskFileNames(rawText);
+  // The readings of one run (see `readings`): the structured records the tool logged, and whatever it wrote
+  // that was not structured. `v.rawText` still carries the names verbatim, because naming the file to the
+  // person is exactly what the detail extraction is for.
+  const v = readings(o.stdout, o.stderr, o.records);
+  const rawText = v.rawText;
+  const text = v.textPart;
+  // The bounded detail for one outcome, taken from the record that decided it when the run was structured —
+  // the failing file is then a FIELD, not something found by re-reading a sentence — and otherwise from the
+  // line that decided it, exactly as before.
+  const decided = (name) => {
+    const rec = decidingRecord(name, v);
+    if (rec) {
+      const file = showableFileName(rec.object);
+      const maxBytes = statedLimitBytes(rec.msg);
+      return { detail: (file || maxBytes) ? { file, maxBytes } : null, failedPath: safeRelPath(rec.object) };
+    }
+    const line = decidingRawLine(text, rawText, SIG[name]) || rawText;
+    return { detail: outcomeDetail(line), failedPath: failedRelPath(line) };
+  };
   // What bisync said about the BASELINE, decided independently of which cause wins the result below. A file
   // the server refused is the honest cause of the run, but bisync may ALSO have aborted and owed a resync;
   // naming the real cause must never quietly drop that latch.
-  const owesResync = SIG.needsResync.test(text) || SIG.excessiveDelete.test(text) || SIG.allChanged.test(text);
+  const owesResync = fires('needsResync', v) || fires('excessiveDelete', v) || fires('allChanged', v);
   const baseline = () => (owesResync ? true : (o.code === 0 ? false : null));
   // What a CONNECTION verdict must carry through instead of a flat `null`. A data-safety abort — a >50% delete,
   // or every file on one side reading as changed — latches the vault until a person deliberately repairs it, and
@@ -374,19 +561,19 @@ function classifyBisyncOutcome(o) {
   // classifies as needs-resync on its own, which latches honestly.
   // Only on a FAILED run: a run that exited green established its own baseline, and inventing a repair for it
   // would put a vault behind a manual Repair it never needed.
-  const safetyLatch = () => ((o.code !== 0 && (SIG.excessiveDelete.test(text) || SIG.allChanged.test(text))) ? true : null);
+  const safetyLatch = () => ((o.code !== 0 && (fires('excessiveDelete', v) || fires('allChanged', v))) ? true : null);
 
   // Most serious first: a changed server identity is the one signal that outranks even a data-safety abort —
   // it says the machine on the other end may not be the vault at all, and it must be the loud answer whatever
   // else the run also said. It carries the baseline rather than discarding it, so a run that ALSO aborted on a
   // mass delete keeps the repair that abort owes (see below: no verdict here may quietly drop that latch).
   // Where the output carries logged lines at all, the alarm must come from one of them (see the two signatures).
-  const logged = new RegExp(LOG_LINE).test(text);
-  if ((logged ? SIG.hostKeyMismatchLogged : SIG.hostKeyMismatch).test(text)) return { result: RESULT.HOST_KEY_MISMATCH, resyncRequired: safetyLatch(), needsAttention: true };
-  if (SIG.excessiveDelete.test(text)) return { result: RESULT.ABORT_EXCESSIVE_DELETE, resyncRequired: true, needsAttention: true };
+  const logged = new RegExp(LOG_LINE).test(v.runVoice.lines);
+  if (fires(logged ? 'hostKeyMismatchLogged' : 'hostKeyMismatch', v, v.runVoice)) return { result: RESULT.HOST_KEY_MISMATCH, resyncRequired: safetyLatch(), needsAttention: true };
+  if (fires('excessiveDelete', v)) return { result: RESULT.ABORT_EXCESSIVE_DELETE, resyncRequired: true, needsAttention: true };
   // A different safety abort than the delete cap — all files on one side read as changed. Must NOT be labelled as
   // a large DELETE (its own honest status); still a fail-closed abort requiring a deliberate resync.
-  if (SIG.allChanged.test(text)) return { result: RESULT.ABORT_ALL_CHANGED, resyncRequired: true, needsAttention: true };
+  if (fires('allChanged', v)) return { result: RESULT.ABORT_ALL_CHANGED, resyncRequired: true, needsAttention: true };
 
   // A DOOR that refused the credential, refused the connection, or could not be reached at all, outranks
   // anything about a file. A connection dropping mid-transfer leaves both kinds of trace in one log, and reading
@@ -408,9 +595,9 @@ function classifyBisyncOutcome(o) {
   // belt-and-braces should that order ever be changed back. Where it genuinely does the work is the identity
   // check at the top, which must outrank even an abort to be the loud answer, and which without it would take
   // the verdict and drop the abort's repair with it.
-  if (o.code !== 0 && SIG.authFailed.test(text)) return { result: RESULT.AUTH_FAILED, resyncRequired: safetyLatch(), needsAttention: true };
-  if (o.code !== 0 && SIG.channelRefused.test(text)) return { result: RESULT.CHANNEL_REFUSED, resyncRequired: safetyLatch(), needsAttention: true };
-  if (o.code !== 0 && SIG.connectFailed.test(text)) return { result: RESULT.CONNECT_FAILED, resyncRequired: safetyLatch(), needsAttention: true };
+  if (o.code !== 0 && fires('authFailed', v)) return { result: RESULT.AUTH_FAILED, resyncRequired: safetyLatch(), needsAttention: true };
+  if (o.code !== 0 && fires('channelRefused', v)) return { result: RESULT.CHANNEL_REFUSED, resyncRequired: safetyLatch(), needsAttention: true };
+  if (o.code !== 0 && fires('connectFailed', v)) return { result: RESULT.CONNECT_FAILED, resyncRequired: safetyLatch(), needsAttention: true };
 
   // A file the server would not take. Two orderings matter here.
   //
@@ -426,25 +613,25 @@ function classifyBisyncOutcome(o) {
   // Among themselves they run from the most specific thing the server said to the least: a size it stated, a
   // lack of room it stated, and last the case where it said nothing at all.
   if (o.code !== 0) {
-    if (SIG.fileTooLarge.test(text)) return { result: RESULT.FILE_TOO_LARGE, resyncRequired: baseline(), needsAttention: true, detail: outcomeDetail(decidingRawLine(text, rawText, SIG.fileTooLarge) || rawText), failedPath: failedRelPath(decidingRawLine(text, rawText, SIG.fileTooLarge) || rawText) };
-    if (SIG.serverNoSpace.test(text)) return { result: RESULT.SERVER_NO_SPACE, resyncRequired: baseline(), needsAttention: true, detail: outcomeDetail(decidingRawLine(text, rawText, SIG.serverNoSpace) || rawText), failedPath: failedRelPath(decidingRawLine(text, rawText, SIG.serverNoSpace) || rawText) };
-    if (SIG.uploadNotStored.test(text)) return { result: RESULT.UPLOAD_NOT_STORED, resyncRequired: baseline(), needsAttention: true, detail: outcomeDetail(decidingRawLine(text, rawText, SIG.uploadNotStored) || rawText), failedPath: failedRelPath(decidingRawLine(text, rawText, SIG.uploadNotStored) || rawText) };
+    if (fires('fileTooLarge', v)) return { result: RESULT.FILE_TOO_LARGE, resyncRequired: baseline(), needsAttention: true, ...decided('fileTooLarge') };
+    if (fires('serverNoSpace', v)) return { result: RESULT.SERVER_NO_SPACE, resyncRequired: baseline(), needsAttention: true, ...decided('serverNoSpace') };
+    if (fires('uploadNotStored', v)) return { result: RESULT.UPLOAD_NOT_STORED, resyncRequired: baseline(), needsAttention: true, ...decided('uploadNotStored') };
   }
 
-  if (SIG.needsResync.test(text)) return { result: RESULT.NEEDS_RESYNC, resyncRequired: true, needsAttention: true };
+  if (fires('needsResync', v)) return { result: RESULT.NEEDS_RESYNC, resyncRequired: true, needsAttention: true };
 
   if (o.code !== 0) {
     // A non-zero exit with no recognized safety signature: name path-too-long distinctly if that is the
     // cause, else a generic error. Neither changes the resync block (no new baseline was established).
-    if (SIG.pathTooLong.test(text)) return { result: RESULT.PATH_TOO_LONG, resyncRequired: null, needsAttention: true, detail: outcomeDetail(decidingRawLine(text, rawText, SIG.pathTooLong) || rawText) };
+    if (fires('pathTooLong', v)) return { result: RESULT.PATH_TOO_LONG, resyncRequired: null, needsAttention: true, detail: decided('pathTooLong').detail };
     return { result: RESULT.ERROR, resyncRequired: null, needsAttention: true };
   }
 
   // code === 0: the run completed and established/refreshed the baseline (clears the resync block), but
   // it may still carry a non-green attention state that must not read as "clean".
-  if (SIG.pathTooLong.test(text)) return { result: RESULT.PATH_TOO_LONG, resyncRequired: false, needsAttention: true, detail: outcomeDetail(decidingRawLine(text, rawText, SIG.pathTooLong) || rawText) };
-  if (SIG.conflict.test(text)) return { result: RESULT.CONFLICT_KEEP_BOTH, resyncRequired: false, needsAttention: true };
+  if (fires('pathTooLong', v)) return { result: RESULT.PATH_TOO_LONG, resyncRequired: false, needsAttention: true, detail: decided('pathTooLong').detail };
+  if (fires('conflict', v, v.everything)) return { result: RESULT.CONFLICT_KEEP_BOTH, resyncRequired: false, needsAttention: true };
   return { result: o.resync ? RESULT.RESYNC_OK : RESULT.OK, resyncRequired: false, needsAttention: false };
 }
 
-module.exports = { classifyBisyncOutcome, maskFileNames, classifyConnectionFailure, outcomeDetail, failedFileName, failedRelPath, statedLimitBytes, RESULT, VAULT_FULL, HOST_KEY_UNVERIFIED, SIG };
+module.exports = { classifyBisyncOutcome, maskFileNames, classifyConnectionFailure, outcomeDetail, failedFileName, failedRelPath, showableFileName, safeRelPath, readings, statedLimitBytes, RESULT, VAULT_FULL, HOST_KEY_UNVERIFIED, SIG, JSON_SIG };

@@ -216,10 +216,12 @@ class RcloneRunner {
       // `stdoutTruncated` so a consumer that needs the complete output can refuse to act on a partial one.
       // The optional line relay (onLine) sees each complete line exactly once and retains nothing.
       const stdoutSink = new BoundedOutput(maxStdoutBytes, onLine);
-      // stderr is not accumulated raw: it is fed through a stats parser that extracts ONLY the two
-      // aggregate progress integers (files, bytes) and keeps ONLY genuine non-stats lines for the
-      // typed-outcome classifier. rclone's stats block carries per-file PATHS ("Transferring:" + " * path")
-      // that must never be kept, forwarded, or logged — the parser drops them (see stats-parse.js).
+      // stderr is not accumulated raw: it is fed through a stats parser that extracts ONLY the progress
+      // integers and keeps ONLY what the typed-outcome classifier needs — the helper's structured log
+      // records (each with its own file's name already taken out of its message), plus any line that was
+      // not structured. rclone's stats block carries per-file PATHS (a "Transferring:" section, and the
+      // in-flight entries of a structured stats record) that must never be kept, forwarded, or logged —
+      // the parser drops the whole block and keeps only its numbers (see stats-parse.js).
       const statsParser = new StatsStderrParser();
       let done = false;
       let idleTimer = null;
@@ -257,7 +259,7 @@ class RcloneRunner {
       child.on('exit', (code) => {
         statsParser.end();
         const out = stdoutSink.end();
-        finish(resolve, { code, stdout: out.text, stdoutTruncated: out.truncated, stderr: statsParser.stderr(), stderrTruncated: statsParser.truncated() });
+        finish(resolve, { code, stdout: out.text, stdoutTruncated: out.truncated, stderr: statsParser.stderr(), stderrTruncated: statsParser.truncated(), logRecords: statsParser.records() });
       });
     });
   }
