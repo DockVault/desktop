@@ -108,9 +108,19 @@
       if (result && !isRunning) for (const n of result.notes || []) pane.appendChild(para(n, 'note'));
     }
 
-    if (picture.action) {
+    // The action a check offers, either from the picture or from what the probe just found. The KIND decides
+    // where it leads: this used to call openServerSetup() whatever the kind said, which was invisible while
+    // every check was about the server and would have sent a folder problem to the server setup screen.
+    const action = (result && !isRunning && result.action) || picture.action;
+    if (action) {
       const actions = el('div', 'actions');
-      actions.appendChild(button(picture.action.label, { onClick: () => { if (api) void api.openServerSetup(); } }));
+      actions.appendChild(button(action.label, {
+        onClick: () => {
+          if (!api) return;
+          if (action.kind === 'relocate-folder' && action.vaultId) void api.relocateFolder(action.vaultId);
+          else void api.openServerSetup();
+        },
+      }));
       pane.appendChild(actions);
     }
     // A run started from the button keeps the keyboard where it was: on that button, rebuilt.

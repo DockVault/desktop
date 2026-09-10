@@ -143,7 +143,10 @@ const api = Object.freeze({
   troubleshoot: Object.freeze({
     // The Troubleshoot view. Main owns the list of checks and everything each one does; the page only names a
     // check by the id main gave it and renders what comes back. Nothing here writes, and nothing takes an
-    // address from the page: a probe reaches the SAVED server setting and nothing else.
+    // address from the page. The server check reaches the SAVED server setting and nothing else; the folder
+    // check reaches no network at all and names LOCAL FOLDER PATHS, which is the one place this channel does
+    // — a missing folder cannot be answered without saying which folder and where it was expected. Gated to
+    // this page and this window, the same as the Computers view, which shows the same paths for the same reason.
     // The checks on offer: [{ id, title }].
     checks: () => ipcRenderer.invoke('dockvault:troubleshoot.checks'),
     // What is set up, for one check: { id, title, intro, facts: [{ label, value, mono }], legs: [{ id, label }],

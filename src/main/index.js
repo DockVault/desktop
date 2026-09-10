@@ -76,7 +76,7 @@ const { runDeviceSetup } = require('./device-enable');
 const { resumePendingGrants, markerActionForRunReason, runSetupAgainGrants } = require('./device-grant-resume');
 const { decideMigration } = require('./device-migrate');
 const { createSyncWizard } = require('./sync-wizard');
-const { createManageView } = require('./manage-view');
+const { createManageView, isUuid } = require('./manage-view');
 const { createStatusView } = require('./status-view');
 const appMenu = require('./app-menu');
 const { WatchGate } = require('./watch-gate');
@@ -536,6 +536,16 @@ function registerIpc() {
   ipcMain.handle('dockvault:troubleshoot.describe', (e, args) => (fromTroubleshootPage(e) && troubleshootInstance ? troubleshootInstance.describe(args && args.id) : null));
   ipcMain.handle('dockvault:troubleshoot.probe', (e, args) => (fromTroubleshootPage(e) && troubleshootInstance ? troubleshootInstance.probe(args && args.id) : null));
   ipcMain.handle('dockvault:troubleshoot.open-server-setup', (e) => { if (fromTroubleshootPage(e)) void openServerSetupFromTroubleshoot(); return null; });
+  // Point DockVault at a synced folder again, or stop syncing it - the same confirmed flow the tray offers,
+  // gated to this page like every other intent here. The page names only a vault id the check gave it; main
+  // checks its shape and owns the flow.
+  ipcMain.handle('dockvault:troubleshoot.relocate', (e, args) => {
+    if (!fromTroubleshootPage(e)) return null;
+    const vaultId = args && typeof args.vaultId === 'string' ? args.vaultId : '';
+    if (!isUuid(vaultId)) return null;
+    void relocateFolder(vaultId);
+    return null;
+  });
   ipcMain.handle('dockvault:troubleshoot.close', (e) => { if (fromTroubleshootPage(e)) closeTroubleshoot(); return null; });
 
   // Non-secret app facts, for any page. It sits HERE, below every page gate, because part of what it
@@ -2850,6 +2860,24 @@ async function openTroubleshoot() {
       // The same verify the setup screen runs, over main's request helper and the real SSH probe; it reads the
       // saved addresses main itself passed in and contacts nothing else.
       verify: (fields) => verifySetup(fields, { httpJson: mainHttpJson }),
+      // The folders this computer syncs, and what is actually at each one. Local only - this check reaches
+      // no network at all, so it answers whether or not anyone is signed in, which is the state a person
+      // with a missing folder is often in.
+      syncedFolders: () => {
+        try { return storedConfig().filter((e) => e.enabled !== false).map((e) => ({ vaultId: e.vaultId, name: e.vaultName || e.vaultId, folder: e.localFolder || '' })); }
+        catch { return []; }
+      },
+      inspectFolder: async (folder, vaultId) => {
+        try {
+          if (!folder) return { kind: 'folder-missing' };
+          const m = folderMarker.readMarker(folder);
+          if (m.kind === 'folder-missing') return { kind: 'folder-missing' };
+          if (m.kind === 'unreadable') return { kind: 'folder-marker-unreadable' };
+          if (m.kind !== 'ok') return { kind: 'folder-marker-missing' };
+          const mine = String(m.vaultId || '').toLowerCase() === String(vaultId).toLowerCase();
+          return { kind: mine ? 'ok' : 'folder-other-vault' };
+        } catch { return { kind: 'not-checked' }; }
+      },
     });
     win.setMenuBarVisibility(false);
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));

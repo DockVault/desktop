@@ -186,7 +186,99 @@ function safeState(io) {
   } catch { return { status: 'unreadable', origin: null, sftp: null }; }
 }
 
-const CHECKS = Object.freeze([serverConnection]);
+// --- "A synced folder is missing" -------------------------------------------------------------------------
+
+/*
+ * A synced folder is known by a hidden marker in its root, not by where it happens to sit — so a folder can
+ * be renamed or moved and the sync follows it. The failures this check is for are the ones where that
+ * lookup comes back with an answer nobody wants: the folder is not there, a DIFFERENT folder is now where
+ * it was, the marker cannot be read, or two folders look like it.
+ *
+ * Those states already pause the vault and already offer a way out from the tray. What was missing is the
+ * ability for a person who suspects it to go and LOOK, without waiting to be told, and to see which folder
+ * DockVault is expecting and what it finds there. That is the whole check.
+ *
+ * It names local folder paths, which nothing else on this channel does. That is deliberate and it is the
+ * point: "a synced folder is missing" is unanswerable without saying which folder and where it was
+ * expected. The channel is gated to this page and this window, the same as the Computers view, which shows
+ * the same paths for the same reason.
+ */
+const FOLDER_STATE = Object.freeze({
+  ok: { state: 'ok', text: 'Found, and it is the folder this vault syncs.' },
+  'folder-missing': { state: 'bad', text: 'Not found. It may have been moved, renamed into a place DockVault has not looked, deleted, or be on a drive that is not plugged in.' },
+  'folder-marker-missing': { state: 'bad', text: "A folder is there, but it is not this vault's - it does not carry the marker DockVault wrote. Nothing in it has been touched." },
+  'folder-other-vault': { state: 'bad', text: "Another vault's folder is where this one's used to be. Nothing in it has been touched." },
+  'folder-marker-unreadable': { state: 'bad', text: "The folder is there, but the marker that identifies it cannot be read. DockVault will not write into a folder whose identity is in doubt." },
+  'folder-ambiguous': { state: 'bad', text: 'More than one folder looks like this one - a copy was probably made. DockVault will not guess which is which.' },
+  'not-checked': { state: 'idle', text: '' },
+});
+const folderProblem = (kind) => kind !== 'ok' && kind !== 'not-checked';
+
+const FOLDER_INTRO = 'Looks for each folder you sync on this computer, and says whether DockVault can still recognise it. Nothing is written or changed.';
+
+const folderMissing = {
+  id: 'folder-missing',
+  title: 'A synced folder is missing',
+  describe(io) {
+    const folders = safeFolders(io);
+    const legs = folders.map((f) => ({ id: f.vaultId, label: f.name }));
+    if (folders.length === 0) {
+      return {
+        id: this.id, title: this.title, intro: '', facts: [], legs: [], canProbe: false,
+        note: 'No folders are set up to sync on this computer yet, so there is nothing to look for.',
+        action: null,
+      };
+    }
+    return {
+      id: this.id, title: this.title, intro: FOLDER_INTRO, canProbe: true, note: '', action: null,
+      facts: folders.map((f) => ({ label: f.name, value: f.folder || 'no folder recorded', mono: true })),
+      legs,
+    };
+  },
+  async probe(io) {
+    const folders = safeFolders(io);
+    if (folders.length === 0) return { id: this.id, ran: false, legs: [], notes: [], verdict: null, action: null };
+    const legs = [];
+    const broken = [];
+    for (const f of folders) {
+      let kind = 'not-checked';
+      try {
+        const r = await io.inspectFolder(f.folder, f.vaultId);
+        kind = (r && typeof r.kind === 'string' && FOLDER_STATE[r.kind]) ? r.kind : 'not-checked';
+      } catch { kind = 'not-checked'; }
+      const face = FOLDER_STATE[kind];
+      legs.push({ id: f.vaultId, label: f.name, state: face.state, text: face.text, detail: f.folder || '' });
+      if (folderProblem(kind)) broken.push(f);
+    }
+    // The way out, on the FIRST vault that needs it. One action rather than a row of them: each one opens a
+    // flow that asks about a single vault, and offering four at once invites picking the wrong one.
+    const first = broken[0] || null;
+    const notes = broken.length > 1
+      ? [`${broken.length} folders need attention. Sorting the first one out will bring you back here for the next.`]
+      : [];
+    return {
+      id: this.id, ran: true, legs, notes,
+      verdict: broken.length === 0
+        ? { state: 'ok', text: folders.length === 1 ? 'The folder you sync is where DockVault expects it.' : 'Every folder you sync is where DockVault expects it.' }
+        : { state: 'bad', text: broken.length === 1 ? `DockVault cannot recognise the folder for ${first.name}.` : 'DockVault cannot recognise some of the folders you sync.' },
+      action: first ? { kind: 'relocate-folder', vaultId: first.vaultId, label: `Find ${first.name}'s folder, or stop syncing it…` } : null,
+    };
+  },
+};
+
+// The synced folders as this computer has them: id, the vault's name, and where the folder is expected.
+// Never throws - a configuration that cannot be read is "nothing to look for", not a broken page.
+function safeFolders(io) {
+  try {
+    const list = typeof io.syncedFolders === 'function' ? io.syncedFolders() : [];
+    if (!Array.isArray(list)) return [];
+    return list
+      .filter((f) => f && f.vaultId)
+      .map((f) => ({ vaultId: String(f.vaultId), name: f.name || 'This vault', folder: f.folder || '' }));
+  } catch { return []; }
+}
+
+const CHECKS = Object.freeze([serverConnection, folderMissing]);
 
 // --- The view --------------------------------------------------------------------------------------------
 

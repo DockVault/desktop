@@ -20,10 +20,16 @@ function make({ state = SAVED, verify = async () => green() } = {}) {
   return { view: createTroubleshoot(io), calls };
 }
 
-test('the registry lists the connection check first, by id and title only', () => {
+test('the registry lists the checks on offer, by id and title only', () => {
   const { view } = make();
-  assert.deepEqual(view.checks(), [{ id: 'server-connection', title: 'Cannot connect to the server' }]);
+  assert.deepEqual(view.checks(), [
+    { id: 'server-connection', title: 'Cannot connect to the server' },
+    { id: 'folder-missing', title: 'A synced folder is missing' },
+  ]);
+  // The connection check stays first: it is the one that explains the most other symptoms.
   assert.equal(CHECKS[0].id, 'server-connection');
+  // Pinned as a set, so a new check is a deliberate change to this line rather than a silent addition.
+  assert.equal(CHECKS.length, 2);
 });
 
 test('describe shows the tied server host with its API port, and the SFTP address — and offers Change server', () => {
@@ -190,15 +196,17 @@ test('an unknown or malformed check id gets nothing', async () => {
 });
 
 test('another check slots into the registry without changing the view or the page contract', async () => {
+  // A made-up id, deliberately not one the registry really has: this test is about the registry taking a
+  // NEW entry, and reusing a real id would make it collide rather than extend.
   const extra = {
-    id: 'folder-missing', title: 'A synced folder is missing',
-    describe: () => ({ id: 'folder-missing', title: 'A synced folder is missing', intro: '', facts: [{ label: 'Folders', value: '2', mono: false }], legs: [{ id: 'f', label: 'Folders' }], canProbe: true, note: '', action: null }),
-    probe: async () => ({ id: 'folder-missing', ran: true, legs: [{ id: 'f', label: 'Folders', state: 'ok', text: 'All present.' }], notes: [], verdict: { state: 'ok', text: 'Fine.' } }),
+    id: 'made-up-check', title: 'Something else entirely',
+    describe: () => ({ id: 'made-up-check', title: 'Something else entirely', intro: '', facts: [{ label: 'Folders', value: '2', mono: false }], legs: [{ id: 'f', label: 'Folders' }], canProbe: true, note: '', action: null }),
+    probe: async () => ({ id: 'made-up-check', ran: true, legs: [{ id: 'f', label: 'Folders', state: 'ok', text: 'All present.' }], notes: [], verdict: { state: 'ok', text: 'Fine.' } }),
   };
   const view = createTroubleshoot({ serverState: () => SAVED, verify: async () => green() }, { checks: [...CHECKS, extra] });
-  assert.deepEqual(view.checks().map((c) => c.id), ['server-connection', 'folder-missing']);
-  assert.equal(view.describe('folder-missing').facts[0].value, '2');
-  assert.equal((await view.probe('folder-missing')).verdict.state, 'ok');
+  assert.deepEqual(view.checks().map((c) => c.id), ['server-connection', 'folder-missing', 'made-up-check']);
+  assert.equal(view.describe('made-up-check').facts[0].value, '2');
+  assert.equal((await view.probe('made-up-check')).verdict.state, 'ok');
 });
 
 test('a check whose describe or probe throws is contained', async () => {
@@ -255,4 +263,182 @@ test('every leg kind has its own sentence in the house voice, and the leg states
   assert.match(sftpSentence({ ...sftp, kind: 'empty' }, HINTS.env), /DOCKVAULT_SERVER/);
   assert.match(syncSentence('unknown'), /syncing should still work/);
   assert.equal(syncSentence('not-checked'), '');
+});
+
+// ---------------------------------------------------------------------------------------------
+// "A synced folder is missing"
+//
+// A synced folder is known by a hidden marker in its root, not by its path, so it survives being renamed or
+// moved. This check is for when that lookup comes back with an answer nobody wants — and its job is to let
+// someone who SUSPECTS it go and look, rather than waiting to be told.
+// ---------------------------------------------------------------------------------------------
+
+const FOLDERS = [
+  { vaultId: 'v1', name: 'Photos', folder: 'C:\Users\a\Photos' },
+  { vaultId: 'v2', name: 'Invoices', folder: 'C:\Users\a\Invoices' },
+];
+function folderIo({ folders = FOLDERS, inspect = async () => ({ kind: 'ok' }) } = {}) {
+  const asked = [];
+  const io = {
+    serverState: () => SAVED,
+    verify: async () => green(),
+    syncedFolders: () => folders,
+    inspectFolder: async (folder, vaultId) => { asked.push({ folder, vaultId }); return inspect(folder, vaultId); },
+  };
+  return { view: createTroubleshoot(io), asked };
+}
+
+test('it shows which folder each vault syncs, so a person can see what is expected where', () => {
+  const { view } = folderIo();
+  const d = view.describe('folder-missing');
+  assert.equal(d.canProbe, true);
+  assert.deepEqual(d.facts.map((f) => [f.label, f.value]), [
+    ['Photos', 'C:\Users\a\Photos'],
+    ['Invoices', 'C:\Users\a\Invoices'],
+  ]);
+  for (const f of d.facts) assert.equal(f.mono, true, 'a path is shown as a path');
+});
+
+test('with nothing synced it says so, and offers no probe of nothing', () => {
+  const { view } = folderIo({ folders: [] });
+  const d = view.describe('folder-missing');
+  assert.equal(d.canProbe, false);
+  assert.match(d.note, /No folders are set up to sync/);
+  assert.deepEqual(d.facts, []);
+});
+
+test('every folder present is a green verdict and no action', async () => {
+  const { view, asked } = folderIo();
+  const r = await view.probe('folder-missing');
+  assert.equal(r.ran, true);
+  assert.deepEqual(asked.map((a) => a.vaultId), ['v1', 'v2'], 'each configured folder is really looked at');
+  assert.equal(r.verdict.state, 'ok');
+  assert.equal(r.action, null, 'nothing to fix, so nothing is offered');
+  for (const leg of r.legs) assert.equal(leg.state, 'ok');
+});
+
+// The four states the acceptance names, each with its own sentence — a person who is told "missing" when a
+// DIFFERENT folder is actually sitting there would go looking for the wrong thing.
+test('each way of losing a folder gets its own answer, never a generic one', async () => {
+  const cases = [
+    ['folder-missing', /Not found/],
+    ['folder-marker-missing', /not this vault's/],
+    ['folder-other-vault', /Another vault's folder/],
+    ['folder-marker-unreadable', /cannot be read/],
+    ['folder-ambiguous', /More than one folder/],
+  ];
+  const seen = new Set();
+  for (const [kind, re] of cases) {
+    const { view } = folderIo({ folders: [FOLDERS[0]], inspect: async () => ({ kind }) });
+    const r = await view.probe('folder-missing');
+    assert.equal(r.legs[0].state, 'bad', kind);
+    assert.match(r.legs[0].text, re, kind);
+    assert.ok(!seen.has(r.legs[0].text), `${kind}: a sentence of its own, not a shared one`);
+    seen.add(r.legs[0].text);
+    // And each one says the folder's contents were left alone, or offers the way out.
+    assert.equal(r.action.kind, 'relocate-folder');
+    assert.equal(r.action.vaultId, 'v1');
+  }
+});
+
+test('the way out is offered for the affected vault, and only one at a time', async () => {
+  const { view } = folderIo({ inspect: async (_f, vaultId) => ({ kind: vaultId === 'v2' ? 'folder-missing' : 'ok' }) });
+  const r = await view.probe('folder-missing');
+  assert.equal(r.action.kind, 'relocate-folder');
+  assert.equal(r.action.vaultId, 'v2', 'the one that is actually broken, not the first in the list');
+  assert.match(r.action.label, /Invoices/);
+  assert.equal(r.verdict.state, 'bad');
+  assert.match(r.verdict.text, /Invoices/);
+});
+
+test('with several broken it fixes one and says there are more, rather than offering a row of buttons', async () => {
+  const { view } = folderIo({ inspect: async () => ({ kind: 'folder-missing' }) });
+  const r = await view.probe('folder-missing');
+  assert.equal(r.action.vaultId, 'v1', 'the first one');
+  assert.equal(r.notes.length, 1);
+  assert.match(r.notes[0], /2 folders need attention/);
+  assert.match(r.notes[0], /bring you back here/);
+});
+
+test('an inspection that fails, or answers nonsense, is not reported as a missing folder', async () => {
+  for (const inspect of [
+    async () => { throw new Error('the disk is busy'); },
+    async () => null,
+    async () => ({ kind: 'something-new' }),
+    async () => ({}),
+  ]) {
+    const { view } = folderIo({ folders: [FOLDERS[0]], inspect });
+    const r = await view.probe('folder-missing');
+    assert.equal(r.legs[0].state, 'idle', 'an unknown answer is not an accusation that the folder is gone');
+    assert.equal(r.verdict.state, 'ok', 'and it is not counted as broken');
+    assert.equal(r.action, null);
+  }
+});
+
+test('a configuration that cannot be read is "nothing to look for", not a broken page', async () => {
+  const io = {
+    serverState: () => SAVED, verify: async () => green(),
+    syncedFolders: () => { throw new Error('unreadable'); },
+    inspectFolder: async () => ({ kind: 'ok' }),
+  };
+  const view = createTroubleshoot(io);
+  assert.equal(view.describe('folder-missing').canProbe, false);
+  const r = await view.probe('folder-missing');
+  assert.equal(r.ran, false);
+  assert.deepEqual(r.legs, []);
+});
+
+test('this check reaches no network at all', async () => {
+  let verified = 0;
+  const io = {
+    serverState: () => SAVED,
+    verify: async () => { verified += 1; return green(); },
+    syncedFolders: () => FOLDERS,
+    inspectFolder: async () => ({ kind: 'ok' }),
+  };
+  const view = createTroubleshoot(io);
+  view.describe('folder-missing');
+  await view.probe('folder-missing');
+  assert.equal(verified, 0, 'a folder question is answered on this computer, signed in or not');
+});
+
+// ---------------------------------------------------------------------------------------------
+// THE WIRING. Source text for the parts that run inside the app, aimed at the two things that would cost
+// something: the action leading somewhere wrong, and the new channel being reachable from the wrong page.
+// ---------------------------------------------------------------------------------------------
+
+const fs = require('node:fs');
+const path = require('node:path');
+const root = path.resolve(__dirname, '..');
+const main = fs.readFileSync(path.join(root, 'src', 'main', 'index.js'), 'utf8');
+const page = fs.readFileSync(path.join(root, 'src', 'renderer', 'troubleshoot.js'), 'utf8');
+
+// The page used to call openServerSetup() for ANY action, whatever its kind said. That was invisible while
+// every check was about the server — and it would have sent a person with a missing folder to the server
+// setup screen, which is the exact class of wrong-destination bug the tray routing phase just fixed.
+test('the page sends each action where its KIND says, not to one hardcoded place', () => {
+  const block = page.slice(page.indexOf('const action = ('), page.indexOf('// A run started from the button'));
+  assert.ok(block.length > 0, 'the action block exists');
+  assert.match(block, /action\.kind === 'relocate-folder'/, 'a folder problem goes to the folder flow');
+  assert.match(block, /api\.relocateFolder\(action\.vaultId\)/);
+  assert.match(block, /else void api\.openServerSetup\(\)/, 'and the server actions still go to setup');
+  // A probe's own action is rendered, not just the picture's — the affected vault is only known after looking.
+  assert.match(block, /result && !isRunning && result\.action/);
+});
+
+test('the relocate channel is gated to the troubleshoot page, and checks the id it is given', () => {
+  const handler = main.slice(main.indexOf("ipcMain.handle('dockvault:troubleshoot.relocate'"), main.indexOf("ipcMain.handle('dockvault:troubleshoot.close'"));
+  assert.ok(handler.length > 0, 'the handler exists');
+  assert.match(handler, /if \(!fromTroubleshootPage\(e\)\) return null;/, 'no other page may reach it');
+  assert.match(handler, /if \(!isUuid\(vaultId\)\) return null;/, 'and the page cannot name something that is not a vault');
+  assert.match(handler, /void relocateFolder\(vaultId\)/, 'it runs the same confirmed flow the tray offers');
+});
+
+test('the folder check reads the disk and nothing else', () => {
+  const io = main.slice(main.indexOf('syncedFolders: () => {'), main.indexOf('    });', main.indexOf('syncedFolders: () => {')));
+  assert.ok(io.length > 0);
+  assert.match(io, /folderMarker\.readMarker\(folder\)/, 'the marker is what identifies a folder');
+  assert.ok(!/mainHttpJson|fetch\(|verifySetup/.test(io), 'nothing here reaches the network');
+  // A vault whose sync is switched off is not a missing folder.
+  assert.match(io, /filter\(\(e\) => e\.enabled !== false\)/);
 });
