@@ -165,15 +165,18 @@ app.whenReady().then(async () => {
   // H) a second check slots in; each check probes on its own
   {
     let releaseFirst = null;
+    // A MADE-UP id and title, deliberately not a real check's. This scenario is about the registry taking a
+    // NEW entry and each check probing on its own — reusing a real id made two identically titled rows, both
+    // marked current, with clickCheck matching whichever came first. That is a collision, not a test.
     const second = {
-      id: 'folder-missing', title: 'A synced folder is missing',
-      describe: () => ({ id: 'folder-missing', title: 'A synced folder is missing', intro: 'Looks for each synced folder where it was last seen.', facts: [{ label: 'Folders', value: '2', mono: false }], legs: [{ id: 'f', label: 'Folders' }], canProbe: true, note: '', action: null }),
-      probe: async () => ({ id: 'folder-missing', ran: true, legs: [{ id: 'f', label: 'Folders', state: 'ok', text: 'Both folders are where they were.' }], notes: [], verdict: { state: 'ok', text: 'All synced folders are present.' } }),
+      id: 'made-up-check', title: 'Something else entirely',
+      describe: () => ({ id: 'made-up-check', title: 'Something else entirely', intro: 'A check that exists only for this scenario.', facts: [{ label: 'Folders', value: '2', mono: false }], legs: [{ id: 'f', label: 'Folders' }], canProbe: true, note: '', action: null }),
+      probe: async () => ({ id: 'made-up-check', ran: true, legs: [{ id: 'f', label: 'Folders', state: 'ok', text: 'Both folders are where they were.' }], notes: [], verdict: { state: 'ok', text: 'All synced folders are present.' } }),
     };
     const r = await scenario('H_second', { checks: [...CHECKS, second], ioSpec: { verify: () => new Promise((res) => { releaseFirst = () => res(GREEN); }) }, drive: async (win, ctx) => {
       await sleep(400); // the first check is now probing and stuck until released
       const first = await ev(win, snap);
-      const switched = await ev(win, clickCheck('A synced folder is missing'));
+      const switched = await ev(win, clickCheck('Something else entirely'));
       await sleep(300);
       const secondSettled = await ev(win, snap);
       const back = await ev(win, clickCheck('Cannot connect to the server'));
@@ -181,8 +184,13 @@ app.whenReady().then(async () => {
       const landed = await ev(win, settle);
       return { first, switched, secondSettled, back, landed, log: ctx.log.length };
     } });
-    out.H_pass = r.first.checks.length === 2 && r.first.checks[0].current === 'true' && r.first.lights.every((l) => l.state === 'checking')
-      && r.switched.checks[1].current === 'true' && r.switched.checks[0].current === null && r.switched.heading === 'A synced folder is missing'
+    // The injected check is LISTED and the connection check is the one selected on arrival. How many checks
+    // the registry holds beside them is a different claim and belongs in the unit tests — pinning it here is
+    // what made adding a real check break this scenario, in a file nothing was running.
+    const current = (snapshot) => (snapshot.checks.find((c) => c.current === 'true') || {}).title;
+    out.H_pass = r.first.checks.some((c) => c.title === 'Something else entirely')
+      && current(r.first) === 'Cannot connect to the server' && r.first.lights.every((l) => l.state === 'checking')
+      && current(r.switched) === 'Something else entirely' && r.switched.heading === 'Something else entirely'
       && r.secondSettled.lights.length === 1 && r.secondSettled.lights[0].state === 'ok' && r.secondSettled.verdict && r.secondSettled.verdict.state === 'ok' && r.secondSettled.buttons[0].label === 'Run again' && r.secondSettled.buttons[0].disabled === false
       && r.back.heading === 'Cannot connect to the server' && r.back.lights.every((l) => l.state === 'checking') && r.back.buttons[0].disabled === true
       && r.landed.lights.every((l) => l.state === 'ok') && r.landed.verdict && r.landed.verdict.state === 'ok' && r.log === 1;
