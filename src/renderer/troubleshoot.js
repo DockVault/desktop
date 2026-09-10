@@ -80,9 +80,14 @@
     }
     if (picture.note) { const box = el('div', 'box'); box.appendChild(para(picture.note)); pane.appendChild(box); }
 
+    // Declared HERE, not inside the probe block below, because the action section after that block reads it
+    // too. It was block-scoped and read outside its block, which threw a ReferenceError on every render and
+    // took the whole action section with it — so no check drew its button at all. Nothing in the unit suite
+    // saw that: the page is only rendered by the functional harness, and nothing ran the harnesses.
+    const isRunning = state === 'checking';
+
     if (picture.canProbe) {
       const bar = el('div', 'toolbar');
-      const isRunning = state === 'checking';
       runButton = button(isRunning ? 'Checking…' : (result ? 'Run again' : 'Run check'), { primary: true, disabled: isRunning, onClick: () => void run(picture.id, { focusRun: true }) });
       bar.appendChild(runButton);
       if (result && result.at && !isRunning) bar.appendChild(el('span', 'ran', `Last run ${new Date(result.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`));
