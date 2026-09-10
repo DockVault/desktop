@@ -277,6 +277,24 @@
       footer.appendChild(button('Choose another folder', { onClick: () => answer(false), autofocus: true, escape: true }));
       footer.appendChild(button('Use it anyway', { onClick: () => answer(true) }));
     },
+    // The folder has been synced before — by this vault, or by another one, or by something whose marker
+    // cannot be read. Said before anything is written to it, because taking over another vault's marker
+    // costs that vault the ability to find its own folder again after a rename.
+    'confirm-reuse': (q) => {
+      setSteps({ computer: 'done', vault: 'done', folder: 'current' });
+      title.textContent = q.heading || 'This folder has been synced before';
+      body.appendChild(el('p', 'mono', q.folder));
+      body.appendChild(q.takeover ? box('warn', para(q.message || '')) : para(q.message || ''));
+      if (q.takeover) {
+        // The safe choice leads, and is the one the keyboard lands on.
+        footer.appendChild(button('Cancel setup', { onClick: () => answer('cancel'), escape: true }));
+        footer.appendChild(button('Choose a different folder', { onClick: () => answer('choose-different'), autofocus: true }));
+        footer.appendChild(button('Use it anyway', { onClick: () => answer('use') }));
+      } else {
+        footer.appendChild(button('Choose a different folder', { onClick: () => answer('choose-different'), escape: true }));
+        footer.appendChild(button('Continue', { primary: true, onClick: () => answer('use'), autofocus: true }));
+      }
+    },
     'confirm-make-private': (q) => {
       setSteps({ computer: 'done', vault: 'done', folder: 'current' });
       title.textContent = 'This folder is shared with other accounts on this computer';

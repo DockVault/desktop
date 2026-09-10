@@ -157,6 +157,9 @@ const api = Object.freeze({
     probe: (id) => ipcRenderer.invoke('dockvault:troubleshoot.probe', { id: String(id) }),
     // Open the server setup (the same screen the app opens with, or the change-server flow with its consent).
     openServerSetup: () => ipcRenderer.invoke('dockvault:troubleshoot.open-server-setup'),
+    // Point DockVault at a synced folder again, or stop syncing it — the same confirmed flow the tray
+    // offers. The page names only a vault id a check gave it; main checks its shape and owns the flow.
+    relocateFolder: (vaultId) => ipcRenderer.invoke('dockvault:troubleshoot.relocate', { vaultId: String(vaultId) }),
     close: () => ipcRenderer.invoke('dockvault:troubleshoot.close'),
   }),
 });

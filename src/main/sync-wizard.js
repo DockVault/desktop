@@ -197,6 +197,25 @@ function createSyncWizard(io, onQuestion = () => {}) {
       },
       ensureFolder: e.ensureFolder,
       markFolder: e.markFolder,
+      // WHAT THE PICKED FOLDER HAS ALREADY BEEN USED FOR. These four are what make the re-use step run at
+      // all: runEnableFlow skips the whole block when `readMarker` is absent, so leaving them out of this
+      // object did not fail — it silently turned the step off, and another vault's marker went back to being
+      // taken over without anyone being asked. This io is an explicit whitelist, which is the right shape;
+      // the cost is that a step added to the flow has to be added HERE too, and forgetting is invisible.
+      readMarker: e.readMarker,
+      knownFolderFor: e.knownFolderFor,
+      vaultNameFor: e.vaultNameFor,
+      confirmReuse: async ({ title, detail, reuse, folder }) => {
+        const d = await ask('confirm-reuse', {
+          folder,
+          heading: title,
+          message: detail,
+          // Taking over another vault's marker is the one outcome here that costs something, so the page
+          // leads with the safe choice for that and not for the rest.
+          takeover: !!(reuse && reuse.takesOverMarker),
+        });
+        return d === 'use' ? true : (d === 'choose-different' ? 'choose-different' : false);
+      },
       onRefuse: async (reason) => { refusal = reason; },
       save: e.save,
     };
