@@ -2547,8 +2547,14 @@ async function manageAct(args) {
 }
 // Tell an open Computers window that what it shows may have changed (a sync ran, a set-up finished).
 function notifyManageChanged() {
-  const win = manageWindow;
-  if (win && !win.isDestroyed()) { try { win.webContents.send('dockvault:evt:manage', { at: Date.now() }); } catch { /* gone */ } }
+  // BOTH first-party windows that show sync state, not just the Computers one. The status window subscribes
+  // to this same event and was never sent it, so it was carried entirely by its own five-second poll while
+  // its code claimed to be pushed to. A window that says it is live and is not is worse than one that says
+  // it polls: the claim is what stops anyone looking.
+  const at = Date.now();
+  for (const win of [manageWindow, statusWindow]) {
+    if (win && !win.isDestroyed()) { try { win.webContents.send('dockvault:evt:manage', { at }); } catch { /* gone */ } }
+  }
 }
 
 /*

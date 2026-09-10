@@ -92,7 +92,15 @@ function createFolderWatch({ fs, gate, onDue, onLog = () => {}, tickMs = DEFAULT
     for (const vaultId of [...watchers.keys()]) {
       if (!want.has(vaultId)) { stopOne(vaultId); gate.forget(vaultId); sawRunning.delete(vaultId); }
     }
-    for (const vaultId of [...unwatchable.keys()]) if (!want.has(vaultId)) unwatchable.delete(vaultId);
+    // A vault that was UNWATCHABLE and has now left the configuration is forgotten in the gate as well, not
+    // merely dropped from this map. Without it, one that had a run in flight when it left stays marked as
+    // running forever — the same permanent suppression as above, reached a different way.
+    for (const vaultId of [...unwatchable.keys()]) {
+      if (want.has(vaultId)) continue;
+      unwatchable.delete(vaultId);
+      gate.forget(vaultId);
+      sawRunning.delete(vaultId);
+    }
 
     for (const [vaultId, folder] of want) {
       const cur = watchers.get(vaultId);
@@ -144,7 +152,19 @@ function createFolderWatch({ fs, gate, onDue, onLog = () => {}, tickMs = DEFAULT
 
   function stop() {
     if (timer) { try { clearIntervalFn(timer); } catch { /* ignore */ } timer = null; }
+    // Captured BEFORE the watchers are closed, because stopOne deletes from that map as it goes — reading it
+    // afterwards to decide what to forget gave an empty list, and the forgetting silently did nothing. My
+    // own test caught that, which is the argument for having written it as behaviour rather than as "the
+    // line is present".
+    const known = new Set([...watchers.keys(), ...unwatchable.keys(), ...sawRunning]);
     for (const vaultId of [...watchers.keys()]) stopOne(vaultId);
+    // THE GATE HAS TO BE TOLD TOO. Clearing only our own record of which vaults are mid-run left the GATE
+    // still believing they were — and because a run is only ended for a vault we saw start, that belief was
+    // permanent: after a stop and start, that vault's changes were suppressed forever and near-live sync was
+    // silently off for it. Dead today (nothing calls stop), and wrong, which is the worse half: a teardown
+    // that is never exercised is exactly where this sits unnoticed until someone wires it up.
+    for (const vaultId of [...sawRunning]) { try { gate.runEnded(vaultId); } catch { /* nothing to end */ } }
+    for (const vaultId of known) { try { gate.forget(vaultId); } catch { /* ignore */ } }
     unwatchable.clear();
     sawRunning.clear();
   }

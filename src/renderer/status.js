@@ -140,8 +140,13 @@
   }
 
   // Live, because a status window that needs reopening to be current is a status window nobody trusts. The
-  // push is the same one the tray listens to; the refresh re-asks main for the whole model rather than
-  // trying to patch a row from an event, so the page can never drift from what main believes.
+  // refresh re-asks main for the whole model rather than patching a row from the event, so the page can
+  // never drift from what main believes.
+  //
+  // The poll below is a backstop, not the mechanism — it was the mechanism for a while, because main sent
+  // this event to the Computers window only and this page never received it while its own comment claimed
+  // otherwise. A window that says it is live and is not is worse than one that says it polls: the claim is
+  // the thing that stops anyone checking.
   if (api && typeof api.onChanged === 'function') {
     try { api.onChanged(() => { void refresh(); }); } catch { /* the poll below still carries it */ }
   }

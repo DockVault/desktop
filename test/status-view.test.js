@@ -321,3 +321,22 @@ test('the page says it, and only when the answer is actually "not watched"', () 
   assert.match(main2, /watchedLive: \(\) => \(folderWatch \? folderWatch\.watching\(\) : null\)/,
     'and it reports what the watcher really has, not a hardcoded answer');
 });
+
+// THE LIVE PUSH HAS TO REACH THIS WINDOW. It subscribes to the same event the Computers view does, and main
+// sent that event to the Computers window ONLY — so this page was carried entirely by its five-second poll
+// while its own comment said it was pushed to. The poll meant nothing looked broken, which is precisely why
+// it went unnoticed: a window that claims to be live and is not is worse than one that says it polls,
+// because the claim is what stops anyone checking.
+test('a change reaches the status window, not only the Computers window', () => {
+  const main3 = fs.readFileSync(path.join(root, 'src', 'main', 'index.js'), 'utf8');
+  const fn = main3.slice(main3.indexOf('function notifyManageChanged()'), main3.indexOf('\n}', main3.indexOf('function notifyManageChanged()')));
+  assert.ok(fn.length > 0, 'the notifier exists');
+  assert.match(fn, /manageWindow/, 'the Computers window still gets it');
+  assert.match(fn, /statusWindow/, 'and so does the status window');
+  // Both are sent the same channel the page subscribes to.
+  assert.match(fn, /'dockvault:evt:manage'/);
+  const page = fs.readFileSync(path.join(root, 'src', 'renderer', 'status.js'), 'utf8');
+  assert.match(page, /api\.onChanged\(/, 'the page really does subscribe');
+  // And the page no longer claims the poll is a backstop while being the only mechanism.
+  assert.ok(!/the push is the same one the tray listens to/.test(page), 'the untrue claim is gone');
+});

@@ -320,3 +320,61 @@ test('watching is optional; the poll is not', () => {
   assert.match(setup, /try \{/, 'a watcher that cannot be created must not stop sync starting');
   assert.match(setup, /catch \{ folderWatch = null;/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// TEARING DOWN WITHOUT LEAVING A VAULT DEAF FOREVER.
+//
+// Suppression is what stops a sync's own writes starting another sync, and a vault is only un-suppressed
+// when a run it was seen to START finishes. So anything that discards the record of "this vault is mid-run"
+// without also telling the gate leaves that vault suppressed permanently — near-live sync silently off for
+// it, with the poll quietly covering up the fact. Two paths reach that state.
+// ---------------------------------------------------------------------------------------------
+
+test('stopping and starting again does not leave a vault deaf', () => {
+  const h = harness();
+  h.w.reconcile([E('v1', '/a')]);
+  h.w.start();
+  h.w.noteEvent('v1', 'running');   // a run is in flight when we tear down
+  h.w.stop();
+
+  h.w.reconcile([E('v1', '/a')]);
+  h.w.start();
+  h.tick(1000);                      // well past any settle window
+  assert.equal(h.gate.suppressed('v1'), false, 'the gate was told, so it is listening again');
+  h.f.fire('/a', 'notes.txt');
+  h.tick(200); h.pump();
+  assert.deepEqual(h.asked, ['v1'], 'and a real change is heard');
+});
+
+test('a vault that leaves the configuration while unwatchable is forgotten in the gate too', () => {
+  const h = harness({ fsOpts: { refuse: (f) => f === '/bad' } });
+  h.w.reconcile([E('v1', '/bad')]);
+  assert.deepEqual(h.w.unwatched(), ['v1']);
+  h.w.noteEvent('v1', 'running');          // a run in flight for a folder we could not watch
+  h.w.reconcile([]);                        // it stops being synced here
+  assert.equal(h.gate.suppressed('v1'), false, 'not left marked as running forever');
+  assert.equal(h.w.unwatched().length, 0, 'and nothing is left behind in the map either');
+});
+
+// A teardown should leave NOTHING held over. Un-suppressing is only half of it: the gate also remembers
+// when each vault last asked, which is what enforces the minimum interval. Carried across a stop and start
+// that becomes a ceiling inherited from a previous life of the process — a change made right after a
+// restart would sit waiting on a clock nobody can see.
+test('after a stop, nothing is carried over into the next start', () => {
+  const h = harness();   // quietMs 100, minIntervalMs 500
+  h.w.reconcile([E('v1', '/a')]);
+  h.w.start();
+  h.f.fire('/a', 'first.txt');
+  h.tick(200); h.pump();
+  assert.deepEqual(h.asked, ['v1'], 'it has asked once, so the ceiling is now running');
+
+  h.w.stop();
+  h.w.reconcile([E('v1', '/a')]);
+  h.w.start();
+
+  // Immediately after the restart — well inside the old ceiling — a change must be heard on its own merits.
+  h.f.fire('/a', 'second.txt');
+  h.tick(200); h.pump();
+  assert.deepEqual(h.asked, ['v1', 'v1'], 'the previous run\'s ceiling did not follow it across the restart');
+  assert.equal(h.gate.pendingCount(), 0);
+});
