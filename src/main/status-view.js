@@ -33,6 +33,10 @@
  *   liveStatus()            -> { state, label, reason, vaults: [{ vault, state, reason, running, lastSyncedAt, via, progress }] }
  *   reasonText(live, name)  -> a plain sentence for a vault's live reason, or null   (the Computers card's own)
  *   lastSyncedLabel(ts)     -> "2 minutes ago" etc, or null
+ *   watchedLive()           -> the vault ids whose folder is being watched for changes, or null when the
+ *                              watcher is not running at all. A folder that is NOT watched still syncs on
+ *                              the poll - it is slower, not broken - and this is the only place that fact
+ *                              is visible to anyone.
  */
 function createStatusView(io) {
   return { model: () => buildModel(io) };
@@ -67,6 +71,15 @@ function buildModel(io) {
   const byId = new Map();
   for (const v of liveVaults) if (v && v.vault) byId.set(String(v.vault).toLowerCase(), v);
 
+  // The folders actually being watched for changes. A missing or failing accessor means "no idea", which
+  // reads as null on every row rather than as every folder being degraded — claiming a fault we cannot see
+  // would be its own kind of lie.
+  let watched = null;
+  try {
+    const ids = typeof io.watchedLive === 'function' ? io.watchedLive() : null;
+    watched = Array.isArray(ids) ? new Set(ids.map((v) => String(v).toLowerCase())) : null;
+  } catch { watched = null; }
+
   const items = configured.map((cfg) => {
     const id = String(cfg.vaultId || '').toLowerCase();
     const l = byId.get(id) || null;
@@ -79,6 +92,11 @@ function buildModel(io) {
       name,
       folder: cfg.localFolder || null,
       enabled,
+      // Watched, and therefore near-live — or not, and therefore up to five minutes behind. A watcher the
+      // operating system drops turns this feature off for that folder with nothing anywhere saying so, and
+      // "why did my edit take five minutes to appear" is unanswerable without it. Null means the watcher is
+      // not running at all, which is not the same as this one folder being singled out.
+      live: enabled && watched ? watched.has(id) : null,
       state: enabled ? (l ? l.state : null) : 'off',
       running: !!(l && l.running),
       // The honest sentence, from the one source the Computers card uses. Null when the state explains

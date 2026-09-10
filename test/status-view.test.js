@@ -255,3 +255,69 @@ test('it is reachable from the app itself, not only from the tray', () => {
   // And from the tray as well, for the person who never opens a window.
   assert.match(main, /label: 'Sync status\u2026', click: \(\) => \{ void openStatusView\(\); \}/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// WHETHER A FOLDER IS BEING WATCHED. A watcher the operating system drops turns near-live sync off for that
+// folder and says so nowhere — the sync still happens, just up to five minutes later, so nothing breaks and
+// nothing complains. "Why did my edit take five minutes to appear" was unanswerable anywhere in the app.
+// ---------------------------------------------------------------------------------------------
+
+test('a folder that is watched, and one that is not, are told apart', () => {
+  const { io: i } = io({
+    configured: () => [
+      { vaultId: V1, vaultName: 'Photos', localFolder: 'C:\p', enabled: true },
+      { vaultId: V2, vaultName: 'Invoices', localFolder: 'C:\i', enabled: true },
+    ],
+    liveStatus: () => ({ state: 'up-to-date', label: 'Up to date', vaults: [] }),
+  });
+  i.watchedLive = () => [V1];
+  const rows = createStatusView(i).model().items;
+  assert.equal(rows[0].live, true, 'watched: changes are picked up in seconds');
+  assert.equal(rows[1].live, false, 'not watched: it still syncs, just on the next check');
+});
+
+// Not knowing and being degraded are different, and only one of them is worth telling anyone about.
+test('with no watcher running at all, no row claims to be degraded', () => {
+  const { io: i } = io();
+  i.watchedLive = () => null;
+  assert.equal(createStatusView(i).model().items[0].live, null);
+
+  const { io: j } = io();          // no accessor at all
+  assert.equal(createStatusView(j).model().items[0].live, null);
+
+  const { io: k } = io();
+  k.watchedLive = () => { throw new Error('gone'); };
+  assert.equal(createStatusView(k).model().items[0].live, null, 'a failing accessor is not a fault report');
+});
+
+test('a vault with sync switched off is not reported as unwatched', () => {
+  const { io: i } = io({
+    configured: () => [{ vaultId: V1, vaultName: 'Photos', localFolder: 'C:\p', enabled: false }],
+    liveStatus: () => ({ state: 'off', label: 'Off', vaults: [] }),
+  });
+  i.watchedLive = () => [];
+  const row = createStatusView(i).model().items[0];
+  assert.equal(row.live, null, 'nothing is watching it because nothing is syncing it — that is not a fault');
+});
+
+test('the id is matched however it is cased, so a watched folder is never reported as unwatched', () => {
+  const MIXED = 'aabbccdd-eeff-4a1b-9c2d-3e4f5a6b7c8d';
+  const { io: i } = io({
+    configured: () => [{ vaultId: MIXED.toUpperCase(), vaultName: 'Photos', localFolder: 'C:\p', enabled: true }],
+    liveStatus: () => ({ state: 'up-to-date', label: 'Up to date', vaults: [] }),
+  });
+  // The two sides are spelled DIFFERENTLY on purpose. An earlier version had the config upper-cased and the
+  // watcher lower-cased, which is what the code already normalises to — so it matched either way and a
+  // mutation dropping the normalisation kept it green.
+  i.watchedLive = () => [MIXED.toUpperCase()];
+  assert.equal(createStatusView(i).model().items[0].live, true);
+});
+
+test('the page says it, and only when the answer is actually "not watched"', () => {
+  const js = fs.readFileSync(path.join(root, 'src', 'renderer', 'status.js'), 'utf8');
+  assert.match(js, /item\.live === false/, 'strictly false — null means unknown and must say nothing');
+  assert.match(js, /next check rather than straight away/);
+  const main2 = fs.readFileSync(path.join(root, 'src', 'main', 'index.js'), 'utf8');
+  assert.match(main2, /watchedLive: \(\) => \(folderWatch \? folderWatch\.watching\(\) : null\)/,
+    'and it reports what the watcher really has, not a hardcoded answer');
+});

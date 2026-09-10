@@ -98,6 +98,13 @@
     // The honest sentence. Last, and free to wrap: it is the one thing here that must never be cut off.
     if (item.note) row.appendChild(el('p', 'note', item.note));
     if (item.lastSynced) row.appendChild(el('div', 'when', `Last synced ${item.lastSynced}`));
+    // Watched folders sync within seconds of a change; an unwatched one waits for the next check. That is
+    // slower, not broken, and it is said quietly for exactly that reason - but it IS said, because
+    // otherwise "why did my edit take five minutes" has no answer anywhere in the app. `null` means the
+    // watcher is not running at all, which is not this folder's business to report.
+    if (item.live === false) {
+      row.appendChild(el('div', 'when', 'Changes here are picked up on the next check rather than straight away.'));
+    }
     return row;
   }
 

@@ -542,3 +542,98 @@ test('an ordinary portable launch is still portable', () => {
   const r = portableLaunch({ env: full, fs, execPath: runningExe, platform: 'win32', appName: APP });
   assert.equal(r.portable, true, `the ordinary case must work: ${r.why}`);
 });
+
+// THE UNINSTALLER PATTERN, IN BOTH DIRECTIONS. It used to be `^unins`, which matched the default name and
+// the Inno convention and missed `Un_DockVault.exe` — a shape NSIS builds really use. Widening it is not
+// free, and the comment that once said it was has been corrected: a miss lets an installed app be talked
+// into relocating its data, and a false match demotes a genuine portable launch into opening the installed
+// profile. Both are the severe direction, so it is aimed rather than broadened.
+test('it recognises the uninstaller names installers really write', () => {
+  const { UNINSTALLER } = require('../src/main/portable');
+  for (const name of [
+    'Uninstall DockVault.exe',      // electron-builder's default
+    'Uninstall.exe',
+    'uninstall.exe',
+    'UNINSTALL.EXE',
+    'unins000.exe',                 // the Inno convention
+    'Un_DockVault.exe',             // the shape the old pattern missed entirely
+    'un-dockvault.exe',
+  ]) {
+    assert.ok(UNINSTALLER.test(name), `${name} is an uninstaller`);
+  }
+});
+
+// The safety of that pattern rests on a fact about the BUILD, not a property of the regex: the only
+// executables in a packaged payload are the app and Chromium's crash handler. Pinned here so that if the
+// payload ever gains a matching name, this fails — rather than a portable launch silently opening a real
+// profile because a payload file looked like an uninstaller.
+test('nothing a packaged payload actually contains is read as an uninstaller', () => {
+  const { UNINSTALLER } = require('../src/main/portable');
+  for (const name of [
+    'DockVault.exe',
+    'chrome_crashpad_handler.exe',
+    'ffmpeg.dll', 'd3dcompiler_47.dll', 'vk_swiftshader.dll', 'vulkan-1.dll', 'libEGL.dll',
+    'resources.pak', 'chrome_100_percent.pak', 'icudtl.dat', 'snapshot_blob.bin',
+    'v8_context_snapshot.bin', 'LICENSE.electron.txt', 'LICENSES.chromium.html',
+    'locales', 'resources',
+    // Near misses, to show the pattern is aimed rather than "anything beginning with un".
+    'under.exe', 'universe.exe', 'unicode.dat', 'unrelated-tool.exe',
+  ]) {
+    assert.ok(!UNINSTALLER.test(name), `${name} is part of the app, not an uninstaller`);
+  }
+});
+
+// THE DEMOTION, AS A PERSON WOULD MEET IT. Someone double-clicked a portable build and got the installed
+// app's data instead — no window of its own, no error, nothing on screen. It was reported to console.warn,
+// from a windowed program started by a silent stub, which is the same "nothing is attached to read it"
+// argument this module already makes about the refusal dialog. A log line there is a line nobody ever sees.
+test('a demoted run has something to SAY, not just something to log', () => {
+  const { demotionMessage, notice } = require('../src/main/portable');
+  const installedExe = installedApp();
+  const { dir, file } = downloadedLauncher();
+  const env = { [PORTABLE_ENV]: dir, [PORTABLE_FILE_ENV]: file, [PORTABLE_APP_ENV]: APP };
+
+  const demoted = portableLaunch({ env, fs, execPath: installedExe, platform: 'win32', appName: APP });
+  assert.equal(demoted.portable, false);
+  const say = demotionMessage(demoted);
+  assert.ok(say && say.title && say.body, 'a demotion is worth a sentence');
+  // It has to say what is being USED, because that is the question behind the surprise.
+  assert.match(say.body, /installed/i);
+  assert.match(say.title, /installed copy/i);
+  // And it must not read as a failure: the run that follows is an ordinary, safe run of the installed app.
+  assert.ok(!/error|failed|cannot|refus/i.test(`${say.title} ${say.body}`), `not an error: ${say.title} / ${say.body}`);
+  // It never puts an internal reason string in front of a person.
+  assert.ok(!say.body.includes(notice(demoted)), 'the log line is not the sentence');
+});
+
+test('an ordinary run and a successful portable launch say nothing at all', () => {
+  const { demotionMessage } = require('../src/main/portable');
+  const installedExe = installedApp();
+  const { dir, file } = downloadedLauncher();
+
+  // No launcher variable: this is simply the installed app starting. Announcing that would be noise on
+  // every single launch.
+  const ordinary = portableLaunch({ env: {}, fs, execPath: installedExe, platform: 'win32', appName: APP });
+  assert.equal(demotionMessage(ordinary), null);
+
+  // A portable launch that worked has nothing surprising to report either.
+  const good = portableLaunch({
+    env: { [PORTABLE_ENV]: dir, [PORTABLE_FILE_ENV]: file, [PORTABLE_APP_ENV]: APP },
+    fs, execPath: unpackedUnder(mk('dv-unpack-ok-')), platform: 'win32', appName: APP,
+  });
+  assert.equal(good.portable, true);
+  assert.equal(demotionMessage(good), null);
+});
+
+test('the app shows that message once it has something to show it with', () => {
+  const main = fs.readFileSync(path.join(__dirname, '..', 'src', 'main', 'index.js'), 'utf8');
+  const code = main.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+  assert.match(code, /const demotionToShow = portable\.demotionMessage\(portableRun\)/,
+    'the message is composed where the decision is made');
+  // It cannot be shown at that point — this runs before the app is ready — so it must be shown later.
+  assert.match(code, /if \(demotionToShow\)/);
+  assert.match(code, /new Notification\(\{ title: demotionToShow\.title, body: demotionToShow\.body \}\)/);
+  const decide = code.indexOf('const demotionToShow');
+  const show = code.indexOf('new Notification({ title: demotionToShow.title');
+  assert.ok(decide < show, 'decided at startup, shown once there is a way to show it');
+});

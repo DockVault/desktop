@@ -142,11 +142,22 @@ function insideOrSame(child, parent, fs) {
 // that same installer script, which is what makes this independent of WHERE the app was installed —
 // the previous attempt at this derived one known install location and missed every other.
 //
-// Matched by shape, not by an exact name, because the name is a build setting. Over-matching is free:
-// the unpack directory holds only the packaged payload, which by construction contains no uninstaller
-// of any name, so a broad pattern costs a portable launch nothing and survives a productName change or
-// a future UNINSTALL_FILENAME. It also covers the `unins000.exe` shape other installers use.
-const UNINSTALLER = /^unins.*\.exe$/i;
+// Matched by SHAPE, because the name is a build setting rather than a constant. The default here is
+// "Uninstall <product>.exe"; other installers use unins000.exe, and NSIS builds in the wild use Un_<product>.exe,
+// which the previous pattern missed entirely.
+//
+// BROADENING THIS IS NOT FREE, and the earlier comment claiming it was deserves correcting. Both directions
+// of a wrong answer are severe. Miss an uninstaller and an installed app can be talked into relocating its
+// data; match something in the packaged payload by accident and a genuine portable launch is demoted into
+// opening the installed profile. So the pattern is aimed rather than widened: `un` followed by install,
+// ins, or a separator, and still ending in .exe.
+//
+// What makes that safe is a fact about the payload rather than a property of the regex: a portable unpack
+// directory holds the packaged app and nothing else, and the only executables in it are the app itself and
+// Chromium's crash handler. Neither begins with "un". That is an assumption about the build, so it is
+// pinned by a test listing what a real payload contains — if the payload ever gains a matching name, that
+// test fails rather than a portable launch silently opening someone's real profile.
+const UNINSTALLER = /^un(?:install|ins|[_ -]).*\.exe$/i;
 
 // AN ACCEPTED RESIDUAL, written down because every trap this code has sprung came from a belief nobody wrote
 // down. ANY copy of the program directory that lacks an uninstaller reads as not-installed. That covers a
@@ -376,6 +387,27 @@ function notice(result) {
  * @param {(line: string) => void} warn
  * @returns {boolean} true when something was reported
  */
+/**
+ * The same fact, for a PERSON rather than a log. Null when there is nothing to say.
+ *
+ * A demotion is the one outcome here that is surprising and invisible: someone double-clicked a portable
+ * build and got the installed app's data instead, with no window, no error, and nothing on screen saying
+ * so. It was reported to `console.warn` — from a windowed program started by a silent stub, which is the
+ * same "nothing is attached to read it" argument this file already makes thirty lines further down about
+ * the refusal dialog. A log line there is a line nobody will ever see.
+ *
+ * Deliberately not an error box: the run that follows is an ordinary, safe run of the installed app, and a
+ * modal error would say something worse than what happened. It states what it is using, so the person can
+ * tell whether that is what they wanted.
+ */
+function demotionMessage(result) {
+  if (!notice(result)) return null;
+  return {
+    title: 'DockVault is running as your installed copy',
+    body: "This isn't running as a portable copy, so it is using your installed DockVault's settings and sync setup rather than keeping its own.",
+  };
+}
+
 function reportDemotion(result, warn) {
   const line = notice(result);
   if (!line) return false;
@@ -385,6 +417,6 @@ function reportDemotion(result, warn) {
 
 module.exports = {
   portableLaunch, chooseDataDir, applyDataDir, insideOrSame, canonical,
-  fallbackDirName, besideDirName, notice, reportDemotion, isRemote,
+  fallbackDirName, besideDirName, notice, demotionMessage, reportDemotion, isRemote, UNINSTALLER,
   PORTABLE_ENV, PORTABLE_FILE_ENV, PORTABLE_APP_ENV, DATA_DIR_NAME, FALLBACK_DIR_NAME,
 };

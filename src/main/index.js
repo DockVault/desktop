@@ -233,6 +233,11 @@ const portableRun = portable.applyDataDir(app, {
 // reported?" can be asked by a test rather than inferred from this line. Reading source could only see that
 // the reason was READ — which is equally true of a value computed and dropped.
 portable.reportDemotion(portableRun, (line) => console.warn(line));
+// ...and the same fact where a person can actually see it. This runs before the app is ready, so the
+// notification cannot be shown here; it is held and shown once there is something to show it with. A log
+// line alone is the failure this file already argues against for the refusal dialog below: a windowed
+// program started by a silent stub has nothing attached to read a console.
+const demotionToShow = portable.demotionMessage(portableRun);
 if (portableRun.portable && !portableRun.applied) {
   // It could not be given a folder of its own. The one thing it must not do is fall back to the
   // installed app's, so it does not start — and it has to SAY so. A console line is not saying so:
@@ -313,6 +318,16 @@ async function boot() {
   // clipboard ROLES are what bind Ctrl+C/V/A inside text inputs, so removing the menu outright would leave
   // the server-address field unable to accept a pasted address.
   installApplicationMenu();
+  // The portable demotion, if there was one. Best-effort and non-modal: the run that follows is an ordinary,
+  // safe run of the installed app, so this states what is being used rather than raising an error.
+  if (demotionToShow) {
+    try {
+      if (Notification && Notification.isSupported && Notification.isSupported()) {
+        const n = new Notification({ title: demotionToShow.title, body: demotionToShow.body });
+        n.show();
+      }
+    } catch { /* a notification that cannot be shown must not stop the app starting */ }
+  }
   uiSession = session.fromPartition(UI_PARTITION); // in-memory; created once, reused by every window
   hardenSession(uiSession);
   // Restore the account session from the encrypted store (null on a non-secure keychain or none):
@@ -2507,6 +2522,9 @@ function statusModel() {
       liveStatus: io.liveStatus,
       reasonText: io.reasonText,
       lastSyncedLabel: (ts) => trayPresentation.lastSyncedLabel(ts),
+      // Which folders are actually being watched. A watcher the operating system drops turns near-live sync
+      // off for that folder and says so nowhere; this is the one surface where that becomes visible.
+      watchedLive: () => (folderWatch ? folderWatch.watching() : null),
     }).model();
   } catch { return null; }
 }
