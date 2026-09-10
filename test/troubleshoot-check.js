@@ -101,7 +101,11 @@ app.whenReady().then(async () => {
   {
     const r = await scenario('A_render', { ioSpec: {}, drive: async (win, ctx) => ({ ...(await ev(win, settle)), log: ctx.log }) });
     const [api, sftp] = r.lights;
-    out.A_pass = r.checks.length === 1 && r.checks[0].title === 'Cannot connect to the server' && r.checks[0].current === 'true'
+    // What this scenario is about is the connection check: that it is listed FIRST and is the one selected on
+    // arrival. It used to also pin how MANY checks the registry has, which is a different claim and belongs
+    // in the unit tests — and pinning it here meant adding a second check broke a harness that nothing runs,
+    // so the breakage sat unnoticed rather than failing loudly.
+    out.A_pass = r.checks[0] && r.checks[0].title === 'Cannot connect to the server' && r.checks[0].current === 'true'
       && r.heading === 'Cannot connect to the server'
       && JSON.stringify(r.facts) === JSON.stringify([['Server address', 'vault.example.com:443'], ['File transfer address', 'vault.example.com:2200']])
       && r.log.length === 1 && JSON.stringify(r.log[0][1]) === JSON.stringify({ input: 'https://vault.example.com', sftp: 'vault.example.com:2200' })
