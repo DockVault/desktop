@@ -13,7 +13,8 @@
  *
  *   DOCKVAULT_PROOF_API            the vault's API origin (required, e.g. http://127.0.0.1:8360)
  *   DOCKVAULT_PROOF_ADMIN_PW_FILE  a file holding the admin password (required)
- *   DOCKVAULT_PROOF_SFTP_PORT      the port the server should advertise for SFTP (default 2222)
+ *   DOCKVAULT_PROOF_SFTP_PORT      optional: ALSO require the advertised SFTP port to be this one (the check
+ *                                  itself dials what the server advertises and reads the SSH banner)
  *   DOCKVAULT_PROOF_DB_CONTAINER   the server's postgres container, for the suspend row (optional; unset skips it)
  *
  * Writes .local/device-sync-check.json with one row per proof step. No secret, token, or password is
@@ -37,10 +38,29 @@ const deviceGrantStore = require('../src/main/device-grant-store');
 const { registerDevice, forgetDevice } = require('../src/main/device-register');
 const { refreshDeviceSecret, isRotationDue } = require('../src/main/device-refresh');
 const httpJson = require('../src/main/http-json').createHttpJson(require('electron').net);
+const nodeNet = require('node:net');
+
+// The first line an SSH server sends on connect ("SSH-2.0-..."), or null if nothing answers there.
+// Settles on every way a connection can end: a line, an error, an idle timeout -- and the peer simply
+// hanging up, after which the idle timer no longer fires and nothing else would settle it.
+function sshBannerAt(host, port, timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    const sock = nodeNet.connect({ host, port });
+    let buf = '';
+    const done = (v) => { sock.destroy(); resolve(v); };
+    sock.setTimeout(timeoutMs, () => done(null));
+    sock.on('data', (d) => { buf += d.toString('latin1'); if (buf.includes('\n') || buf.length > 255) done(buf.split('\n')[0].trim()); });
+    sock.on('error', () => done(null));
+    sock.on('close', () => done(null));
+  });
+}
 
 const API = String(process.env.DOCKVAULT_PROOF_API || '').replace(/\/+$/, '');
 const ADMIN_PW = process.env.DOCKVAULT_PROOF_ADMIN_PW_FILE ? fs.readFileSync(process.env.DOCKVAULT_PROOF_ADMIN_PW_FILE, 'utf8').trim() : '';
-const SFTP_PORT = Number(process.env.DOCKVAULT_PROOF_SFTP_PORT || 2222);
+// The advertised SFTP port is whatever the deployment publishes (2322 on a standard install, which the
+// server binds as 2222 inside its container), so it is not assumed here: the check dials what the mint
+// advertises. Set DOCKVAULT_PROOF_SFTP_PORT only to additionally pin the expected value.
+const EXPECTED_SFTP_PORT = process.env.DOCKVAULT_PROOF_SFTP_PORT ? Number(process.env.DOCKVAULT_PROOF_SFTP_PORT) : null;
 const DB_CONTAINER = process.env.DOCKVAULT_PROOF_DB_CONTAINER || '';
 const RESULT = path.join(__dirname, '..', '.local', 'device-sync-check.json');
 
@@ -173,7 +193,13 @@ app.whenReady().then(async () => {
   row('mint-and-send', m1.ok === true, m1.ok ? 'ok' : m1.reason);
   const c1 = mintCalls[0] || {};
   row('mint-request-body', !!c1.body && Object.keys(c1.body).sort().join(',') === 'validity_minutes,vault_id' && c1.body.vault_id === VID && c1.body.validity_minutes === 15, c1.body);
-  row('mint-advertises-reachable-port', c1.port === SFTP_PORT, { advertised: c1.port, expected: SFTP_PORT, host: c1.host });
+  // Where the mint says SFTP is must be where SFTP answers: dial it (the API's host when none is
+  // advertised, as the client does) and read the SSH banner, instead of comparing to an assumed port.
+  const dialHost = c1.host || new URL(API).hostname.replace(/^\[|\]$/g, '');
+  const banner = Number.isInteger(c1.port) ? await sshBannerAt(dialHost, c1.port) : null;
+  row('mint-advertises-reachable-port',
+    typeof banner === 'string' && banner.startsWith('SSH-') && (EXPECTED_SFTP_PORT === null || c1.port === EXPECTED_SFTP_PORT),
+    { advertised: c1.port, host: c1.host, dialed: dialHost, banner, expected: EXPECTED_SFTP_PORT });
   row('mint-carries-host-key', c1.hasKey === true, c1.hasKey);
 
   // ---- the first sync: a baseline of two local files lands on the server over SFTP ---------------------

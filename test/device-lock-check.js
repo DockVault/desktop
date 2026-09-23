@@ -20,7 +20,6 @@
  *
  *   DOCKVAULT_PROOF_API            the vault's API origin (required, e.g. http://127.0.0.1:8360)
  *   DOCKVAULT_PROOF_ADMIN_PW_FILE  a file holding the admin password (required)
- *   DOCKVAULT_PROOF_SFTP_PORT      the port the server advertises for SFTP (default 2222)
  *
  * Writes .local/device-lock-check.json with one row per proof step. No secret, token, or password is ever
  * written to the result (scrubbed and asserted).
@@ -53,7 +52,6 @@ const httpJson = require('../src/main/http-json').createHttpJson(require('electr
 
 const API = String(process.env.DOCKVAULT_PROOF_API || '').replace(/\/+$/, '');
 const ADMIN_PW = process.env.DOCKVAULT_PROOF_ADMIN_PW_FILE ? fs.readFileSync(process.env.DOCKVAULT_PROOF_ADMIN_PW_FILE, 'utf8').trim() : '';
-const SFTP_PORT = Number(process.env.DOCKVAULT_PROOF_SFTP_PORT || 2222);
 const RESULT = path.join(__dirname, '..', '.local', 'device-lock-check.json');
 
 const out = { api: API, rows: [] };
