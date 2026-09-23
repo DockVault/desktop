@@ -126,7 +126,7 @@ app.whenReady().then(async () => {
   if (!VID) { dump(); app.exit(2); return; }
 
   // ---- register this computer, bound to this server ------------------------------------------------
-  const reg = await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Proof laptop', dir, safeStorage });
+  const reg = await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Proof laptop', dir, safeStorage }, { fetchFn: httpJson });
   row('register', reg.ok === true && typeof reg.deviceId === 'string', reg.ok ? 'ok' : reg.reason);
   const DEVICE_ID = reg.deviceId;
   const readHere = deviceSecretStore.readDeviceSecret(safeStorage, dir, API);
@@ -139,7 +139,7 @@ app.whenReady().then(async () => {
   row('sidecar-id-only', Object.keys(hint).sort().join(',') === 'deviceId,v', Object.keys(hint));
 
   // ---- grant the vault to this computer, proving the password ONCE --------------------------------
-  const g = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: DEVICE_ID, vaultId: VID, vaultType: 'standard', vaultName: VAULT_NAME, vaultPassword: VPW, dir, safeStorage });
+  const g = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: DEVICE_ID, vaultId: VID, vaultType: 'standard', vaultName: VAULT_NAME, vaultPassword: VPW, dir, safeStorage }, { fetchFn: httpJson });
   row('grant', g.ok === true && g.hasPassword === true && g.recorded === true, g.ok ? { hasPassword: g.hasPassword, recorded: g.recorded } : g.reason);
 
   // ---- the real helper --------------------------------------------------------------------------
@@ -269,7 +269,7 @@ app.whenReady().then(async () => {
     await mintPath.begin(VID);
     const mr = await credCache.ensureSent(VID);
     row('password-rotation-needs-reproof', mr.ok === false && mr.reason === 'grant-needs-reproof', mr.reason);
-    const g2 = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: DEVICE_ID, vaultId: VID, vaultType: 'standard', vaultName: VAULT_NAME, vaultPassword: VPW2, dir, safeStorage });
+    const g2 = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: DEVICE_ID, vaultId: VID, vaultType: 'standard', vaultName: VAULT_NAME, vaultPassword: VPW2, dir, safeStorage }, { fetchFn: httpJson });
     fs.writeFileSync(path.join(local, 'fifth.txt'), `fifth ${rand}
 `);
     await mintPath.begin(VID);
@@ -297,14 +297,14 @@ app.whenReady().then(async () => {
   row('revoke-refuses-mint', (await rawMint()) === 'device-revoked', mintCalls[mintCalls.length - 1] && mintCalls[mintCalls.length - 1].status);
 
   // ---- forget: the local identity goes away; nothing left behind ------------------------------------------
-  const fg = await forgetDevice({ serverOrigin: API, accountToken: JWT, dir, safeStorage });
+  const fg = await forgetDevice({ serverOrigin: API, accountToken: JWT, dir, safeStorage }, { fetchFn: httpJson });
   const afterForget = deviceSecretStore.readDeviceSecret(safeStorage, dir, API);
   row('forget-clears-identity', fg.cleared === true && afterForget.status === 'absent' && !fs.existsSync(path.join(dir, 'device-secret.bin')), { revoked: fg.revoked, status: afterForget.status });
 
   // ---- suspend (a second registration): a replayed retired secret suspends the device; sync stops -----------
   if (DB_CONTAINER) {
-    const reg2 = await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Proof laptop two', dir, safeStorage });
-    const g3 = reg2.ok ? await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: reg2.deviceId, vaultId: VID, vaultType: 'standard', vaultName: VAULT_NAME, vaultPassword: rot.ok ? VPW2 : VPW, dir, safeStorage }) : { ok: false };
+    const reg2 = await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Proof laptop two', dir, safeStorage }, { fetchFn: httpJson });
+    const g3 = reg2.ok ? await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: reg2.deviceId, vaultId: VID, vaultType: 'standard', vaultName: VAULT_NAME, vaultPassword: rot.ok ? VPW2 : VPW, dir, safeStorage }, { fetchFn: httpJson }) : { ok: false };
     let suspended = null;
     if (reg2.ok && g3.ok) {
       const cur = deviceSecretStore.readDeviceSecret(safeStorage, dir, API);
@@ -329,7 +329,7 @@ app.whenReady().then(async () => {
       row('suspend-stops-sync', false, { skipped: 'second registration/grant failed', reg: reg2.reason || 'ok', grant: g3.reason || 'ok' });
     }
     await api(`/devices/${reg2.deviceId}/revoke`, { method: 'POST', headers: auth(JWT) }).catch(() => null);
-    await forgetDevice({ serverOrigin: API, accountToken: JWT, dir, safeStorage });
+    await forgetDevice({ serverOrigin: API, accountToken: JWT, dir, safeStorage }, { fetchFn: httpJson });
   }
 
   // ---- clean up the throwaway vault; stop the helper --------------------------------------------------
