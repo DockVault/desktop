@@ -214,17 +214,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          run_smoke() {            # run_smoke <label> <command...>: the app, in smoke mode, 120 s at most
+          run_smoke() {            # run_smoke <label> <command...>: the app, in smoke mode, SMOKE_LIMIT s at most
             local label="$1"; shift
             local result="$RUNNER_TEMP/smoke-$label.json" log="$RUNNER_TEMP/smoke-$label.log" code=0 pid
+            local limit="${SMOKE_LIMIT:-120}"
             rm -f "$result"
             DOCKVAULT_SMOKE=1 DOCKVAULT_SMOKE_RESULT="$result" "$@" --user-data-dir="$RUNNER_TEMP/smoke-profile-$label" \
               > "$log" 2>&1 &
             pid=$!
-            for _ in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+            for _ in $(seq 1 "$limit"); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
             if kill -0 "$pid" 2>/dev/null; then
               kill -9 "$pid" 2>/dev/null || true
-              echo "::error::$label: the packaged app did not finish its smoke check within 120 s"; tail -40 "$log"; return 1
+              echo "::error::$label: the packaged app did not finish its smoke check within $limit s"; tail -40 "$log"; return 1
             fi
             wait "$pid" || code=$?
             if [ "$code" -ne 0 ] || ! grep -q '"ok": true' "$result" 2>/dev/null; then
@@ -255,8 +256,12 @@ jobs:
                 gk=$(spctl --assess --type execute "$app" 2>&1 | tr '\n' ' ' || true)
                 echo "- macOS $arch: signature $sig; $kind; Gatekeeper: ${gk:-accepted}" >> "$GITHUB_STEP_SUMMARY"
                 echo "macOS $arch: signature $sig | $kind | Gatekeeper: ${gk:-accepted}"
-                if [ "$arch" = arm64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; then
+                if [ "$arch" = arm64 ]; then
                   run_smoke "macos-$arch" "$app/Contents/MacOS/DockVault"
+                elif arch -x86_64 /usr/bin/true 2>/dev/null; then
+                  # Under Rosetta. Its first launch translates the whole Electron framework before
+                  # anything runs, which took longer than the native limit on the runner.
+                  SMOKE_LIMIT=480 run_smoke "macos-$arch" arch -x86_64 "$app/Contents/MacOS/DockVault"
                 else
                   echo "::notice::macOS x64: no Rosetta on this runner, so the Intel build was not started"
                 fi
@@ -267,9 +272,15 @@ jobs:
               # The .deb, installed the way a person installs it (its post-install step sets up the
               # Chromium sandbox helper), then the AppImage as downloaded.
               deb=$(find dist -maxdepth 1 -name '*.deb' | head -1)
+              [ -n "$deb" ] || { echo "::error::no .deb was produced"; exit 1; }
+              pkg=$(dpkg-deb -f "$deb" Package)
               timeout 300 sudo apt-get install -y "./$deb" >/dev/null
-              bin=$(dpkg -L dockvault-desktop | grep -E '^/opt/[^/]+/dockvault-desktop$' | head -1)
-              [ -n "$bin" ] || { echo "::error::the .deb installed no /opt/*/dockvault-desktop"; exit 1; }
+              # Launch what the desktop menu launches: the Exec line of the package's .desktop entry.
+              entry=$(dpkg -L "$pkg" | grep -E '\.desktop$' | head -1 || true)
+              [ -n "$entry" ] || { echo "::error::package $pkg installed no .desktop entry"; exit 1; }
+              bin=$(sed -n 's/^Exec=//p' "$entry" | head -1 | sed -E 's/ %[a-zA-Z]//g; s/^"//; s/"$//')
+              echo "package $pkg; menu entry $entry launches: $bin"
+              [ -x "$bin" ] || { echo "::error::the menu entry's command is not an executable: $bin"; exit 1; }
               run_smoke linux-deb xvfb-run -a "$bin"
               appimage=$(find dist -maxdepth 1 -name '*.AppImage' | head -1)
               chmod +x "$appimage"
