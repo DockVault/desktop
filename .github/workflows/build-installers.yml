@@ -206,66 +206,20 @@ jobs:
 
       # Does the PACKAGED app start on this platform? Everything above proves an installer was produced;
       # nothing proved the app inside it runs -- and on this pipeline two platforms are never started by
-      # hand. Each leg runs the app's own headless check (DOCKVAULT_SMOKE: the boot crypto self-test, the
-      # UI loaded over the app scheme, the renderer's secure context) from what the installer carries,
-      # and the result file plus the exit code must both say it passed. A crash, a refusal to launch
-      # (an Apple-silicon binary with a broken signature is killed before it runs), or a hang all fail.
+      # hand. Each leg runs the app's own headless check from what the installer carries (see
+      # scripts/smoke-packaged.sh); a crash, a refusal to launch or a hang fails the leg. The Intel macOS
+      # build is started natively in its own job below, not here under Rosetta, where it never finished.
       - name: Smoke-test the packaged app
         shell: bash
         run: |
           set -euo pipefail
-          run_smoke() {            # run_smoke <label> <command...>: the app, in smoke mode, SMOKE_LIMIT s at most
-            local label="$1"; shift
-            local result="$RUNNER_TEMP/smoke-$label.json" log="$RUNNER_TEMP/smoke-$label.log" code=0 pid
-            local limit="${SMOKE_LIMIT:-120}"
-            rm -f "$result"
-            DOCKVAULT_SMOKE=1 DOCKVAULT_SMOKE_RESULT="$result" "$@" --user-data-dir="$RUNNER_TEMP/smoke-profile-$label" \
-              > "$log" 2>&1 &
-            pid=$!
-            for _ in $(seq 1 "$limit"); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-            if kill -0 "$pid" 2>/dev/null; then
-              kill -9 "$pid" 2>/dev/null || true
-              echo "::error::$label: the packaged app did not finish its smoke check within $limit s"; tail -40 "$log"; return 1
-            fi
-            wait "$pid" || code=$?
-            if [ "$code" -ne 0 ] || ! grep -q '"ok": true' "$result" 2>/dev/null; then
-              echo "::error::$label: the packaged app failed its smoke check (exit $code)"
-              cat "$result" 2>/dev/null || echo "(no result file)"; tail -40 "$log"; return 1
-            fi
-            echo "$label: smoke check passed"
-            echo "- $label: the packaged app starts and passes its smoke check" >> "$GITHUB_STEP_SUMMARY"
-          }
           case "${{ runner.os }}" in
             Windows)
-              run_smoke windows-x64 dist/win-unpacked/DockVault.exe
+              bash scripts/smoke-packaged.sh run windows-x64 dist/win-unpacked/DockVault.exe
               ;;
             macOS)
-              # From the .dmg itself, since that is what a person downloads. Report the signature and
-              # Gatekeeper's verdict as they are (an unsigned preview is expected to be refused by
-              # Gatekeeper); the gate is that the app runs.
-              for arch in arm64 x64; do
-                dmg=$(find dist -maxdepth 1 -name "*-mac-$arch.dmg" | head -1)
-                [ -n "$dmg" ] || { echo "::error::no $arch .dmg was produced"; exit 1; }
-                mnt="$RUNNER_TEMP/dmg-$arch"; mkdir -p "$mnt" "$RUNNER_TEMP/app-$arch"
-                hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null
-                cp -R "$mnt/DockVault.app" "$RUNNER_TEMP/app-$arch/"
-                hdiutil detach "$mnt" >/dev/null
-                app="$RUNNER_TEMP/app-$arch/DockVault.app"
-                if codesign --verify --deep --strict "$app" 2>"$RUNNER_TEMP/codesign-$arch.txt"; then sig="valid"; else sig="INVALID: $(tr '\n' ' ' < "$RUNNER_TEMP/codesign-$arch.txt")"; fi
-                kind=$(codesign -dv "$app" 2>&1 | grep -E '^(Signature|Authority|flags)' | tr '\n' ' ' || true)
-                gk=$(spctl --assess --type execute "$app" 2>&1 | tr '\n' ' ' || true)
-                echo "- macOS $arch: signature $sig; $kind; Gatekeeper: ${gk:-accepted}" >> "$GITHUB_STEP_SUMMARY"
-                echo "macOS $arch: signature $sig | $kind | Gatekeeper: ${gk:-accepted}"
-                if [ "$arch" = arm64 ]; then
-                  run_smoke "macos-$arch" "$app/Contents/MacOS/DockVault"
-                elif arch -x86_64 /usr/bin/true 2>/dev/null; then
-                  # Under Rosetta. Its first launch translates the whole Electron framework before
-                  # anything runs, which took longer than the native limit on the runner.
-                  SMOKE_LIMIT=480 run_smoke "macos-$arch" arch -x86_64 "$app/Contents/MacOS/DockVault"
-                else
-                  echo "::notice::macOS x64: no Rosetta on this runner, so the Intel build was not started"
-                fi
-              done
+              dmg=$(find dist -maxdepth 1 -name '*-mac-arm64.dmg' | head -1)
+              bash scripts/smoke-packaged.sh dmg macos-arm64 "$dmg"
               ;;
             Linux)
               timeout 300 sudo apt-get install -y --no-install-recommends xvfb >/dev/null
@@ -281,10 +235,10 @@ jobs:
               bin=$(sed -n 's/^Exec=//p' "$entry" | head -1 | sed -E 's/ %[a-zA-Z]//g; s/^"//; s/"$//')
               echo "package $pkg; menu entry $entry launches: $bin"
               [ -x "$bin" ] || { echo "::error::the menu entry's command is not an executable: $bin"; exit 1; }
-              run_smoke linux-deb xvfb-run -a "$bin"
+              bash scripts/smoke-packaged.sh run linux-deb xvfb-run -a "$bin"
               appimage=$(find dist -maxdepth 1 -name '*.AppImage' | head -1)
               chmod +x "$appimage"
-              run_smoke linux-appimage xvfb-run -a "./$appimage" --appimage-extract-and-run
+              bash scripts/smoke-packaged.sh run linux-appimage xvfb-run -a "./$appimage" --appimage-extract-and-run
               ;;
           esac
 
@@ -337,6 +291,27 @@ jobs:
             dist/*.deb
             dist/signing-*.txt
 
+  # The Intel macOS build, started natively. The macOS leg builds both architectures on an Apple-silicon
+  # runner, where the Intel app under Rosetta never finished its smoke check; this proves it on the
+  # hardware it is for, from the same .dmg a person downloads.
+  smoke_macos_intel:
+    name: macOS Intel (smoke)
+    needs: build
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dockvault-macOS-*
+          path: installers
+          merge-multiple: true
+      - name: Smoke-test the Intel app from its .dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg=$(find installers -maxdepth 1 -name '*-mac-x64.dmg' | head -1)
+          bash scripts/smoke-packaged.sh dmg macos-x64 "$dmg"
+
   # On a version tag, attach every installer to the release for that tag (created as a draft if it
   # does not exist yet, so the notes can be written before it is published). This is the only job
   # that can write to the repository, and only on tags.
@@ -349,7 +324,7 @@ jobs:
   release:
     name: Attach installers to the release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, smoke_macos_intel]
     runs-on: ubuntu-latest
     permissions:
       contents: write
