@@ -217,7 +217,9 @@
   // The transfer strip under the title while bytes move: an overall bar, how many files are in flight, and a
   // small bar per file (numbers only — the files are not named here). Removed the moment nothing is moving.
   function setTransfer(card, t) {
-    let strip = card.querySelector('.xfer');
+    // The card's own row only: the state chip's icon wears the class `xfer` too while transferring, and a
+    // lookup by class alone found that icon and built the bar and its text inside it.
+    let strip = card.querySelector(':scope > .xfer');
     if (!t) { if (strip) strip.remove(); return; }
     if (!strip) { strip = el('div', 'xfer'); const title = card.querySelector('.title'); if (title && title.nextSibling) card.insertBefore(strip, title.nextSibling); else card.appendChild(strip); }
     strip.replaceChildren();
@@ -380,7 +382,9 @@
     if (!text) { if (existing) existing.remove(); return; }
     if (existing) { existing.textContent = text; return; }
     const p = el('p', 'reason', text);
-    const after = card.querySelector('p.standing') || card.querySelector('.xfer') || card.querySelector('.title');
+    // The card's own rows only (see setTransfer: the chip's icon is also `.xfer` while transferring, and it
+    // is not a child of the card, so inserting after it threw).
+    const after = card.querySelector(':scope > p.standing') || card.querySelector(':scope > .xfer') || card.querySelector(':scope > .title');
     if (after && after.nextSibling) card.insertBefore(p, after.nextSibling); else card.appendChild(p);
   }
   function cssEscape(s) { return (window.CSS && CSS.escape) ? CSS.escape(String(s)) : String(s).replace(/["\\]/g, '\\$&'); }

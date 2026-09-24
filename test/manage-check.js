@@ -342,7 +342,50 @@ app.whenReady().then(async () => {
       && unstamped.build === 'DockVault 0.1.0 · build not stamped';
   }
 
-  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'];
+  // M) while bytes move, the transfer strip is the card's own row under its title, and goes when they stop.
+  //    The state chip's icon wears the class `xfer` while transferring too, so a lookup by that class alone
+  //    found the icon first and built the bar and its text inside the chip's icon.
+  {
+    const STRIP = `(() => {
+      const card = document.querySelector('.card');
+      const strip = card.querySelector(':scope > .xfer');
+      const ico = card.querySelector('.title .state .ico');
+      return {
+        strips: card.querySelectorAll(':scope > .xfer').length,
+        afterTitle: !!strip && strip.previousElementSibling === card.querySelector(':scope > .title'),
+        text: strip ? strip.textContent : '',
+        bar: !!(strip && strip.querySelector('.bar .fill')),
+        iconXfer: !!ico && ico.classList.contains('xfer'),
+        iconEmpty: !!ico && ico.children.length === 0,
+      };
+    })()`;
+    const r = await scenario('M_transfer', { ioSpec: {}, drive: async (win) => {
+      await ev(win, settle);
+      win.webContents.send('dockvault:evt:syncstatus', { state: 'syncing', vaults: [{ vault: V1, state: 'syncing', reason: null, running: true, lastSyncedAt: 1700000000000, via: 'device',
+        progress: { percent: 26, bytes: 838860800, bytesTotal: 3221225472, files: 0, filesTotal: 1, transferring: 1, fileProgress: [26] } }] });
+      await sleep(300);
+      const during = await ev(win, STRIP);
+      // A reason that arrives mid-transfer lands as the card's own row, under the strip.
+      const REASON = 'The sync server is slow to answer; DockVault keeps trying.';
+      win.webContents.send('dockvault:evt:syncstatus', { state: 'syncing', vaults: [{ vault: V1, state: 'syncing', reason: 'slow', running: true, lastSyncedAt: 1700000000000, via: 'device', reasonText: REASON,
+        progress: { percent: 27, bytes: 869711872, bytesTotal: 3221225472, files: 0, filesTotal: 1, transferring: 1, fileProgress: [27] } }] });
+      await sleep(300);
+      during.reason = await ev(win, `(() => { const card = document.querySelector('.card'); const p = card.querySelector(':scope > p.reason');
+        return { text: p ? p.textContent : '', afterStrip: !!p && p.previousElementSibling === card.querySelector(':scope > .xfer') }; })()`);
+      win.webContents.send('dockvault:evt:syncstatus', { state: 'up-to-date', vaults: [{ vault: V1, state: 'up-to-date', reason: null, running: false, lastSyncedAt: 1700000000000, via: 'device', reasonText: null }] });
+      await sleep(300);
+      const after = await ev(win, STRIP);
+      return { during, after };
+    } });
+    out.M = r;
+    out.M_pass = r.during.strips === 1 && r.during.afterTitle && r.during.bar
+      && r.during.text.includes('26%') && r.during.text.includes('1 file at once')
+      && r.during.iconXfer && r.during.iconEmpty
+      && r.during.reason.text === 'The sync server is slow to answer; DockVault keeps trying.' && r.during.reason.afterStrip
+      && r.after.strips === 0 && r.after.iconEmpty && !r.after.iconXfer;
+  }
+
+  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M'];
   out.ok = KEYS.every((k) => out[`${k}_pass`] === true);
   clearTimeout(watchdog);
   dump();
