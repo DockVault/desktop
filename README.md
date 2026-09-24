@@ -3,14 +3,19 @@
 A cross-platform desktop client for [DockVault](https://github.com/DockVault/vault) — the self-hosted,
 zero-knowledge encrypted file vault.
 
-> Status: early development. Structure and interfaces are expected to change.
+> Status: preview. Releases are published as **unsigned previews** until code signing is in place, so
+> Windows and macOS warn before the first launch; see [Installing](#installing). Structure and interfaces
+> may still change.
 
-## Planned capabilities
+## What it does
 
-- Vault browsing and management from the desktop, reusing the vault's own web interface.
-- Two-way local folder sync for Standard vaults, backed by [rclone](https://rclone.org/).
-- Client-side handling of zero-knowledge vaults, using the vault's existing browser cryptography.
-- A system-tray presence with sync status and conflict handling.
+- Browse and manage your vaults from the desktop, in the vault's own web interface. Zero-knowledge vaults
+  work there as they do in a browser: they are encrypted and decrypted inside the app.
+- Two-way folder sync for Standard vaults, backed by a bundled [rclone](https://rclone.org/) that is
+  checked against a pinned hash before every launch. Each computer syncs on its own identity, so it keeps
+  syncing while DockVault or the screen is locked, and it can be revoked per vault or as a whole.
+- A tray app: sync status, a walk-through to set up sync, the list of computers and synced folders, and
+  checks you can run yourself when something does not connect.
 
 Windows, macOS, and Linux are treated as first-class targets.
 
@@ -33,6 +38,25 @@ git clone --recurse-submodules https://github.com/DockVault/desktop.git
 ```
 
 ## Installing
+
+Download the installer for your system from the
+[releases page](https://github.com/DockVault/desktop/releases).
+
+### Preview releases are unsigned
+
+Until code signing is set up, releases are published as previews (versions like `0.2.0-preview.1`,
+marked as pre-releases) and their installers are **not signed**. The app each installer carries is
+started by the release pipeline on its own platform before anything is published, but your system
+cannot confirm who made it, so it warns before the first launch:
+
+- **Windows** shows "Windows protected your PC". Choose **More info**, then **Run anyway**.
+- **macOS** says Apple could not verify that DockVault is free of malware, and does not open it. The
+  app is signed ad hoc but not notarized. Close the message, then open **System Settings → Privacy &
+  Security**, find the line saying DockVault was blocked, and choose **Open Anyway**. On macOS 14 and
+  earlier you can instead Control-click the app and choose **Open**.
+- **Linux** shows no warning.
+
+Each installer also carries the commit it was built from; **About DockVault** in the tray menu shows it.
 
 Installers are produced by the `Build installers` workflow (see below) and attached to releases:
 
