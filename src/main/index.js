@@ -3379,12 +3379,22 @@ async function finishSmokeIfNeeded() {
     electron: process.versions.electron,
     utc: new Date().toISOString(),
   };
+  // DOCKVAULT_SMOKE_RESULT names a file for the result and makes the exit code carry the verdict. A
+  // PACKAGED app needs both: its code sits inside app.asar, where the default .local path cannot be
+  // written, so without them a packaged smoke run had no way to report a failure (it always exited 0).
+  const resultFile = process.env.DOCKVAULT_SMOKE_RESULT;
+  let written = false;
   try {
-    const dir = path.join(__dirname, '..', '..', '.local');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'shell-smoke-result.json'), JSON.stringify(result, null, 2));
-  } catch { /* best effort */ }
+    const file = resultFile || path.join(__dirname, '..', '..', '.local', 'shell-smoke-result.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(result, null, 2));
+    written = true;
+  } catch { /* best effort, unless the caller asked for the file: then an unwritten result is a failure */ }
   isQuitting = true;
+  if (resultFile) {
+    app.exit(result.ok && written ? 0 : 1);
+    return;
+  }
   app.quit();
 }
 

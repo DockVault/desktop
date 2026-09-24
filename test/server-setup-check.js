@@ -210,7 +210,7 @@ app.whenReady().then(async () => {
     // First run: the SFTP field is suggested from the server as it is typed.
     const dir2 = fresh();
     const r2 = await scenario('F_suggest', { dir: dir2, drive: async (win) => win.webContents.executeJavaScript(`(async () => { const f = document.getElementById('server'); f.value = 'https://vault.example.com:8443/x'; f.dispatchEvent(new Event('input', { bubbles: true })); await new Promise(r => setTimeout(r, 30)); return ${snapshot}; })()`, true) });
-    out.F_suggest = r2.sftpField === 'vault.example.com:2222';
+    out.F_suggest = r2.sftpField === 'vault.example.com:2322';   // the port a standard install publishes
     out.F_pass = out.F_pass && out.F_suggest;
   }
   // G) degraded: combined sentence, hold before the sign-in page
@@ -296,7 +296,7 @@ app.whenReady().then(async () => {
       d: await win.webContents.executeJavaScript(type('sftp', 'files.example.com:2200'), true),             // a host of the person's own
       e: await win.webContents.executeJavaScript(type('server', 'three.example.com'), true),                // no longer follows
     }) });
-    out.L_follow = r.a === 'one.example.com:2222' && r.b === 'one.example.com:2200' && r.c === 'two.example.com:2200' && r.d === 'files.example.com:2200' && r.e === 'files.example.com:2200';
+    out.L_follow = r.a === 'one.example.com:2322' && r.b === 'one.example.com:2200' && r.c === 'two.example.com:2200' && r.d === 'files.example.com:2200' && r.e === 'files.example.com:2200';
     // Change mode: the previous server's SFTP address is replaced as soon as a different server host is typed.
     const dir2 = fresh();
     const r2 = await scenario('L_changeFollows', { dir: dir2, mode: 'change', changeHost: () => 'old.example.com', changeSftp: () => 'old.example.com:2200', drive: async (win) => ({

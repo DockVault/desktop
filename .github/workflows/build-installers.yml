@@ -6,9 +6,12 @@ name: Build installers
 # version tags, where they are also attached to the GitHub release for that tag — the portable
 # Windows build included, since a person choosing a download may want the one that installs nothing.
 #
+# Every leg starts the packaged app in its headless smoke mode before anything is uploaded.
+#
 # Signing is driven entirely by repository secrets. When they are absent the artifacts are
 # produced UNSIGNED and the job summary says so; nothing in this workflow or the repository holds a
-# certificate, password, or Apple credential.
+# certificate, password, or Apple credential. Unsigned installers reach a release only as a
+# labelled preview (a vX.Y.Z-preview.N tag, published as a pre-release); see the release job.
 #
 #   Windows Authenticode : CSC_LINK (base64 .pfx), CSC_KEY_PASSWORD
 #   macOS signing        : CSC_LINK (base64 .p12), CSC_KEY_PASSWORD
@@ -201,6 +204,79 @@ jobs:
             exit 1
           fi
 
+      # Does the PACKAGED app start on this platform? Everything above proves an installer was produced;
+      # nothing proved the app inside it runs -- and on this pipeline two platforms are never started by
+      # hand. Each leg runs the app's own headless check (DOCKVAULT_SMOKE: the boot crypto self-test, the
+      # UI loaded over the app scheme, the renderer's secure context) from what the installer carries,
+      # and the result file plus the exit code must both say it passed. A crash, a refusal to launch
+      # (an Apple-silicon binary with a broken signature is killed before it runs), or a hang all fail.
+      - name: Smoke-test the packaged app
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_smoke() {            # run_smoke <label> <command...>: the app, in smoke mode, 120 s at most
+            local label="$1"; shift
+            local result="$RUNNER_TEMP/smoke-$label.json" log="$RUNNER_TEMP/smoke-$label.log" code=0 pid
+            rm -f "$result"
+            DOCKVAULT_SMOKE=1 DOCKVAULT_SMOKE_RESULT="$result" "$@" --user-data-dir="$RUNNER_TEMP/smoke-profile-$label" \
+              > "$log" 2>&1 &
+            pid=$!
+            for _ in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+            if kill -0 "$pid" 2>/dev/null; then
+              kill -9 "$pid" 2>/dev/null || true
+              echo "::error::$label: the packaged app did not finish its smoke check within 120 s"; tail -40 "$log"; return 1
+            fi
+            wait "$pid" || code=$?
+            if [ "$code" -ne 0 ] || ! grep -q '"ok": true' "$result" 2>/dev/null; then
+              echo "::error::$label: the packaged app failed its smoke check (exit $code)"
+              cat "$result" 2>/dev/null || echo "(no result file)"; tail -40 "$log"; return 1
+            fi
+            echo "$label: smoke check passed"
+            echo "- $label: the packaged app starts and passes its smoke check" >> "$GITHUB_STEP_SUMMARY"
+          }
+          case "${{ runner.os }}" in
+            Windows)
+              run_smoke windows-x64 dist/win-unpacked/DockVault.exe
+              ;;
+            macOS)
+              # From the .dmg itself, since that is what a person downloads. Report the signature and
+              # Gatekeeper's verdict as they are (an unsigned preview is expected to be refused by
+              # Gatekeeper); the gate is that the app runs.
+              for arch in arm64 x64; do
+                dmg=$(find dist -maxdepth 1 -name "*-mac-$arch.dmg" | head -1)
+                [ -n "$dmg" ] || { echo "::error::no $arch .dmg was produced"; exit 1; }
+                mnt="$RUNNER_TEMP/dmg-$arch"; mkdir -p "$mnt" "$RUNNER_TEMP/app-$arch"
+                hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null
+                cp -R "$mnt/DockVault.app" "$RUNNER_TEMP/app-$arch/"
+                hdiutil detach "$mnt" >/dev/null
+                app="$RUNNER_TEMP/app-$arch/DockVault.app"
+                if codesign --verify --deep --strict "$app" 2>"$RUNNER_TEMP/codesign-$arch.txt"; then sig="valid"; else sig="INVALID: $(tr '\n' ' ' < "$RUNNER_TEMP/codesign-$arch.txt")"; fi
+                kind=$(codesign -dv "$app" 2>&1 | grep -E '^(Signature|Authority|flags)' | tr '\n' ' ' || true)
+                gk=$(spctl --assess --type execute "$app" 2>&1 | tr '\n' ' ' || true)
+                echo "- macOS $arch: signature $sig; $kind; Gatekeeper: ${gk:-accepted}" >> "$GITHUB_STEP_SUMMARY"
+                echo "macOS $arch: signature $sig | $kind | Gatekeeper: ${gk:-accepted}"
+                if [ "$arch" = arm64 ] || arch -x86_64 /usr/bin/true 2>/dev/null; then
+                  run_smoke "macos-$arch" "$app/Contents/MacOS/DockVault"
+                else
+                  echo "::notice::macOS x64: no Rosetta on this runner, so the Intel build was not started"
+                fi
+              done
+              ;;
+            Linux)
+              timeout 300 sudo apt-get install -y --no-install-recommends xvfb >/dev/null
+              # The .deb, installed the way a person installs it (its post-install step sets up the
+              # Chromium sandbox helper), then the AppImage as downloaded.
+              deb=$(find dist -maxdepth 1 -name '*.deb' | head -1)
+              timeout 300 sudo apt-get install -y "./$deb" >/dev/null
+              bin=$(dpkg -L dockvault-desktop | grep -E '^/opt/[^/]+/dockvault-desktop$' | head -1)
+              [ -n "$bin" ] || { echo "::error::the .deb installed no /opt/*/dockvault-desktop"; exit 1; }
+              run_smoke linux-deb xvfb-run -a "$bin"
+              appimage=$(find dist -maxdepth 1 -name '*.AppImage' | head -1)
+              chmod +x "$appimage"
+              run_smoke linux-appimage xvfb-run -a "./$appimage" --appimage-extract-and-run
+              ;;
+          esac
+
       # Each leg records whether its installers are signed, so the release job can refuse to publish
       # unsigned ones. Linux has no code signing in this pipeline, so its record is "not-applicable".
       - name: Record signing state
@@ -252,9 +328,13 @@ jobs:
 
   # On a version tag, attach every installer to the release for that tag (created as a draft if it
   # does not exist yet, so the notes can be written before it is published). This is the only job
-  # that can write to the repository, and only on tags. It publishes only when every one of the three
-  # legs reports exactly "signed" or "not-applicable" (an allowlist, so an unexpected or empty record
-  # also refuses): an unsigned installer is for local testing, never for a release.
+  # that can write to the repository, and only on tags.
+  #
+  # A normal release needs every leg to report exactly "signed" or "not-applicable". An UNSIGNED build
+  # is published only as a preview: the tag's version must say so (vX.Y.Z-preview.N), the release is a
+  # GitHub pre-release titled "unsigned preview", and unsigned installers are never attached to an
+  # existing release that is not a pre-release. Any other tag with unsigned installers is skipped, and
+  # they stay workflow artifacts. Every installer must also carry the tag's own version in its name.
   release:
     name: Attach installers to the release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -275,9 +355,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           ls -l installers
-          publish=true
           records=0
+          signed=true
+          known=true
           for f in installers/signing-*.txt; do
             [ -e "$f" ] || continue
             records=$((records + 1))
@@ -285,15 +367,42 @@ jobs:
             echo "$f: $state"
             case "$state" in
               signed|not-applicable) ;;
-              *) publish=false ;;
+              unsigned) signed=false ;;
+              *) known=false ;;
             esac
           done
-          if [ "$records" -ne 3 ]; then
-            publish=false
+          if [ "$records" -ne 3 ] || [ "$known" != "true" ]; then
+            echo "::error::expected one signing record from each of the three legs, each signed, unsigned or not-applicable"
+            exit 1
           fi
-          if [ "$publish" != "true" ]; then
-            echo "::notice::Unsigned or incomplete installers; skipping release attach (the installers remain downloadable as workflow artifacts). Configure the signing secrets to publish a release."
-            exit 0
+          # A tag may carry only its own version's installers.
+          version="${TAG#v}"
+          for f in installers/*.exe installers/*.dmg installers/*.AppImage installers/*.deb; do
+            case "$(basename "$f")" in
+              "DockVault-$version-"*) ;;
+              *) echo "::error::$(basename "$f") is not a $version installer; refusing to attach it to $TAG"; exit 1 ;;
+            esac
+          done
+          if [ "$signed" = "true" ]; then
+            title="$TAG"
+            flags=(--draft)
+          else
+            case "$TAG" in
+              v*-preview*) ;;
+              *)
+                echo "::notice::Unsigned installers, and $TAG is not a preview tag; skipping release attach (the installers remain downloadable as workflow artifacts). A normal release needs the signing secrets; an unsigned build can be published only on a vX.Y.Z-preview.N tag."
+                exit 0
+                ;;
+            esac
+            title="DockVault Desktop $version (unsigned preview)"
+            flags=(--draft --prerelease)
           fi
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --title "$TAG" --notes ""
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$signed" != "true" ] && [ "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" != "true" ]; then
+              echo "::error::release $TAG exists and is not a pre-release; refusing to attach unsigned installers to it"
+              exit 1
+            fi
+          else
+            gh release create "$TAG" "${flags[@]}" --title "$title" --notes ""
+          fi
           gh release upload "$TAG" installers/*.exe installers/*.dmg installers/*.AppImage installers/*.deb --clobber

@@ -81,7 +81,9 @@ Standard-vault sync, so nothing else needs to be installed.
 
 The first time DockVault opens it asks for two addresses and checks both before saving anything:
 your server's address (https only), and the file transfer (SFTP) address that synced folders are
-sent to, which is usually the server's own name on port 2222. Each gets its own light: the server
+sent to, which is usually the server's own name on port 2322, the port a standard DockVault install
+publishes SFTP on (the server listens on 2222 inside its container, which clients cannot reach). The
+screen suggests that address as you type the server's. Each gets its own light: the server
 must answer as DockVault, and the SFTP address must be reachable and prove its host key. An address
 that cannot be reached, a certificate this computer does not trust, a server that is not DockVault,
 or a port that is not SFTP each get a plain explanation, never a bypass. The check also tells you up

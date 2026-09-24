@@ -31,7 +31,10 @@
   const sftpFp = document.getElementById('sftp-fp');
   const syncLine = document.getElementById('sync');
 
-  const DEFAULT_SFTP_PORT = 2222;
+  // The port a standard DockVault install PUBLISHES SFTP on (its SFTP_HOST_PORT default). The server
+  // listens on 2222 inside its container, but no client can reach that port, so suggesting it sent every
+  // first run to an address nothing answers on.
+  const DEFAULT_SFTP_PORT = 2322;
   // A submit that lands within this long of the button turning into Connect is a second Enter from the
   // check, not a decision made on the lights; it is ignored.
   const SETTLE_MS = 400;
