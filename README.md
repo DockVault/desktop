@@ -89,8 +89,8 @@ Installers are produced by the `Build installers` workflow (see below) and attac
   for an installed copy's data.
 - macOS: `DockVault-<version>-mac-arm64.dmg` (Apple silicon) or `DockVault-<version>-mac-x64.dmg`
   (Intel) — drag DockVault into Applications.
-- Linux: `DockVault-<version>-linux-x64.AppImage` (make it executable and run it) or
-  `DockVault-<version>-linux-x64.deb` for Debian and Ubuntu. The tray needs a status-notifier host;
+- Linux: `DockVault-<version>-linux-x86_64.AppImage` (make it executable and run it) or
+  `DockVault-<version>-linux-amd64.deb` for Debian and Ubuntu. The tray needs a status-notifier host;
   on GNOME install the AppIndicator extension.
 
 DockVault lives in the system tray. Closing its window keeps it running in the background. The
