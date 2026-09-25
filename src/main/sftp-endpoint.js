@@ -17,7 +17,10 @@
 
 const { isIPv6 } = require('node:net');
 
-const DEFAULT_SFTP_PORT = 2222;
+// The port a standard DockVault install PUBLISHES SFTP on (its SFTP_HOST_PORT default). 2222 is the
+// port inside the container, which no client can reach. A bare host typed without a port, and the
+// address suggested for a server, both mean this one.
+const DEFAULT_SFTP_PORT = 2322;
 
 // A hostname or IPv4 literal (labels of letters, digits, hyphens), matching what the mint accepts.
 const HOST_SHAPE = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)*$/;

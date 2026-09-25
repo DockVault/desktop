@@ -8,6 +8,14 @@ const assert = require('node:assert/strict');
 
 const { parseSftpEndpoint, formatSftpEndpoint, isSftpEndpoint, suggestSftpEndpoint, applySftpEndpoint, DEFAULT_SFTP_PORT } = require('../src/main/sftp-endpoint');
 
+test('the default is the port a standard install publishes, not the one inside its container', () => {
+  // The tests below use the constant by name, so they would pass for any value; this one pins it. A
+  // standard vault install publishes SFTP on host port 2322; 2222 is only its in-container port.
+  assert.equal(DEFAULT_SFTP_PORT, 2322);
+  assert.deepEqual(parseSftpEndpoint('vault.example.com'), { kind: 'ok', host: 'vault.example.com', port: 2322 });
+  assert.deepEqual(suggestSftpEndpoint('https://vault.example.com'), { host: 'vault.example.com', port: 2322 });
+});
+
 test('host:port, a bare host on the default port, IPv6 in brackets, and a pasted sftp:// URL all parse', () => {
   assert.deepEqual(parseSftpEndpoint('files.example.com:2200'), { kind: 'ok', host: 'files.example.com', port: 2200 });
   assert.deepEqual(parseSftpEndpoint('  files.example.com  '), { kind: 'ok', host: 'files.example.com', port: DEFAULT_SFTP_PORT });

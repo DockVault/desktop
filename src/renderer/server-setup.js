@@ -129,9 +129,9 @@
       case 'ok': return `Reachable at ${at}, and it answered as an SFTP server.`;
       case 'not-needed': return "Not needed — this server doesn't sync folders, so this address is set aside.";
       case 'empty': return 'Enter the file transfer address (SFTP).';
-      case 'malformed': return 'Enter a host and port, for example vault.example.com:2222.';
+      case 'malformed': return 'Enter a host and port, for example vault.example.com:2322.';
       case 'unreachable': return `Couldn't reach ${at}. Check the address and the port — ask whoever runs your server which port SFTP is on.`;
-      case 'not-ssh': return `${at} answers, but not as an SFTP server — usually the wrong port. Try the port whoever runs your server gave you (often 2222).`;
+      case 'not-ssh': return `${at} answers, but not as an SFTP server — usually the wrong port. Try the port whoever runs your server gave you (often 2322).`;
       case 'ssh-unsupported': return `${at} is an SSH server, but not one DockVault can use. Check the port; if it's right, ask whoever runs your server.`;
       case 'host-key-unverified': return `${at} presented a host key it couldn't prove it owns, so DockVault won't use it. Check the address; if it's right, ask whoever runs your server — something between you and the server may be interfering.`;
       default: return `Couldn't check ${at}.`;

@@ -22,7 +22,7 @@ function harness({ facts = {}, answers = {}, overrides = {} } = {}) {
   const saved = [];
   const questions = [];
   const io = {
-    gather: async () => ({ signedIn: true, support: 'ok', deviceStatus: 'ok', otherServerHost: null, sftpSaved: true, sftpSuggestion: 'vault.example.com:2222', configUnreadable: false, label: 'Blue Heron', existing: [], ...facts }),
+    gather: async () => ({ signedIn: true, support: 'ok', deviceStatus: 'ok', otherServerHost: null, sftpSaved: true, sftpSuggestion: 'vault.example.com:2322', configUnreadable: false, label: 'Blue Heron', existing: [], ...facts }),
     verifySftp: async (text) => { log.push(['verifySftp', text]); return text === 'good:2222' ? { kind: 'ok', host: 'good', port: 2222, fingerprint: 'SHA256:x' } : { kind: 'unreachable', host: 'bad', port: 2222 }; },
     saveSftp: (ep) => log.push(['saveSftp', ep]),
     registration: {
@@ -121,7 +121,7 @@ test('the file transfer address step appears only when none is saved, re-asks wi
   assert.equal(out.kind, 'done');
   assert.deepEqual(h.kinds().slice(0, 3), ['sftp-address', 'sftp-address', 'pick-vault']);
   assert.equal(h.questions[0].previous, null);
-  assert.equal(h.questions[0].suggestion, 'vault.example.com:2222');
+  assert.equal(h.questions[0].suggestion, 'vault.example.com:2322');
   assert.deepEqual(h.questions[1].previous, { kind: 'unreachable', host: 'bad', port: 2222, text: 'bad:2222' });
   assert.deepEqual(h.log.filter((l) => l[0] === 'saveSftp'), [['saveSftp', { host: 'good', port: 2222 }]]);
   assert.ok(h.log.findIndex((l) => l[0] === 'saveSftp') < h.log.findIndex((l) => l[0] === 'save'));

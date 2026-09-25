@@ -61,7 +61,7 @@ function makeIo(root, { facts = {}, folders = [], overrides = {} } = {}) {
   const saved = [];
   const home = root;
   const io = {
-    gather: async () => ({ signedIn: true, support: 'ok', deviceStatus: 'ok', otherServerHost: null, sftpSaved: true, sftpSuggestion: 'vault.example.com:2222', configUnreadable: false, label: 'Blue Heron', existing: [], ...facts }),
+    gather: async () => ({ signedIn: true, support: 'ok', deviceStatus: 'ok', otherServerHost: null, sftpSaved: true, sftpSuggestion: 'vault.example.com:2322', configUnreadable: false, label: 'Blue Heron', existing: [], ...facts }),
     verifySftp: async (text) => { log.push(['verifySftp', text]); return text === 'files.example.com:2200' ? { kind: 'ok', host: 'files.example.com', port: 2200, fingerprint: 'SHA256:x' } : { kind: 'unreachable', host: 'nowhere.example.com', port: 2222 }; },
     saveSftp: (ep) => log.push(['saveSftp', ep]),
     registration: { probe: async () => ({ reason: 'ok' }), readStatus: () => 'absent', forget: async () => log.push(['forget']), register: async (label) => { log.push(['register', label]); return { ok: true, deviceId: 'd1' }; } },
@@ -211,7 +211,7 @@ app.whenReady().then(async () => {
       ctx.log.push(['MARK']);
       return { s1, prefilled, s2, s3, log: ctx.log, questions: ctx.questions.map((q) => q.kind) };
     } });
-    out.D_pass = r.s1.title === 'One more thing about your server' && r.prefilled === 'vault.example.com:2222'
+    out.D_pass = r.s1.title === 'One more thing about your server' && r.prefilled === 'vault.example.com:2322'
       && r.s2.body.includes("Couldn't reach nowhere.example.com:2222") && r.s2.title === 'One more thing about your server' && r.s3.title === 'Which vault do you want to sync to this computer?'
       && JSON.stringify(r.log.filter((l) => l[0] === 'saveSftp')) === JSON.stringify([['saveSftp', { host: 'files.example.com', port: 2200 }]])
       && r.questions.slice(0, 3).join(',') === 'sftp-address,sftp-address,pick-vault' && out.D_kept === true;

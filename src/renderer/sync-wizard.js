@@ -92,9 +92,9 @@
     const at = endpointText(prev);
     switch (prev && prev.kind) {
       case 'empty': return 'Enter the file transfer address (SFTP).';
-      case 'malformed': return 'Enter a host and port, for example vault.example.com:2222.';
+      case 'malformed': return 'Enter a host and port, for example vault.example.com:2322.';
       case 'unreachable': return `Couldn't reach ${at}. Check the address and the port — ask whoever runs your server which port SFTP is on.`;
-      case 'not-ssh': return `${at} answers, but not as an SFTP server — usually the wrong port. Try the port whoever runs your server gave you (often 2222).`;
+      case 'not-ssh': return `${at} answers, but not as an SFTP server — usually the wrong port. Try the port whoever runs your server gave you (often 2322).`;
       case 'ssh-unsupported': return `${at} is an SSH server, but not one DockVault can use. Check the port; if it's right, ask whoever runs your server.`;
       case 'host-key-unverified': return `${at} presented a host key it couldn't prove it owns, so DockVault won't use it. Check the address; if it's right, ask whoever runs your server.`;
       default: return `Couldn't check ${at}.`;
@@ -157,7 +157,7 @@
     'sftp-address': (q) => {
       setSteps({});
       title.textContent = 'One more thing about your server';
-      body.appendChild(para("To sync files, DockVault needs your server's file transfer (SFTP) address. It is usually your server's name on port 2222. Enter it once — DockVault checks it before going on."));
+      body.appendChild(para("To sync files, DockVault needs your server's file transfer (SFTP) address. It is usually your server's name on port 2322. Enter it once — DockVault checks it before going on."));
       const field = el('input'); field.type = 'text'; field.id = 'sftp'; field.autocomplete = 'off'; field.spellcheck = false;
       field.value = (q.previous && typeof q.previous.text === 'string' && q.previous.text) ? q.previous.text : (q.suggestion || '');
       const lbl = el('label', null, 'File transfer address (SFTP)'); lbl.htmlFor = 'sftp';
