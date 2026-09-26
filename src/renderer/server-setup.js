@@ -68,8 +68,29 @@
     else setButton(button.textContent === 'Check again' ? 'Check again' : 'Check', okToTry);
   }
 
+  // The host of what is in the server field, for the SFTP suggestion. A name in another script is shown the way
+  // the person typed it (trimmed, lower-cased), never as the "xn--" form the URL parser turns it into: main
+  // converts it where a connection is made. The parser only confirms that it is an address at all and that the
+  // spelling shown names the same host; a plain ASCII name is taken from the parser exactly as before.
+  const SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
+  function typedHostOf(withScheme) {
+    const authority = withScheme.replace(SCHEME, '').split(/[\/?#\\]/)[0].replace(/^.*@/, '');
+    if (authority.startsWith('[')) return authority.slice(0, authority.indexOf(']') + 1);
+    return authority.replace(/:\d*$/, '').trim();
+  }
   function hostnameOf(typed) {
-    try { return new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(typed) ? typed : `https://${typed}`).hostname; } catch { return ''; }
+    const withScheme = SCHEME.test(typed) ? typed : `https://${typed}`;
+    let ascii;
+    try { ascii = new URL(withScheme).hostname; } catch { return ''; }
+    if (!ascii) return '';
+    const asTyped = typedHostOf(withScheme);
+    if (!/[^\x00-\x7f]/.test(asTyped) || asTyped.includes('%')) return ascii;
+    // Lower-cased when that still names the same host (a few letters lower-case differently from the way host
+    // names are folded); otherwise exactly as typed.
+    for (const spelling of [asTyped.toLowerCase(), asTyped]) {
+      try { if (new URL(`https://${spelling}`).hostname === ascii) return spelling; } catch { /* the next spelling */ }
+    }
+    return ascii;
   }
   // The host part of what is in the SFTP field, and the port part (kept when the host is swapped).
   function splitSftpField() {

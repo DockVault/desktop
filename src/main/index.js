@@ -87,6 +87,7 @@ const { deviceRemotePath } = require('./mint-path');
 const { probeSftp } = require('./sftp-probe');
 const { mintDeviceSftpAccess } = require('./device-mint');
 const sftpEndpoint = require('./sftp-endpoint');
+const hostName = require('./host-name');
 const { MintPathSelector, identityEndedBy } = require('./mint-path');
 const { refreshDeviceSecret, isRotationDue, identityIsStaleAfter, reconcileRotationMarker } = require('./device-refresh');
 const { RunStateSnapshot } = require('./run-state-snapshot');
@@ -3020,7 +3021,14 @@ function buildManageIo() {
     },
     configured: () => storedConfig().map((e) => ({ vaultId: e.vaultId, vaultName: e.vaultName, localFolder: e.localFolder, enabled: e.enabled !== false })),
     liveStatus: () => (syncHub ? syncHub.current() : { vaults: [] }),
-    endpoint: () => ({ serverHost: origin() ? serverProbe.hostOf(origin()) : '', sftp: serverConfig.readSftpEndpoint(dir) }),
+    // Shown on the Computers page only, so both hosts go in their readable form.
+    endpoint: () => {
+      const sftp = serverConfig.readSftpEndpoint(dir);
+      return {
+        serverHost: origin() ? hostName.toDisplayAddress(serverProbe.hostOf(origin())) : '',
+        sftp: sftp ? { host: sftp.host.includes(':') ? `[${sftp.host}]` : hostName.toDisplayHost(sftp.host), port: sftp.port } : null,
+      };
+    },
     remotePathFor: (vaultId, via, vaultName) => (via === 'device' ? deviceRemotePath(vaultId) : (vaultName ? syncConfig.remotePathForVault(vaultName) : null)),
     revokeGrant: (deviceId, vaultId) => accountCall('POST', `/devices/${encodeURIComponent(deviceId)}/grants/${encodeURIComponent(vaultId)}/revoke`),
     revokeDevice: (deviceId) => accountCall('POST', `/devices/${encodeURIComponent(deviceId)}/revoke`),
@@ -3089,7 +3097,7 @@ function buildWizardIo(win) {
       try {
         const read = deviceSecretStore.readDeviceSecret(safeStorage, dir, origin);
         deviceStatus = (read && read.status) || 'absent';
-        if (read && read.status === 'absent-for-this-server' && read.otherOrigin) otherServerHost = serverProbe.hostOf(read.otherOrigin);
+        if (read && read.status === 'absent-for-this-server' && read.otherOrigin) otherServerHost = hostName.toDisplayAddress(serverProbe.hostOf(read.otherOrigin));
         if (read && read.secret) { try { deviceSecretStore.zeroizeSecret(read.secret); } catch { /* best-effort */ } read.secret = null; }
       } catch { deviceStatus = 'unreadable'; }
       if (deviceStatus === 'stale' && !deviceIdentityStale) { try { if (deviceSecretStore.hasRotatingMarker(dir)) deviceStatus = 'rechecking'; } catch { /* keep stale */ } }
@@ -3105,7 +3113,7 @@ function buildWizardIo(win) {
       } catch { existing = []; }
       return {
         signedIn, support, deviceStatus, otherServerHost,
-        sftpSaved: !!sftp, sftpSuggestion: suggestion ? sftpEndpoint.formatSftpEndpoint(suggestion) : '',
+        sftpSaved: !!sftp, sftpSuggestion: suggestion ? sftpEndpoint.displaySftpEndpoint(suggestion) : '',
         configUnreadable, label: deviceRegister.suggestDeviceLabel(existingLabels), existing,
       };
     },
@@ -3114,11 +3122,12 @@ function buildWizardIo(win) {
       if (parsed.kind !== 'ok') return { kind: parsed.kind, host: '', port: 0 };
       let r;
       try { r = await probeSftp({ host: parsed.host, port: parsed.port }); } catch { r = { kind: 'unreachable', host: parsed.host, port: parsed.port }; }
-      const out = { kind: r.kind, host: r.host, port: r.port };
+      // The conversation shows the host in its readable form; saveSftp turns it back into the ASCII form probed here.
+      const out = { kind: r.kind, host: hostName.toDisplayHost(r.host), port: r.port };
       if (r.kind === 'ok') out.fingerprint = r.fingerprint; // never the key line: the pin comes from the vault's answer
       return out;
     },
-    saveSftp: (ep) => serverConfig.writeSftpEndpoint(dir, ep, serverConfig.readServerOrigin(dir)),
+    saveSftp: (ep) => serverConfig.writeSftpEndpoint(dir, { host: hostName.toAsciiHost(ep && ep.host), port: ep && ep.port }, serverConfig.readServerOrigin(dir)),
     registration: { probe: dev.probe, readStatus: dev.readStatus, forget: dev.forget, register: dev.register },
     grantVault: dev.grantVault,
     addPending: (vaultId) => devicePending.addPending(safeStorage, dir, vaultId),
@@ -3660,7 +3669,8 @@ async function openSignInAfterSetup() {
 // window of its own to take down.
 async function changeServer({ onConsent = null } = {}) {
   const s = serverConfigState();
-  const consent = trayPresentation.changeServerConsent(s.origin ? serverProbe.hostOf(s.origin) : '');
+  const shownHost = s.origin ? hostName.toDisplayAddress(serverProbe.hostOf(s.origin)) : '';
+  const consent = trayPresentation.changeServerConsent(shownHost);
   let res;
   try {
     res = await dialog.showMessageBox(mainWindow, {
@@ -3670,8 +3680,9 @@ async function changeServer({ onConsent = null } = {}) {
   } catch { return false; }
   if (!res || res.response !== 1) return false;
   if (onConsent) { try { onConsent(); } catch { /* the caller's window is not load-bearing */ } }
-  changeHost = s.origin ? serverProbe.hostOf(s.origin) : null;
-  changeSftp = s.sftp ? sftpEndpoint.formatSftpEndpoint(s.sftp) : null;
+  // Pre-fills for the setup screen, in the readable form: whatever is typed back goes through the verify again.
+  changeHost = shownHost || null;
+  changeSftp = s.sftp ? sftpEndpoint.displaySftpEndpoint(s.sftp) : null;
   await forgetServerRelationship(s.origin);
   setupMode = 'change';
   refreshTray();

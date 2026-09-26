@@ -26,7 +26,8 @@
  *      previous server's address is replaced as soon as a different server host is typed;
  *   M) a DockVault stub on plain http typed without a scheme → the https attempt gets no TLS back, the one http
  *      retry connects, the light says plain HTTP was used, and the http origin is saved;
- *   N) the same stub typed with https:// → no retry, the "not over HTTPS" sentence, never a certificate one.
+ *   N) the same stub typed with https:// → no retry, the "not over HTTPS" sentence, never a certificate one;
+ *   O) a server name in another script → the SFTP suggestion shows it as typed, not in its xn-- form.
  * Writes .local/server-setup-check.json and prints one PASS/FAIL line. Exit 0 = PASS.
  *
  *   node_modules/electron/dist/electron.exe test/server-setup-check.js
@@ -333,8 +334,18 @@ app.whenReady().then(async () => {
       && !/certificate/i.test(r.ui.apiWhat) && r.ui.button === 'Check again' && r.saved === 'absent' && r.opened === 0;
     stub.srv.close();
   }
+  // O) a server name in another script: the SFTP suggestion shows it as typed (lower-cased), not in its xn-- form.
+  {
+    const type = (value) => `(async () => { const f = document.getElementById('server'); f.value = ${JSON.stringify(value)}; f.dispatchEvent(new Event('input', { bubbles: true })); await new Promise(r => setTimeout(r, 30)); return document.getElementById('sftp').value; })()`;
+    const dir = fresh();
+    const r = await scenario('O_readableSuggestion', { dir, drive: async (win) => ({
+      a: await win.webContents.executeJavaScript(type('τεστ'), true),
+      b: await win.webContents.executeJavaScript(type('ΤΕΣΤ.example.com:8443'), true),
+    }) });
+    out.O_pass = r.a === 'τεστ:2322' && r.b === 'τεστ.example.com:2322';
+  }
 
-  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N'];
+  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O'];
   out.ok = KEYS.every((k) => out[`${k}_pass`] === true);
   try { await sftp.close(); } catch { /* ignore */ }
   try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }

@@ -2,7 +2,11 @@
 
 /*
  * The setup screen, from the page's real source: its words for a server that answers without HTTPS, which are
- * never the untrusted-certificate sentence, and for a server on this computer reached over plain http.
+ * never the untrusted-certificate sentence, and for a server on this computer reached over plain http. And its
+ * SFTP suggestion: typing a server fills the file transfer field with that server's host on the default port.
+ * A name in another script is shown the way it was typed (trimmed, lower-cased), not as the "xn--" form the URL
+ * parser turns it into, and main's parse of the suggestion always lands on the same ASCII host main uses for
+ * the server address itself.
  *
  * The page runs in a small DOM that keeps each element's value and listeners — enough to type into a field and
  * press Check; the full screen is exercised under Electron by test/server-setup-check.js.
@@ -13,6 +17,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+
+const { parseSftpEndpoint, DEFAULT_SFTP_PORT } = require('../src/main/sftp-endpoint');
+const { normalizeInput } = require('../src/main/server-probe');
 
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer', 'server-setup.js'), 'utf8');
 
@@ -25,6 +32,59 @@ function element() {
     fire(type) { for (const fn of listeners[type] || []) fn({ preventDefault() {} }); },
   };
 }
+
+async function openScreen() {
+  const nodes = new Map();
+  const document = { getElementById: (id) => { if (!nodes.has(id)) nodes.set(id, element()); return nodes.get(id); } };
+  const server = { state: async () => ({ mode: 'first-run', status: 'absent', host: null, sftp: null }), check: async () => null, connect: async () => null };
+  const sandbox = { document, window: { dockvault: { server } }, URL, setTimeout, clearTimeout, Date, console };
+  vm.runInContext(SRC, vm.createContext(sandbox), { filename: 'server-setup.js' });
+  for (let i = 0; i < 5; i += 1) await new Promise((r) => setImmediate(r)); // start() has read the state
+  const type = (text) => { document.getElementById('server').value = text; document.getElementById('server').fire('input'); return document.getElementById('sftp').value; };
+  return { type, sftp: document.getElementById('sftp') };
+}
+
+// The ASCII host main connects to for a typed server address, without brackets (as an SFTP host carries it).
+const serverHostAscii = (typed) => new URL(normalizeInput(typed).origin).hostname.replace(/^\[|\]$/g, '');
+
+test('the suggestion shows a name in another script as typed, lower-cased, on port 2322', async () => {
+  const screen = await openScreen();
+  const cases = [
+    ['τεστ', 'τεστ:2322'],                                   // the reported case: not "xn--qxa2abc:2322"
+    ['  ΤΕΣΤ  ', 'τεστ:2322'],                               // trimmed and lower-cased
+    ['Τεστ.Example.COM:8443/login', 'τεστ.example.com:2322'], // a port and a path are not part of the host
+    ['https://bücher.example', 'bücher.example:2322'],
+    ['localhost:8290', 'localhost:2322'],
+    ['Vault.Example.com', 'vault.example.com:2322'],         // a plain ASCII name, exactly as before
+    ['[::1]:8290', '[::1]:2322'],                            // an IPv6 literal keeps its brackets
+    ['xn--qxa2abc', 'xn--qxa2abc:2322'],                     // the ASCII form, typed as such, is left as typed
+  ];
+  for (const [typed, expected] of cases) {
+    const suggested = await screen.type(typed);
+    assert.equal(suggested, expected, typed);
+    const parsed = parseSftpEndpoint(suggested);
+    assert.equal(parsed.kind, 'ok', typed);
+    assert.equal(parsed.port, DEFAULT_SFTP_PORT);
+    assert.equal(parsed.host, serverHostAscii(typed), `${typed}: the SFTP host is the server's own host where it is connected to`);
+  }
+});
+
+test('a name whose lower-cased spelling would be a different host is shown exactly as typed', async () => {
+  // A final capital sigma lower-cases to "ς", which is a different host name than the "σ" host names fold it
+  // to; shown lower-cased, the suggestion would point somewhere else.
+  const screen = await openScreen();
+  const suggested = await screen.type('ΤΕΣ');
+  assert.equal(suggested, 'ΤΕΣ:2322');
+  assert.equal(parseSftpEndpoint(suggested).host, serverHostAscii('ΤΕΣ'));
+});
+
+test('the suggestion never holds 2332 or any port but the default for a host typed without one', async () => {
+  const screen = await openScreen();
+  for (const typed of ['vault.example.com', 'τεστ', 'localhost:8290', '10.0.0.5:443']) {
+    assert.match(await screen.type(typed), /:2322$/, typed);
+  }
+  assert.doesNotMatch(SRC, /2332/);
+});
 
 // The screen's words for an API outcome: press Check with a canned verify and read the server light.
 async function apiLightFor(api) {

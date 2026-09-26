@@ -24,7 +24,8 @@
 const serverConfig = require('./server-config');
 const serverProbe = require('./server-probe');
 const { verifySetup, failedVerify } = require('./setup-verify');
-const { formatSftpEndpoint } = require('./sftp-endpoint');
+const { displaySftpEndpoint } = require('./sftp-endpoint');
+const { toDisplayAddress } = require('./host-name');
 
 const DEGRADED_HOLD_MS = 1500;
 
@@ -69,8 +70,9 @@ function createServerSetup({ dir, httpJson, probeSftp, probeSyncCapability, onSa
     const change = mode() === 'change';
     // While switching, the old server is already forgotten on disk; its host and SFTP address are kept
     // in memory only so the fields can be pre-filled.
-    const host = s.origin ? serverProbe.hostOf(s.origin) : (change ? (changeHost() || null) : null);
-    const sftp = s.sftp ? formatSftpEndpoint(s.sftp) : (change ? (changeSftp() || null) : null);
+    // Both are shown (and pre-filled) in their readable form; whatever is typed back goes through the verify again.
+    const host = s.origin ? toDisplayAddress(serverProbe.hostOf(s.origin)) : (change ? (changeHost() || null) : null);
+    const sftp = s.sftp ? displaySftpEndpoint(s.sftp) : (change ? (changeSftp() || null) : null);
     return { mode: change ? 'change' : 'first-run', status: s.status, host, sftp: sftp || null };
   }
 

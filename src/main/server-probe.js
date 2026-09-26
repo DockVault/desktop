@@ -35,6 +35,9 @@
  * version: the health route carries none, and the version requirement is checked after sign-in
  * where it already lives. No error text, path, or certificate detail ever leaves this module —
  * only the kind, the normalised origin, and its host for the copy.
+ *
+ * Host names travel in their ASCII form (a name typed in another script is converted by the URL parser, as
+ * an address bar converts it); the readable form is made for the screen only, in setup-verify.js.
  */
 
 const { normalizeServer } = require('./server-config');

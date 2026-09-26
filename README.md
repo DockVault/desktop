@@ -107,7 +107,8 @@ The first time DockVault opens it asks for two addresses and checks both before 
 your server's address (https only), and the file transfer (SFTP) address that synced folders are
 sent to, which is usually the server's own name on port 2322, the port a standard DockVault install
 publishes SFTP on (the server listens on 2222 inside its container, which clients cannot reach). The
-screen suggests that address as you type the server's. Each gets its own light: the server
+screen suggests that address as you type the server's, showing a name in any script as you typed it
+(it is saved and connected to in its ASCII form). Each gets its own light: the server
 must answer as DockVault, and the SFTP address must be reachable and prove its host key. An address
 that cannot be reached, a certificate this computer does not trust, a server that does not offer
 https, a server that is not DockVault, or a port that is not SFTP each get a plain explanation, never a

@@ -16,6 +16,7 @@
  */
 
 const { isIPv6 } = require('node:net');
+const { toAsciiHost, toDisplayHost } = require('./host-name');
 
 // The port a standard DockVault install PUBLISHES SFTP on (its SFTP_HOST_PORT default). 2222 is the
 // port inside the container, which no client can reach. A bare host typed without a port, and the
@@ -33,7 +34,9 @@ function validHost(h) { return typeof h === 'string' && h.length > 0 && h.length
 /**
  * Parse what was typed. Accepts "host", "host:port", "[v6]:port", "[v6]", and tolerates a pasted
  * "sftp://host:port" or a trailing slash. Returns { kind: 'ok', host, port } or { kind: 'empty' } or
- * { kind: 'malformed' }. A missing port means the default.
+ * { kind: 'malformed' }. A missing port means the default. The host comes back in its ASCII form, lower-cased
+ * (a name typed in another script is converted as an address bar would convert it), because this is the
+ * host that is probed, saved, and handed to the sync engine.
  */
 function parseSftpEndpoint(input) {
   let s = String(input == null ? '' : input).trim();
@@ -44,13 +47,14 @@ function parseSftpEndpoint(input) {
   const bracket = s.match(/^\[([^\]]+)\](?::(\d{1,5}))?$/);
   if (bracket) {
     if (!isIPv6(bracket[1])) return { kind: 'malformed' }; // brackets are for an IPv6 literal only
-    host = bracket[1]; portText = bracket[2] == null ? null : bracket[2];
+    host = bracket[1].toLowerCase(); portText = bracket[2] == null ? null : bracket[2];
   }
   else {
     const colons = (s.match(/:/g) || []).length;
     if (colons > 1) { host = s; }                                    // a bare IPv6 literal, no port
     else if (colons === 1) { const i = s.lastIndexOf(':'); host = s.slice(0, i); portText = s.slice(i + 1); }
     else host = s;
+    host = toAsciiHost(host);
   }
   if (!validHost(host)) return { kind: 'malformed' };
   let port = DEFAULT_SFTP_PORT;
@@ -62,11 +66,18 @@ function parseSftpEndpoint(input) {
   return { kind: 'ok', host, port };
 }
 
-/** "host:port" for the screen (an IPv6 host in brackets). */
+/** "host:port" (an IPv6 host in brackets), exactly as it is connected to: the ASCII form. */
 function formatSftpEndpoint(endpoint) {
   if (!endpoint || !validHost(endpoint.host) || !validPort(endpoint.port)) return '';
   const h = endpoint.host.includes(':') ? `[${endpoint.host}]` : endpoint.host;
   return `${h}:${endpoint.port}`;
+}
+
+/** "host:port" for the screen: the same address with its host in the readable form ("τεστ:2322"). */
+function displaySftpEndpoint(endpoint) {
+  const text = formatSftpEndpoint(endpoint);
+  if (!text || endpoint.host.includes(':')) return text;
+  return `${toDisplayHost(endpoint.host)}:${endpoint.port}`;
 }
 
 /** A saved endpoint read back from disk is used only when it is whole and well-formed. */
@@ -98,4 +109,4 @@ function applySftpEndpoint(bundle, endpoint) {
   return { bundle, advertised, overridden };
 }
 
-module.exports = { parseSftpEndpoint, formatSftpEndpoint, isSftpEndpoint, suggestSftpEndpoint, applySftpEndpoint, DEFAULT_SFTP_PORT };
+module.exports = { parseSftpEndpoint, formatSftpEndpoint, displaySftpEndpoint, isSftpEndpoint, suggestSftpEndpoint, applySftpEndpoint, DEFAULT_SFTP_PORT };

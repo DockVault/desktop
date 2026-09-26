@@ -28,6 +28,7 @@ const serverProbe = require('./server-probe');
 const { parseSftpEndpoint } = require('./sftp-endpoint');
 const { probeSyncCapability: defaultSyncProbe } = require('./sync-capability');
 const { probeSftp: defaultSftpProbe } = require('./sftp-probe');
+const { toDisplayHost, toDisplayAddress } = require('./host-name');
 
 const API_GREEN = new Set(['ok', 'degraded']);
 // The SFTP outcomes that mean "nothing answered as SFTP here" — set aside on a server without sync.
@@ -38,14 +39,23 @@ function apiIsGreen(api) { return !!(api && API_GREEN.has(api.kind)); }
 // What the screen needs of the API leg: the kind, the host, where a redirect came from, and the two facts
 // its sentences turn on (the address is on this computer; plain http was used because the server offers no
 // https). Never the normalised origin (main keeps that for the write) and never anything else the probe may
-// carry.
+// carry. Hosts are shown in their readable form — except a redirect's landing: a name the server chose, not
+// the person, is shown exactly as the network spells it (the ASCII form), so a look-alike name can never
+// pass for the one that was typed.
 function apiForScreen(api) {
   const out = { kind: api.kind };
-  if (typeof api.host === 'string') out.host = api.host;
-  if (typeof api.from === 'string') out.from = api.from;
+  const redirected = typeof api.from === 'string';
+  if (typeof api.host === 'string') out.host = redirected ? api.host : toDisplayAddress(api.host);
+  if (redirected) out.from = toDisplayAddress(api.from);
   if (api.loopback === true) out.loopback = true;
   if (api.plainHttp === true) out.plainHttp = true;
   return out;
+}
+
+// The SFTP leg's host for the screen, in the readable form. The endpoint that is saved travels apart, in the
+// ASCII form it was probed with.
+function sftpHostForScreen(host) {
+  return typeof host === 'string' && !host.includes(':') ? toDisplayHost(host) : host;
 }
 
 /** The outcome for a verify that itself failed (a bug or an unexpected throw), fail-closed. */
@@ -84,7 +94,7 @@ async function verifySetup(fields, { httpJson, probeSftp = defaultSftpProbe, pro
   const [{ api, sync }, sftpRaw] = await Promise.all([apiLeg, sftpLeg]);
   // Only what the screen shows travels: never the host-key line itself (the pin comes from the vault's
   // authenticated answer at sync time, not from this probe), never a raw error.
-  let sftp = { kind: sftpRaw.kind, host: sftpRaw.host, port: sftpRaw.port };
+  let sftp = { kind: sftpRaw.kind, host: sftpHostForScreen(sftpRaw.host), port: sftpRaw.port };
   if (sftpRaw.kind === 'ok') sftp.fingerprint = sftpRaw.fingerprint;
   const syncUnsupported = sync.kind === 'unsupported';
   if (syncUnsupported && SFTP_ABSENT.has(sftp.kind)) sftp = { ...sftp, kind: 'not-needed' };

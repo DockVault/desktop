@@ -18,7 +18,8 @@
  * a bug is never read as "your connection is down".
  */
 
-const { formatSftpEndpoint } = require('./sftp-endpoint');
+const { formatSftpEndpoint, displaySftpEndpoint } = require('./sftp-endpoint');
+const { toDisplayHost } = require('./host-name');
 const { apiIsGreen, failedVerify } = require('./setup-verify');
 
 const LEG_SERVER = 'Server';
@@ -123,6 +124,12 @@ function verdictOf(verify) {
 // Each check: { id, title, describe(io) -> picture, probe(io) -> result }. `describe` is synchronous and
 // reads only what is saved; `probe` reaches out. Both hand back the generic shapes the page renders.
 
+// A host written in another script is shown readable, followed by the ASCII form the network uses, so the
+// address can be compared with either spelling a person was given.
+function withAsciiForm(text, shownHost, asciiHost) {
+  return shownHost !== asciiHost ? `${text} (${asciiHost})` : text;
+}
+
 // The saved origin as an address a person can compare with what they were given: always with its port, so
 // the "API port" is never implied; a plain-http loopback (a development server) says so.
 function addressText(origin) {
@@ -130,8 +137,14 @@ function addressText(origin) {
     const u = new URL(origin);
     const http = u.protocol === 'http:';
     const port = u.port || (http ? '80' : '443');
-    return `${http ? 'http://' : ''}${u.hostname}:${port}`;
+    const shown = toDisplayHost(u.hostname);
+    return withAsciiForm(`${http ? 'http://' : ''}${shown}:${port}`, shown, u.hostname);
   } catch { return String(origin); }
+}
+
+function sftpAddressText(endpoint) {
+  const shown = displaySftpEndpoint(endpoint);
+  return withAsciiForm(shown, shown, formatSftpEndpoint(endpoint));
 }
 
 const INTRO = "Tries both of your server's doors from this computer, without signing in: the server address (signing in, browsing) and the file transfer address (syncing folders).";
@@ -151,7 +164,7 @@ const serverConnection = {
     const env = state.status === 'env';
     const facts = [
       { label: 'Server address', value: addressText(state.origin), mono: true },
-      { label: 'File transfer address', value: state.sftp ? formatSftpEndpoint(state.sftp) : 'not saved', mono: !!state.sftp },
+      { label: 'File transfer address', value: state.sftp ? sftpAddressText(state.sftp) : 'not saved', mono: !!state.sftp },
     ];
     if (env) facts.push({ label: 'Set by', value: state.envOverrides ? 'the DOCKVAULT_SERVER environment variable, overriding the saved setting' : 'the DOCKVAULT_SERVER environment variable', mono: false });
     return {
