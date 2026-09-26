@@ -35,12 +35,16 @@ const SFTP_ABSENT = new Set(['empty', 'malformed', 'unreachable', 'not-ssh', 'ss
 
 function apiIsGreen(api) { return !!(api && API_GREEN.has(api.kind)); }
 
-// What the screen needs of the API leg: the kind, the host, and where a redirect came from. Never the
-// normalised origin (main keeps that for the write) and never anything else the probe may carry.
+// What the screen needs of the API leg: the kind, the host, where a redirect came from, and the two facts
+// its sentences turn on (the address is on this computer; plain http was used because the server offers no
+// https). Never the normalised origin (main keeps that for the write) and never anything else the probe may
+// carry.
 function apiForScreen(api) {
   const out = { kind: api.kind };
   if (typeof api.host === 'string') out.host = api.host;
   if (typeof api.from === 'string') out.from = api.from;
+  if (api.loopback === true) out.loopback = true;
+  if (api.plainHttp === true) out.plainHttp = true;
   return out;
 }
 

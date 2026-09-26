@@ -109,14 +109,21 @@
   // The API leg's sentence. Only the host of the normalised origin is ever shown, never an error.
   function apiSentence(outcome) {
     const host = (outcome && outcome.host) || '';
+    // Said whenever plain http was used without the person asking for it (a server on this computer that
+    // offers no https).
+    const plain = outcome && outcome.plainHttp ? " It doesn't offer HTTPS, so DockVault uses plain HTTP — allowed only for a server on this computer." : '';
     switch (outcome && outcome.kind) {
-      case 'ok': return outcome.from && outcome.from !== host ? `${outcome.from} sent us to ${host} — that's a DockVault server.` : `${host} is a DockVault server.`;
-      case 'degraded': return `${host} is a DockVault server, but it reports a problem — signing in may still work.`;
+      case 'ok': return (outcome.from && outcome.from !== host ? `${outcome.from} sent us to ${host} — that's a DockVault server.` : `${host} is a DockVault server.`) + plain;
+      case 'degraded': return `${host} is a DockVault server, but it reports a problem — signing in may still work.${plain}`;
       case 'http-refused': return 'DockVault connects over https only. Change http:// to https://.';
       case 'malformed': return "That doesn't look like a server address.";
       case 'empty': return 'Enter your server address.';
       case 'unreachable': return `Couldn't reach ${host}. Check the address and your connection.`;
       case 'tls-untrusted': return "This server's certificate isn't trusted by this computer, so DockVault won't connect. Ask your administrator to install the certificate on this computer.";
+      // Something answered, but not over HTTPS: there is no certificate involved, so none is mentioned.
+      case 'tls-not-offered': return outcome.loopback
+        ? `${host} answered, but not over HTTPS. If it's a test server on this computer that uses plain HTTP, enter http://${host}.`
+        : `${host} answered, but not over HTTPS. A server on another computer must offer HTTPS — check the address and port with whoever runs it.`;
       case 'not-dockvault': return "That address answers, but it isn't a DockVault server. Check the address with whoever runs it.";
       case 'redirected': return 'That address redirects somewhere else. Enter the address it lands on.';
       default: return "Couldn't check that server.";
@@ -195,6 +202,7 @@
         say('', null); setButton('Check', false); break;
       case 'unreachable':
       case 'tls-untrusted':
+      case 'tls-not-offered':
       case 'not-dockvault':
       case 'redirected':
         say('', null);

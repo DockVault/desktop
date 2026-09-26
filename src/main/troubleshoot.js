@@ -48,6 +48,10 @@ function apiSentence(api, hints = HINTS.saved) {
     case 'degraded': return `${host} answered as a DockVault server, but it reports a problem on its side. Signing in may still work; if it doesn't, ask ${ADMIN}.`;
     case 'unreachable': return `Nothing answered at ${host}. Check that this computer is online and the server is up, and that nothing between them (a firewall, a VPN) is in the way.`;
     case 'tls-untrusted': return `${host} answered, but its certificate isn't trusted by this computer, so DockVault won't connect to it. Ask ${ADMIN} to install its certificate on this computer.`;
+    // Something answered, but not over HTTPS: there is no certificate involved, so none is mentioned.
+    case 'tls-not-offered': return api.loopback
+      ? `${host} answered, but not over HTTPS. If it's a test server on this computer that uses plain HTTP, its address needs http:// in front. ${hints.change}`
+      : `${host} answered, but not over HTTPS, so DockVault won't connect to it. Its HTTPS may be switched off or on another port — ask ${ADMIN}.`;
     case 'not-dockvault': return `Something answered at ${host}, but not a DockVault server. The saved address may be wrong, or the server may have moved. ${hints.change}`;
     case 'redirected': return `${host} now sends DockVault somewhere else. The server may have moved — ${hints.landing}`;
     case 'http-refused': case 'malformed': case 'empty': return `The saved server address isn't usable. ${hints.change}`;

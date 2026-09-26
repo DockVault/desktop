@@ -145,7 +145,7 @@ test('a server reporting a problem on its side is amber, not green — on its le
 });
 
 test('a server that answers wrongly is not called unreachable', async () => {
-  for (const kind of ['tls-untrusted', 'not-dockvault', 'redirected']) {
+  for (const kind of ['tls-untrusted', 'tls-not-offered', 'not-dockvault', 'redirected']) {
     const { view } = make({ verify: async () => ({ api: { kind, host: 'vault.example.com' }, sync: { kind: 'not-checked' }, sftp: { kind: 'ok', host: 'vault.example.com', port: 2222, fingerprint: 'SHA256:abc' }, proceed: false }) });
     const r = await view.probe('server-connection');
     assert.equal(r.verdict.state, 'bad');
@@ -222,7 +222,7 @@ test('a check whose describe or probe throws is contained', async () => {
 test('verdicts cover every combination the verify can produce, and green needs both doors proven', () => {
   const api = { kind: 'ok', host: 'h' };
   const SFTP_KINDS = ['ok', 'not-needed', 'empty', 'malformed', 'unreachable', 'not-ssh', 'ssh-unsupported', 'host-key-unverified', 'failed'];
-  const API_KINDS = ['ok', 'degraded', 'unreachable', 'tls-untrusted', 'not-dockvault', 'redirected', 'http-refused', 'malformed', 'empty', 'failed'];
+  const API_KINDS = ['ok', 'degraded', 'unreachable', 'tls-untrusted', 'tls-not-offered', 'not-dockvault', 'redirected', 'http-refused', 'malformed', 'empty', 'failed'];
   for (const a of API_KINDS) for (const s of SFTP_KINDS) {
     const v = verdictOf({ api: { kind: a, host: 'h' }, sftp: { kind: s, host: 'h', port: 1 } });
     assert.ok(['ok', 'partial', 'bad'].includes(v.state) && v.text.length > 20, `${a}/${s}`);
@@ -241,7 +241,7 @@ test('verdicts cover every combination the verify can produce, and green needs b
 test('every leg kind has its own sentence in the house voice, and the leg states follow the kinds', () => {
   const api = { host: 'vault.example.com', from: 'old.example.com' };
   const seen = new Set();
-  for (const kind of ['ok', 'degraded', 'unreachable', 'tls-untrusted', 'not-dockvault', 'redirected', 'http-refused', 'failed', 'something-new']) {
+  for (const kind of ['ok', 'degraded', 'unreachable', 'tls-untrusted', 'tls-not-offered', 'not-dockvault', 'redirected', 'http-refused', 'failed', 'something-new']) {
     const t = apiSentence({ ...api, kind });
     assert.ok(t.length > 15 && !seen.has(t), `${kind}: ${t}`);
     seen.add(t);
@@ -258,6 +258,13 @@ test('every leg kind has its own sentence in the house voice, and the leg states
     seen2.add(t);
     assert.equal(sftpState({ kind }), kind === 'ok' ? 'ok' : kind === 'not-needed' ? 'skip' : 'bad');
   }
+  // A server that answers without HTTPS: its own words, with no certificate in them, for this computer and for another.
+  const local = apiSentence({ kind: 'tls-not-offered', host: 'localhost:8290', loopback: true });
+  const remote = apiSentence({ kind: 'tls-not-offered', host: 'vault.example.com' });
+  assert.match(local, /^localhost:8290 answered, but not over HTTPS\. If it's a test server on this computer that uses plain HTTP, its address needs http:\/\/ in front\. Use Change server…/);
+  assert.match(apiSentence({ kind: 'tls-not-offered', host: 'localhost:8290', loopback: true }, HINTS.env), /DOCKVAULT_SERVER/);
+  assert.match(remote, /^vault.example.com answered, but not over HTTPS, so DockVault won't connect to it\. .*ask whoever runs your server\.$/);
+  for (const t of [local, remote]) assert.doesNotMatch(t, /certificate/i);
   assert.match(sftpSentence({ host: '::1', port: 22, kind: 'unreachable' }), /\[::1\]:22/);
   assert.match(sftpSentence({ ...sftp, kind: 'empty' }), /Use Change server… to add one/);
   assert.match(sftpSentence({ ...sftp, kind: 'empty' }, HINTS.env), /DOCKVAULT_SERVER/);

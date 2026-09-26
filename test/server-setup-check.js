@@ -23,7 +23,10 @@
  *      support syncing" sentence, Connect allowed, saved with no endpoint;
  *   L) the SFTP suggestion follows the server host while the field still holds the screen's own suggestion
  *      (a changed port is kept), stops once a host of the person's own is typed, and in change mode the
- *      previous server's address is replaced as soon as a different server host is typed.
+ *      previous server's address is replaced as soon as a different server host is typed;
+ *   M) a DockVault stub on plain http typed without a scheme → the https attempt gets no TLS back, the one http
+ *      retry connects, the light says plain HTTP was used, and the http origin is saved;
+ *   N) the same stub typed with https:// → no retry, the "not over HTTPS" sentence, never a certificate one.
  * Writes .local/server-setup-check.json and prints one PASS/FAIL line. Exit 0 = PASS.
  *
  *   node_modules/electron/dist/electron.exe test/server-setup-check.js
@@ -307,7 +310,31 @@ app.whenReady().then(async () => {
     out.L_pass = out.L_follow === true && out.L_change === true;
   }
 
-  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'];
+  // M) a DockVault server on plain http on this computer, typed WITHOUT a scheme: the https attempt gets no TLS
+  //    back (Chromium's own error, through Electron net), the one http retry answers, the light says plain HTTP
+  //    was used, and Connect saves the http origin.
+  {
+    const stub = await serve({ status: 'healthy', database: 'connected' });
+    const dir = fresh();
+    const r = await scenario('M_plainHttpRetry', { dir, stub, drive: async (win, ctx) => ({
+      ui: await win.webContents.executeJavaScript(checkThenConnect(stub.host, SFTP_ADDR), true), saved: serverConfig.readSavedServer(dir), opened: ctx.saved.length,
+    }) });
+    const f = r.ui.first; const s = r.ui.second;
+    out.M_pass = !!s && f.api === 'ok' && f.apiWhat === `${stub.host} is a DockVault server. It doesn't offer HTTPS, so DockVault uses plain HTTP — allowed only for a server on this computer.`
+      && f.sftp === 'ok' && s.line === `Connected to ${stub.host}.` && r.saved.status === 'ok' && r.saved.origin === stub.origin && r.opened === 1;
+    stub.srv.close();
+  }
+  // N) the same server typed WITH https: no retry, and the words say "not over HTTPS", never a certificate.
+  {
+    const stub = await serve({ status: 'healthy' });
+    const dir = fresh();
+    const r = await scenario('N_httpsTypedNoTls', { dir, stub, drive: async (win, ctx) => ({ ui: await win.webContents.executeJavaScript(typeAndCheck(`https://${stub.host}`, SFTP_ADDR), true), saved: serverConfig.readSavedServer(dir).status, opened: ctx.saved.length }) });
+    out.N_pass = r.ui.api === 'bad' && r.ui.apiWhat === `${stub.host} answered, but not over HTTPS. If it's a test server on this computer that uses plain HTTP, enter http://${stub.host}.`
+      && !/certificate/i.test(r.ui.apiWhat) && r.ui.button === 'Check again' && r.saved === 'absent' && r.opened === 0;
+    stub.srv.close();
+  }
+
+  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N'];
   out.ok = KEYS.every((k) => out[`${k}_pass`] === true);
   try { await sftp.close(); } catch { /* ignore */ }
   try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }

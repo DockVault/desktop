@@ -63,3 +63,21 @@ test('a front that redirects the health route to another loopback origin: the pr
     assert.deepEqual(r, { kind: 'ok', origin: real.origin, host: new URL(real.origin).host, from: new URL(front.origin).host });
   } finally { front.srv.close(); real.srv.close(); }
 });
+
+test('a plain-http DockVault server on this computer, typed without a scheme: the real https attempt fails without TLS and the one http retry connects', async () => {
+  const seen = [];
+  const { srv, origin } = await serve((req, res) => {
+    seen.push(req.url);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ status: 'healthy' }));
+  });
+  const host = new URL(origin).host;
+  try {
+    const r = await probeServer(host, { httpJson });
+    assert.deepEqual(r, { kind: 'ok', origin, host, plainHttp: true });
+    // Typed WITH https, the same server is not retried: the answer is "not over HTTPS", never a certificate problem.
+    const typed = await probeServer(`https://${host}`, { httpJson });
+    assert.deepEqual(typed, { kind: 'tls-not-offered', origin: `https://${host}`, host, loopback: true });
+    assert.deepEqual(seen, ['/health'], 'only the plain-http request reached the handler');
+  } finally { srv.close(); }
+});

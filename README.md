@@ -109,8 +109,11 @@ sent to, which is usually the server's own name on port 2322, the port a standar
 publishes SFTP on (the server listens on 2222 inside its container, which clients cannot reach). The
 screen suggests that address as you type the server's. Each gets its own light: the server
 must answer as DockVault, and the SFTP address must be reachable and prove its host key. An address
-that cannot be reached, a certificate this computer does not trust, a server that is not DockVault,
-or a port that is not SFTP each get a plain explanation, never a bypass. The check also tells you up
+that cannot be reached, a certificate this computer does not trust, a server that does not offer
+https, a server that is not DockVault, or a port that is not SFTP each get a plain explanation, never a
+bypass. The one exception to https is a test server on this computer: an address such as
+`localhost:8290`, typed without `https://`, that answers only over plain http is used over http, and
+the screen says so. A server on another computer is never reached over plain http. The check also tells you up
 front whether the server supports syncing folders from this computer at all; if it does not, you can
 still connect and use your files, and the SFTP address is not needed. The SFTP address you verified is
 what sync connects to from then on, even when a deployment publishes SFTP on a different port than the
