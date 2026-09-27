@@ -35,10 +35,12 @@ const HINTS = {
 
 // --- Words -------------------------------------------------------------------------------------------
 
+// The SFTP address a leg names, readable, with the ASCII form beside it when the verify says the two differ.
 function endpointText(leg) {
   if (!leg || !leg.host) return 'that address';
   const h = leg.host.includes(':') ? `[${leg.host}]` : leg.host;
-  return `${h}:${leg.port}`;
+  const ascii = typeof leg.ascii === 'string' && leg.ascii && leg.ascii !== leg.host ? ` (${leg.ascii}:${leg.port})` : '';
+  return `${h}:${leg.port}${ascii}`;
 }
 
 // The server leg, as what happened and what to do. Only the host of the normalised origin is ever named.
@@ -126,25 +128,24 @@ function verdictOf(verify) {
 
 // A host written in another script is shown readable, followed by the ASCII form the network uses, so the
 // address can be compared with either spelling a person was given.
-function withAsciiForm(text, shownHost, asciiHost) {
-  return shownHost !== asciiHost ? `${text} (${asciiHost})` : text;
+function withAsciiForm(text, asciiText) {
+  return text !== asciiText ? `${text} (${asciiText})` : text;
 }
 
-// The saved origin as an address a person can compare with what they were given: always with its port, so
-// the "API port" is never implied; a plain-http loopback (a development server) says so.
+// The saved origin as an address a person can compare with what they were given: always with its port, in
+// both spellings, so the "API port" is never implied; a plain-http loopback (a development server) says so.
 function addressText(origin) {
   try {
     const u = new URL(origin);
-    const http = u.protocol === 'http:';
-    const port = u.port || (http ? '80' : '443');
+    const scheme = u.protocol === 'http:' ? 'http://' : '';
+    const port = u.port || (scheme ? '80' : '443');
     const shown = toDisplayHost(u.hostname);
-    return withAsciiForm(`${http ? 'http://' : ''}${shown}:${port}`, shown, u.hostname);
+    return withAsciiForm(`${scheme}${shown}:${port}`, `${scheme}${u.hostname}:${port}`);
   } catch { return String(origin); }
 }
 
 function sftpAddressText(endpoint) {
-  const shown = displaySftpEndpoint(endpoint);
-  return withAsciiForm(shown, shown, formatSftpEndpoint(endpoint));
+  return withAsciiForm(displaySftpEndpoint(endpoint), formatSftpEndpoint(endpoint));
 }
 
 const INTRO = "Tries both of your server's doors from this computer, without signing in: the server address (signing in, browsing) and the file transfer address (syncing folders).";

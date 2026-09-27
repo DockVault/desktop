@@ -6,7 +6,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { normalizeInput, probeServer, failureKind, plainHttpOrigin, TLS_CODES, NO_TLS_CODES } = require('../src/main/server-probe');
+const { normalizeInput, probeServer, failureKind, plainHttpOrigin, plainHttpAddress, TLS_CODES, NO_TLS_CODES } = require('../src/main/server-probe');
 
 const reply = (ok, status, body) => ({ ok, status, json: async () => { if (body === 'not json') throw new SyntaxError('x'); return body; } });
 const fetchWith = (fn) => async (url, init) => fn(url, init);
@@ -128,6 +128,44 @@ test('the classifier: a plain-http answer is tls-not-offered in both Node and Ch
   assert.equal(failureKind(Object.assign(new Error('write EPROTO'), { code: 'EPROTO' })), 'unreachable');
 });
 
+test('the classifier: each not-TLS code decides on its own, with no reason anywhere in the message', () => {
+  // Written out rather than read from NO_TLS_CODES, so dropping a code from the set is caught here.
+  for (const code of ['ERR_SSL_WRONG_VERSION_NUMBER', 'ERR_SSL_PACKET_LENGTH_TOO_LONG', 'ERR_SSL_UNKNOWN_PROTOCOL']) {
+    assert.equal(failureKind(Object.assign(new Error('boom'), { code })), 'tls-not-offered', `${code} on the error`);
+    assert.equal(failureKind(Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('boom'), { code }) })), 'tls-not-offered', `${code} on the cause`);
+  }
+});
+
+test('the classifier: a server that DID speak TLS and then failed the handshake is never "not over HTTPS"', () => {
+  // An alert or a refused protocol version comes from a TLS server: no retry over http may follow it.
+  const nodeTlsFailure = (code, reason) => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error(`C03B0000:error:0A000410:SSL routines:ssl3_read_bytes:${reason}:ssl/record/rec_layer_s3.c:907:SSL alert number 40`), { code }) });
+  const failures = [
+    nodeTlsFailure('ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE', 'sslv3 alert handshake failure'),
+    nodeTlsFailure('ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION', 'tlsv1 alert protocol version'),
+    nodeTlsFailure('ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR', 'tlsv1 alert internal error'),
+    nodeTlsFailure('ERR_SSL_UNSUPPORTED_PROTOCOL', 'unsupported protocol'),
+    nodeTlsFailure('ERR_SSL_NO_PROTOCOLS_AVAILABLE', 'no protocols available'),
+    Object.assign(new Error('write EPROTO C0:error:0A000410:SSL routines:ssl3_read_bytes:sslv3 alert handshake failure:ssl/record/rec_layer_s3.c:907:'), { code: 'EPROTO' }),
+    Object.assign(new Error('write EPROTO C0:error:10000410:SSL routines:OPENSSL_internal:SSLV3_ALERT_HANDSHAKE_FAILURE:ssl/tls_record.cc:592:'), { code: 'EPROTO' }),
+    chromiumError('ERR_SSL_VERSION_OR_CIPHER_MISMATCH'),
+    chromiumError('ERR_SSL_CLIENT_AUTH_CERT_NEEDED'),
+    chromiumError('ERR_BAD_SSL_CLIENT_AUTH_CERT'),
+  ];
+  for (const e of failures) assert.notEqual(failureKind(e), 'tls-not-offered', (e.cause || e).message);
+});
+
+test('the classifier: a Chromium certificate name wins over the not-TLS name, wherever each appears', () => {
+  const both = [
+    Object.assign(chromiumError('ERR_SSL_PROTOCOL_ERROR'), { cause: chromiumError('ERR_CERT_AUTHORITY_INVALID') }),
+    Object.assign(chromiumError('ERR_CERT_DATE_INVALID'), { cause: chromiumError('ERR_SSL_PROTOCOL_ERROR') }),
+    new Error('net::ERR_SSL_PROTOCOL_ERROR after net::ERR_CERT_COMMON_NAME_INVALID'),
+    // A not-TLS code or reason beside a certificate name: the certificate still decides.
+    Object.assign(new Error('net::ERR_CERT_AUTHORITY_INVALID'), { code: 'ERR_SSL_WRONG_VERSION_NUMBER' }),
+    Object.assign(new Error('write EPROTO SSL routines::wrong version number net::ERR_CERT_INVALID'), { code: 'EPROTO' }),
+  ];
+  for (const e of both) assert.equal(failureKind(e), 'tls-untrusted', e.message);
+});
+
 test('the classifier: every certificate problem is still tls-untrusted, in both spellings, and a certificate code wins', () => {
   const certs = [
     nodeCertError('DEPTH_ZERO_SELF_SIGNED_CERT', 'self-signed certificate'),
@@ -186,12 +224,31 @@ test('a server on this computer typed without a scheme that answers without TLS 
 });
 
 test('the http retry is never taken for a remote address, nor for an address typed with a scheme, nor for any other failure', async () => {
-  for (const typed of ['vault.example.com:8290', 'vault.example.com', 'https://vault.example.com:8290', '192.168.1.20:8290', 'localhost.example.com:8290']) {
+  const neverRetried = [
+    'vault.example.com:8290', 'vault.example.com', 'https://vault.example.com:8290', '192.168.1.20:8290', 'localhost.example.com:8290',
+    // Names built to read as this computer while naming another one, or to slip a second host past the parser.
+    'localhost.evil.example', '127.0.0.1.nip.io', 'localhost.:8290', 'localhost..:8290', 'localhost@evil.example:8290',
+    'localhost:8290@evil.example', 'localhost%2eevil.example', '[::ffff:127.0.0.1]', '127.0.0.2', 'http:/localhost:8290',
+  ];
+  for (const typed of neverRetried) {
     const { httpJson, calls } = twoDoors({ https: noTls, http: HEALTHY });
     const r = await probeServer(typed, { httpJson });
     assert.equal(calls.length, 1, `${typed}: one request, over https only`);
     assert.ok(calls[0].startsWith('https://'), typed);
     assert.deepEqual([r.kind, r.loopback], ['tls-not-offered', false], typed);
+    assert.ok(r.origin.startsWith('https://'), typed);
+    assert.equal('plainHttpAddress' in r, false, `${typed}: no plain-http suggestion for another computer`);
+  }
+  // Spellings that ARE this computer are retried, and the retry only ever goes to this computer.
+  const LOOPBACK_HTTP = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):\d+\/health$/;
+  const thisComputer = ['LOCALHOST', 'evil.example@localhost', '[0:0:0:0:0:0:0:1]', '127.1', '2130706433', '0x7f000001',
+    'ｌｏｃａｌｈｏｓｔ', 'ⓛⓞⓒⓐⓛⓗⓞⓢⓣ', 'local\thost'];
+  for (const typed of thisComputer) {
+    const { httpJson, calls } = twoDoors({ https: noTls, http: HEALTHY });
+    const r = await probeServer(typed, { httpJson });
+    assert.equal(calls.length, 2, JSON.stringify(typed));
+    assert.match(calls[1], LOOPBACK_HTTP, JSON.stringify(typed));
+    assert.deepEqual([r.kind, r.plainHttp], ['ok', true], JSON.stringify(typed));
   }
   // A scheme the person typed is kept, on this computer too.
   for (const typed of ['https://localhost:8290', 'https://127.0.0.1:8290', 'https://[::1]:8290']) {
@@ -211,20 +268,62 @@ test('the http retry is never taken for a remote address, nor for an address typ
   }
 });
 
-test('the http retry: nothing on http keeps the https outcome, something that is not DockVault says so', async () => {
-  const silent = twoDoors({ https: noTls, http: () => { throw chromiumError('ERR_CONNECTION_REFUSED'); } });
-  const a = await probeServer('localhost:8290', { httpJson: silent.httpJson });
-  assert.deepEqual(a, { kind: 'tls-not-offered', origin: 'https://localhost:8290', host: 'localhost:8290', loopback: true });
-  const other = twoDoors({ https: noTls, http: () => ({ ok: true, status: 200, json: async () => ({ hello: 'world' }) }) });
-  const b = await probeServer('localhost:8290', { httpJson: other.httpJson });
-  assert.deepEqual(b, { kind: 'not-dockvault', origin: 'http://localhost:8290', host: 'localhost:8290' });
-  // A local http server that redirects: said against what the person typed.
+test('the http retry: only a DockVault answer is taken; anything else keeps the https outcome and its plain-http suggestion', async () => {
+  const TYPED_OUTCOME = { kind: 'tls-not-offered', origin: 'https://localhost:8290', host: 'localhost:8290', loopback: true, plainHttpAddress: 'http://localhost:8290' };
+  const redirectTo = (landing) => () => ({ ok: true, status: 200, url: landing, json: async () => HEALTHY });
+  const answers = {
+    'nothing on http': () => { throw chromiumError('ERR_CONNECTION_REFUSED'); },
+    'no TLS on http either': noTls,
+    'not DockVault': () => ({ ok: true, status: 200, json: async () => ({ hello: 'world' }) }),
+    'an error status': () => ({ ok: false, status: 400, json: async () => ({}) }),
+    // A redirect onto plain http on another computer: never "Change http:// to https://" for an address the
+    // person typed without http://.
+    'a redirect onto remote http': redirectTo('http://vault.example.com/health'),
+    'a redirect onto something that is not an address': redirectTo('ftp://localhost/health'),
+    'a redirect that cannot be followed': () => { throw new TypeError('fetch failed: redirect count exceeded'); },
+    'a redirect onto https with a certificate problem': () => { throw chromiumError('ERR_CERT_AUTHORITY_INVALID'); },
+    'a timeout': () => { throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }); },
+  };
+  for (const [what, http] of Object.entries(answers)) {
+    const { httpJson, calls } = twoDoors({ https: noTls, http });
+    const r = await probeServer('localhost:8290', { httpJson });
+    assert.deepEqual(calls, ['https://localhost:8290/health', 'http://localhost:8290/health'], what);
+    assert.deepEqual(r, TYPED_OUTCOME, what);
+  }
+  // A local http server that redirects to another local http origin: said against what the person typed.
   const moved = async (url) => {
     if (url.startsWith('https:')) noTls();
     return { ok: true, status: 200, url: 'http://127.0.0.1:9000/health', json: async () => HEALTHY };
   };
   const c = await probeServer('localhost:8290', { httpJson: moved });
   assert.deepEqual(c, { kind: 'ok', origin: 'http://127.0.0.1:9000', host: '127.0.0.1:9000', from: 'localhost:8290', plainHttp: true });
+  // A local http server that sends the check on to https: saved over https, and plain http is not mentioned.
+  const upgraded = async (url) => {
+    if (url.startsWith('https://localhost:8290')) noTls();
+    return { ok: true, status: 200, url: 'https://localhost:9443/health', json: async () => ({ status: 'degraded' }) };
+  };
+  const u = await probeServer('localhost:8290', { httpJson: upgraded });
+  assert.deepEqual(u, { kind: 'degraded', origin: 'https://localhost:9443', host: 'localhost:9443', from: 'localhost:8290' });
+  assert.equal('plainHttp' in u, false, 'an https landing never carries plainHttp');
+});
+
+test('the plain-http suggestion names the server that answered: the same host, over http, with its port written out', async () => {
+  assert.equal(plainHttpAddress('https://localhost'), 'http://localhost:443', 'a typed "localhost" answered on 443, not 80');
+  assert.equal(plainHttpAddress('https://localhost:8290'), 'http://localhost:8290');
+  assert.equal(plainHttpAddress('https://127.0.0.1:80'), 'http://127.0.0.1:80', 'the port is written out even where http would imply it');
+  assert.equal(plainHttpAddress('https://[::1]'), 'http://[::1]:443');
+  for (const remote of ['https://vault.example.com', 'https://192.168.1.20:8290', 'http://localhost:8290', 'not a url', '']) {
+    assert.equal(plainHttpAddress(remote), null, remote);
+  }
+  // Through the probe: typed without a port and without a scheme, the retry found nothing; the suggestion is 443.
+  const { httpJson } = twoDoors({ https: noTls, http: () => { throw chromiumError('ERR_CONNECTION_REFUSED'); } });
+  assert.equal((await probeServer('localhost', { httpJson })).plainHttpAddress, 'http://localhost:443');
+  // Typed with https:// there is no retry, and the suggestion keeps the port that was typed.
+  const typed = twoDoors({ https: noTls, http: HEALTHY });
+  assert.equal((await probeServer('https://127.0.0.1:8290', { httpJson: typed.httpJson })).plainHttpAddress, 'http://127.0.0.1:8290');
+  // A remote address gets no plain-http suggestion at all.
+  const remote = twoDoors({ https: noTls, http: HEALTHY });
+  assert.equal('plainHttpAddress' in (await probeServer('vault.example.com:8290', { httpJson: remote.httpJson })), false);
 });
 
 test('the plain-http address is only ever built for this computer', () => {

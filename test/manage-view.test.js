@@ -212,3 +212,29 @@ test('the model: a transfer in flight rides on the card as numbers only (counts,
   assert.deepEqual(photos.local.progress, progress, 'the progress numbers are carried through untouched');
   assert.doesNotMatch(JSON.stringify(photos.local.progress), /Photos|home/, 'nothing but numbers');
 });
+
+// The page says which server this computer syncs with: a readable name comes with its ASCII form beside it, so a
+// name that only looks like another cannot pass for it. io.endpoint() hands over the ASCII forms, as saved.
+test('the server and the SFTP address are shown readable, with the ASCII form beside them whenever the two differ', async () => {
+  const GREEK = 'τεστ';
+  const GREEK_ASCII = 'xn--qxa2abc';
+  const h = harness({ endpoint: () => ({ serverHost: `${GREEK_ASCII}:8443`, sftp: { host: GREEK_ASCII, port: 2322 } }) });
+  const m = await h.view.model();
+  assert.equal(m.serverHost, `${GREEK}:8443 (${GREEK_ASCII}:8443)`);
+  assert.equal(m.remoteHost, `${GREEK}:2322 (${GREEK_ASCII}:2322)`);
+  assert.equal(m.computers[0].vaults[0].remote, `${GREEK}:2322/vault_${V1} (${GREEK_ASCII}:2322)`);
+  // The whole-script look-alike: all Cyrillic, reads as "apple"; the ASCII form is on the page beside it.
+  const lookalike = 'xn--80ak6aa92e.com';
+  const l = await harness({ endpoint: () => ({ serverHost: lookalike, sftp: null }) }).view.model();
+  assert.equal(l.serverHost, `аррӏе.com (${lookalike})`);
+  assert.equal(l.remoteHost, `аррӏе.com (${lookalike})`, 'with no SFTP address saved, the server stands in for it');
+  // A slash look-alike is never shown readable at all.
+  const slash = 'paypal.xn--comlogin-0f7d.evil.io';
+  assert.equal((await harness({ endpoint: () => ({ serverHost: slash, sftp: { host: slash, port: 2322 } }) }).view.model()).remoteHost, `${slash}:2322`);
+  // An IPv6 SFTP host keeps its brackets; nothing is added to a plain name.
+  const v6 = await harness({ endpoint: () => ({ serverHost: '[::1]:8290', sftp: { host: '::1', port: 2322 } }) }).view.model();
+  assert.deepEqual([v6.serverHost, v6.remoteHost], ['[::1]:8290', '[::1]:2322']);
+  // An endpoint the view cannot read is never shown half-made.
+  const none = await harness({ endpoint: () => null }).view.model();
+  assert.deepEqual([none.serverHost, none.remoteHost], ['', '']);
+});

@@ -77,7 +77,7 @@ test('a plain-http DockVault server on this computer, typed without a scheme: th
     assert.deepEqual(r, { kind: 'ok', origin, host, plainHttp: true });
     // Typed WITH https, the same server is not retried: the answer is "not over HTTPS", never a certificate problem.
     const typed = await probeServer(`https://${host}`, { httpJson });
-    assert.deepEqual(typed, { kind: 'tls-not-offered', origin: `https://${host}`, host, loopback: true });
+    assert.deepEqual(typed, { kind: 'tls-not-offered', origin: `https://${host}`, host, loopback: true, plainHttpAddress: `http://${host}` });
     assert.deepEqual(seen, ['/health'], 'only the plain-http request reached the handler');
   } finally { srv.close(); }
 });

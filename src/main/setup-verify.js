@@ -28,7 +28,7 @@ const serverProbe = require('./server-probe');
 const { parseSftpEndpoint } = require('./sftp-endpoint');
 const { probeSyncCapability: defaultSyncProbe } = require('./sync-capability');
 const { probeSftp: defaultSftpProbe } = require('./sftp-probe');
-const { toDisplayHost, toDisplayAddress } = require('./host-name');
+const { toDisplayHost, addressWithAscii } = require('./host-name');
 
 const API_GREEN = new Set(['ok', 'degraded']);
 // The SFTP outcomes that mean "nothing answered as SFTP here" — set aside on a server without sync.
@@ -36,26 +36,37 @@ const SFTP_ABSENT = new Set(['empty', 'malformed', 'unreachable', 'not-ssh', 'ss
 
 function apiIsGreen(api) { return !!(api && API_GREEN.has(api.kind)); }
 
-// What the screen needs of the API leg: the kind, the host, where a redirect came from, and the two facts
-// its sentences turn on (the address is on this computer; plain http was used because the server offers no
-// https). Never the normalised origin (main keeps that for the write) and never anything else the probe may
-// carry. Hosts are shown in their readable form — except a redirect's landing: a name the server chose, not
-// the person, is shown exactly as the network spells it (the ASCII form), so a look-alike name can never
-// pass for the one that was typed.
+// What the screen needs of the API leg: the kind, the host, where a redirect came from, and the facts its
+// sentences turn on (the address is on this computer, with the plain-http address to suggest for it; plain
+// http was used because the server offers no https). Never the normalised origin (main keeps that for the
+// write) and never anything else the probe may carry. This is where a person confirms which server they are
+// trusting, so a host with a readable form is shown with its ASCII form beside it whenever the two differ
+// ("τεστ (xn--qxa2abc)"): a name that only looks like another one is exposed by the ASCII form. A redirect's
+// landing, a name the server chose rather than the person, is shown in the ASCII form alone.
 function apiForScreen(api) {
   const out = { kind: api.kind };
   const redirected = typeof api.from === 'string';
-  if (typeof api.host === 'string') out.host = redirected ? api.host : toDisplayAddress(api.host);
-  if (redirected) out.from = toDisplayAddress(api.from);
-  if (api.loopback === true) out.loopback = true;
+  if (typeof api.host === 'string') out.host = redirected ? api.host : addressWithAscii(api.host);
+  if (redirected) out.from = addressWithAscii(api.from);
+  if (api.loopback === true) {
+    out.loopback = true;
+    if (typeof api.plainHttpAddress === 'string') out.plainHttpAddress = api.plainHttpAddress;
+  }
   if (api.plainHttp === true) out.plainHttp = true;
   return out;
 }
 
-// The SFTP leg's host for the screen, in the readable form. The endpoint that is saved travels apart, in the
-// ASCII form it was probed with.
-function sftpHostForScreen(host) {
-  return typeof host === 'string' && !host.includes(':') ? toDisplayHost(host) : host;
+// The SFTP leg for the screen: the host in its readable form, and its ASCII form as `ascii` whenever the two
+// differ, so the sentence that says which door answered can give both. The endpoint that is saved travels
+// apart, in the ASCII form it was probed with.
+function sftpForScreen(raw) {
+  const host = raw.host;
+  const out = { kind: raw.kind, host, port: raw.port };
+  if (typeof host === 'string' && host && !host.includes(':')) {
+    const shown = toDisplayHost(host);
+    if (shown !== host) { out.host = shown; out.ascii = host; }
+  }
+  return out;
 }
 
 /** The outcome for a verify that itself failed (a bug or an unexpected throw), fail-closed. */
@@ -94,7 +105,7 @@ async function verifySetup(fields, { httpJson, probeSftp = defaultSftpProbe, pro
   const [{ api, sync }, sftpRaw] = await Promise.all([apiLeg, sftpLeg]);
   // Only what the screen shows travels: never the host-key line itself (the pin comes from the vault's
   // authenticated answer at sync time, not from this probe), never a raw error.
-  let sftp = { kind: sftpRaw.kind, host: sftpHostForScreen(sftpRaw.host), port: sftpRaw.port };
+  let sftp = sftpForScreen(sftpRaw);
   if (sftpRaw.kind === 'ok') sftp.fingerprint = sftpRaw.fingerprint;
   const syncUnsupported = sync.kind === 'unsupported';
   if (syncUnsupported && SFTP_ABSENT.has(sftp.kind)) sftp = { ...sftp, kind: 'not-needed' };

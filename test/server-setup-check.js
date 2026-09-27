@@ -27,7 +27,11 @@
  *   M) a DockVault stub on plain http typed without a scheme → the https attempt gets no TLS back, the one http
  *      retry connects, the light says plain HTTP was used, and the http origin is saved;
  *   N) the same stub typed with https:// → no retry, the "not over HTTPS" sentence, never a certificate one;
- *   O) a server name in another script → the SFTP suggestion shows it as typed, not in its xn-- form.
+ *   O) a server name in another script → the SFTP suggestion shows it as typed, not in its xn-- form;
+ *   P) the same name checked and connected → the server light and the Connected line give it with its ASCII
+ *      form beside it, and the ASCII form is saved;
+ *   Q) look-alike names → a slash look-alike or a mixed-script name is shown in its ASCII form alone, a name
+ *      wholly in one script with its ASCII form beside it; the SFTP suggestion still echoes what was typed.
  * Writes .local/server-setup-check.json and prints one PASS/FAIL line. Exit 0 = PASS.
  *
  *   node_modules/electron/dist/electron.exe test/server-setup-check.js
@@ -70,14 +74,26 @@ function serve(body, { devices = 401 } = {}) {
   });
 }
 
+// A name answered by a loopback stub, so a server name in another script goes through the real page without a
+// lookup: only the exact ASCII form is answered (through the app's own helper), anything else is "not found".
+// The stub's own address is not handed back as the landing, so the name asked for is the name that answered.
+function nameOnStub(stub, asciiHost) {
+  return async (url, init) => {
+    const u = new URL(url);
+    if (u.hostname !== asciiHost) throw new Error('net::ERR_NAME_NOT_RESOLVED');
+    const r = await httpJson(`${stub.origin}${u.pathname}${u.search}`, init);
+    return { ok: r.ok, status: r.status, json: r.json };
+  };
+}
+
 // One fake SFTP server for every scenario that needs a green door, plus one closed port.
 let sftp = null;
 let closedSftp = null;
 
-async function scenario(name, { dir, mode = null, before, drive, stub, pageUrl = null, changeHost, changeSftp }) {
+async function scenario(name, { dir, mode = null, before, drive, stub, pageUrl = null, changeHost, changeSftp, probeHttp = httpJson }) {
   const saved = [];
   const scheduled = [];
-  const setup = createServerSetup({ dir, httpJson, mode: () => mode, changeHost, changeSftp, onSaved: (o) => saved.push(o), schedule: (fn, ms) => { scheduled.push(ms); fn(); } });
+  const setup = createServerSetup({ dir, httpJson: probeHttp, mode: () => mode, changeHost, changeSftp, onSaved: (o) => saved.push(o), schedule: (fn, ms) => { scheduled.push(ms); fn(); } });
   const win = sharedWindow();
   // The same three-leg sender check the app uses, bound to this window.
   const trusted = (e) => isTrustedSetupSender(e, { webContents: win.webContents, appOrigin: APP_ORIGIN, pagePath: schemeMod.SHELL_PATH + SETUP_PAGE });
@@ -344,8 +360,44 @@ app.whenReady().then(async () => {
     }) });
     out.O_pass = r.a === 'τεστ:2322' && r.b === 'τεστ.example.com:2322';
   }
+  // P) a server name in another script, checked and connected: the server light and the Connected line give the
+  //    readable name with the ASCII form beside it, and the ASCII form is what is saved.
+  {
+    const stub = await serve({ status: 'healthy', database: 'connected' });
+    const port = new URL(stub.origin).port;
+    const dir = fresh();
+    const r = await scenario('P_readableWithAscii', { dir, stub, probeHttp: nameOnStub(stub, 'xn--qxa2abc'), drive: async (win, ctx) => ({
+      ui: await win.webContents.executeJavaScript(checkThenConnect(`τεστ:${port}`, SFTP_ADDR), true), saved: serverConfig.readSavedServer(dir), opened: ctx.saved.length,
+    }) });
+    const f = r.ui.first; const s = r.ui.second;
+    out.P_pass = !!s && f.api === 'ok' && f.apiWhat === `τεστ:${port} (xn--qxa2abc:${port}) is a DockVault server.`
+      && s.line === `Connected to τεστ:${port} (xn--qxa2abc:${port}).` && r.saved.status === 'ok' && r.saved.origin === `https://xn--qxa2abc:${port}` && r.opened === 1;
+    stub.srv.close();
+  }
+  // Q) look-alike names: a division slash inside a label, or a name mixing scripts, is shown in its ASCII form
+  //    alone; a name wholly in one script that reads as a Latin one has its ASCII form beside it. The SFTP
+  //    suggestion still echoes what was typed, as it does for every name.
+  {
+    const stub = await serve({ status: 'healthy' });
+    const port = new URL(stub.origin).port;
+    const cases = [
+      { typed: `paypal.com∕login.evil.io:${port}`, ascii: 'paypal.xn--comlogin-0f7d.evil.io', light: `paypal.xn--comlogin-0f7d.evil.io:${port} is a DockVault server.` },
+      { typed: `vauаlt.com:${port}`, ascii: 'xn--vault-6ve.com', light: `xn--vault-6ve.com:${port} is a DockVault server.` },
+      { typed: `аррӏе.com:${port}`, ascii: 'xn--80ak6aa92e.com', light: `аррӏе.com:${port} (xn--80ak6aa92e.com:${port}) is a DockVault server.` },
+    ];
+    const seen = [];
+    for (const [i, c] of cases.entries()) {
+      const dir = fresh();
+      const r = await scenario(`Q_lookalike${i}`, { dir, stub, probeHttp: nameOnStub(stub, c.ascii), drive: async (win) => ({ ui: await win.webContents.executeJavaScript(typeAndCheck(c.typed, SFTP_ADDR), true) }) });
+      const suggested = await sharedWindow().webContents.executeJavaScript(`(async () => { const f = document.getElementById('server'); f.value = ${JSON.stringify(c.typed)}; document.getElementById('sftp').value = ''; f.dispatchEvent(new Event('input', { bubbles: true })); await new Promise(r => setTimeout(r, 30)); return document.getElementById('sftp').value; })()`, true);
+      seen.push(r.ui.api === 'ok' && r.ui.apiWhat === c.light && suggested === `${c.typed.replace(/:\d+$/, '')}:2322`);
+    }
+    out.Q_each = seen;
+    out.Q_pass = seen.length === cases.length && seen.every(Boolean);
+    stub.srv.close();
+  }
 
-  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O'];
+  const KEYS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q'];
   out.ok = KEYS.every((k) => out[`${k}_pass`] === true);
   try { await sftp.close(); } catch { /* ignore */ }
   try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }

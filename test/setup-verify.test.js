@@ -123,3 +123,33 @@ test('the API leg reaching the screen carries a redirect source but never the or
   const f = failedVerify();
   assert.equal(f.api.kind, 'failed'); assert.equal(f.sftp.kind, 'failed'); assert.equal(f.proceed, false); assert.equal(f.endpoint, null);
 });
+
+// The two facts the server light's sentences turn on, and the suggestion that goes with the first, reach the
+// screen exactly when the probe established them — and nothing else the probe carries does.
+test('the API leg carries loopback with its plain-http suggestion, and plainHttp, through to the screen', async () => {
+  const noTls = () => { throw new Error('net::ERR_SSL_PROTOCOL_ERROR'); };
+  const healthy = { ok: true, status: 200, json: async () => ({ status: 'healthy' }) };
+  const devices = { ok: false, status: 401, json: async () => ({}) };
+  // A plain-http server on this computer, typed without a scheme: the retry connected, and the light says so.
+  const plain = async (url) => { if (url.startsWith('https:')) noTls(); return url.endsWith('/health') ? healthy : devices; };
+  const a = await verifySetup({ input: 'localhost:8290', sftp: 'localhost:2322' }, { httpJson: plain, probeSftp: sftpOk });
+  assert.deepEqual(a.api, { kind: 'ok', host: 'localhost:8290', plainHttp: true });
+  assert.equal(a.origin, 'http://localhost:8290');
+  // The same server typed with https://: no retry; the screen learns it is on this computer, and what to type.
+  const b = await verifySetup({ input: 'https://localhost', sftp: '' }, { httpJson: plain, probeSftp: sftpOk });
+  assert.deepEqual(b.api, { kind: 'tls-not-offered', host: 'localhost', loopback: true, plainHttpAddress: 'http://localhost:443' });
+  assert.equal(b.origin, null);
+  // A server on another computer: neither fact, and no plain-http suggestion.
+  const c = await verifySetup({ input: 'vault.example.com', sftp: '' }, { httpJson: async () => noTls(), probeSftp: sftpOk });
+  assert.deepEqual(c.api, { kind: 'tls-not-offered', host: 'vault.example.com' });
+});
+
+test('the screen gets a plain-http suggestion only for a server on this computer, even if the probe offered one otherwise', async () => {
+  const serverProbe = require('../src/main/server-probe');
+  const real = serverProbe.probeServer;
+  serverProbe.probeServer = async () => ({ kind: 'tls-not-offered', origin: 'https://vault.example.com', host: 'vault.example.com', loopback: false, plainHttpAddress: 'http://vault.example.com:443', extra: 'x' });
+  try {
+    const r = await verifySetup({ input: 'vault.example.com', sftp: '' }, { httpJson: server(), probeSftp: sftpOk });
+    assert.deepEqual(r.api, { kind: 'tls-not-offered', host: 'vault.example.com' });
+  } finally { serverProbe.probeServer = real; }
+});

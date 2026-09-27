@@ -39,12 +39,29 @@
  * a confirmation is 'indeterminate': nothing local changes, and the page says the change could not be confirmed.
  */
 
+const { toDisplayAddress, addressWithAscii } = require('./host-name');
+const { formatSftpEndpoint, displaySftpEndpoint } = require('./sftp-endpoint');
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = (v) => typeof v === 'string' && UUID.test(v);
 // A device id is the server's opaque identifier: one bounded, path-safe segment (the client never assumes
 // its format — see device-secret-store.js), compared exactly as the server returned it.
 const DEVICE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const isDeviceId = (v) => typeof v === 'string' && DEVICE_ID.test(v);
+
+// The server and the SFTP address for the page. io.endpoint() hands over the ASCII forms, as saved; each is
+// shown readable, followed by its ASCII form whenever the two differ ("τεστ:2322 (xn--qxa2abc:2322)"): the page
+// says which server this computer syncs with, so a name that only looks like another one must not pass for it.
+// `remote` is the SFTP address (the server's when none is saved); a vault's remote path is written after the
+// readable form, and the ASCII form follows the whole ("τεστ:2322/DockVault/x (xn--qxa2abc:2322)").
+function endpointForPage(ep) {
+  const serverAscii = ep && typeof ep.serverHost === 'string' ? ep.serverHost : '';
+  const sftpAscii = ep && ep.sftp ? formatSftpEndpoint(ep.sftp) : '';
+  const remoteAscii = sftpAscii || serverAscii;
+  const remoteShown = sftpAscii ? displaySftpEndpoint(ep.sftp) : toDisplayAddress(serverAscii);
+  const asciiNote = remoteShown !== remoteAscii ? ` (${remoteAscii})` : '';
+  return { server: addressWithAscii(serverAscii), remote: remoteShown + asciiNote, remoteShown, asciiNote };
+}
 
 // How a vault configured on this computer stands, by the scheduler's own rule (decideMintPath):
 //   'device'      granted to this computer's identity
@@ -69,7 +86,7 @@ function standingOf({ granted, recorded, identityStatus }) {
  *   configured()               -> [{ vaultId, vaultName, localFolder, enabled }]
  *   liveStatus()               -> { vaults: [{ vault, state, reason, running, lastSyncedAt, via, progress }] }
  *   reasonText(live, name)     -> a plain sentence for a vault's live reason, or null
- *   endpoint()                 -> { serverHost, sftp: {host, port}|null }
+ *   endpoint()                 -> { serverHost, sftp: {host, port}|null }   (the ASCII forms, as saved; shown readable here)
  *   remotePathFor(vaultId, via, vaultName) -> the remote directory a run uses
  *   revokeGrant(deviceId, vaultId), revokeDevice(deviceId), deleteDevice(deviceId) -> Promise<{ ok, reason? }>
  *   relocateFolder(vaultId)    -> open main's relocate-or-stop offer for a folder that cannot be found
@@ -101,9 +118,8 @@ function createManageView(io) {
     const live = safe(() => io.liveStatus(), { vaults: [] });
     const liveById = new Map((live.vaults || []).map((v) => [v.vault, v]));
     const liveFor = (id) => liveById.get(id) || liveById.get(String(id).toLowerCase()) || null;
-    const ep = safe(() => io.endpoint(), { serverHost: '', sftp: null });
-    const remoteHost = ep.sftp ? `${ep.sftp.host}:${ep.sftp.port}` : (ep.serverHost || '');
-    const mk = (args) => card({ ...args, remoteHost, identityStatus: me.status, recorded, io });
+    const where = endpointForPage(safe(() => io.endpoint(), { serverHost: '', sftp: null }));
+    const mk = (args) => card({ ...args, where, identityStatus: me.status, recorded, io });
 
     // This computer's vault cards: every grant the server lists for this device, joined with the local
     // configuration; plus configured vaults without an active grant, labelled by their standing.
@@ -161,15 +177,15 @@ function createManageView(io) {
     if (!listed) local = { status: identityOk ? 'not-listed' : me.status, vaults: myVaults || configuredCards() };
     return {
       kind: 'ok',
-      serverHost: ep.serverHost || '',
-      remoteHost,
+      serverHost: where.server,
+      remoteHost: where.remote,
       thisComputer: { deviceId: myId, status: me.status, registered: listed },
       computers,
       local,
     };
   }
 
-  function card({ vaultId, name, grantedAt, granted, cfg, live, remoteHost, identityStatus, recorded, io: o }) {
+  function card({ vaultId, name, grantedAt, granted, cfg, live, where, identityStatus, recorded, io: o }) {
     const rec = recorded(vaultId);
     const standing = standingOf({ granted, recorded: rec === true, identityStatus });
     const via = granted ? 'device' : 'account';
@@ -182,7 +198,7 @@ function createManageView(io) {
       granted,
       grantedAt,
       standing,
-      remote: remotePath ? `${remoteHost}/${remotePath}` : remoteHost,
+      remote: remotePath ? `${where.remoteShown}/${remotePath}${where.asciiNote}` : where.remote,
       local: cfg ? {
         folder: cfg.localFolder, enabled: cfg.enabled !== false,
         state: live ? live.state : null, reason: live ? live.reason : null, running: !!(live && live.running), lastSyncedAt: live ? live.lastSyncedAt : null,

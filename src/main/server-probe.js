@@ -19,7 +19,10 @@
  *                   For an address on this computer typed WITHOUT a scheme, the check is retried once over
  *                   plain http on the same port (loopback http is allowed, as server-config permits); a
  *                   remote address is never retried over http, and neither is one typed with a scheme.
- *                   `loopback` rides along so the screen can say which of the two applies
+ *                   Only a DockVault answer to that retry is taken; any other leaves this outcome standing.
+ *                   `loopback` rides along so the screen can say which of the two applies, and for an
+ *                   address on this computer `plainHttpAddress` ("http://localhost:443": the port written
+ *                   out) is the address the screen may suggest
  *   redirected      the address answers but points elsewhere and the landing could not be reached (the
  *                   check follows a redirect to find the real address; only a chain that never lands,
  *                   or a transport that refuses, ends here), or a REMOTE address redirected onto a
@@ -87,6 +90,16 @@ function plainHttpOrigin(httpsOrigin) {
   } catch { return null; }
 }
 
+// The address the screen may suggest for a server on this computer that answered without TLS: the same host
+// over plain http with its port written out, so the suggestion names the server that answered — typed
+// "localhost" suggests "http://localhost:443", never "http://localhost", which is port 80. Only ever built for
+// a loopback origin, through the same check as the retry.
+function plainHttpAddress(httpsOrigin) {
+  if (!plainHttpOrigin(httpsOrigin)) return null;
+  const u = new URL(httpsOrigin);
+  return `http://${u.hostname}:${u.port || '443'}`;
+}
+
 function errorCode(e) {
   if (!e) return null;
   if (typeof e.code === 'string') return e.code;
@@ -110,16 +123,20 @@ const NO_TLS_MESSAGE = /SSL routines:[^\n]*(?:wrong[ _]version[ _]number|packet[
 // cannot hide a certificate problem. The other ERR_SSL_* names (a version or cipher mismatch, a demand for
 // a client certificate, a pinning failure) come from a server that did speak TLS and stay where they were.
 const CHROMIUM_NO_TLS = /ERR_SSL_PROTOCOL_ERROR/;
+const CHROMIUM_CERT = /ERR_CERT_/;
 const CHROMIUM_TLS = /ERR_CERT_|ERR_SSL_|CERT_/;
 const CHROMIUM_UNREACHABLE = /ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_REFUSED|ERR_CONNECTION_TIMED_OUT|ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED|ERR_ADDRESS_UNREACHABLE|ERR_INTERNET_DISCONNECTED|ERR_NETWORK_CHANGED|ERR_TIMED_OUT|ERR_CONNECTION_ABORTED|ERR_NAME_RESOLUTION_FAILED|ERR_EMPTY_RESPONSE/;
 
 // One typed word for any failure to reach the health route, from Node codes or Chromium names. A
-// certificate code is checked first and wins over everything else.
+// certificate failure is checked first, as a Node code or a Chromium ERR_CERT_* name, and wins over
+// everything else: an answer with a certificate problem is never read as one without TLS (which, for a
+// server on this computer, is followed by a retry over plain http).
 function failureKind(e) {
   const code = errorCode(e);
   if (code && TLS_CODES.has(code)) return 'tls-untrusted';
-  if (code && NO_TLS_CODES.has(code)) return 'tls-not-offered';
   const text = String((e && e.message) || '') + ' ' + String((e && e.cause && e.cause.message) || '');
+  if (CHROMIUM_CERT.test(text)) return 'tls-untrusted';
+  if (code && NO_TLS_CODES.has(code)) return 'tls-not-offered';
   // Before the network codes: Node reports the same answer as EPROTO, which alone reads as a transport failure.
   if (NO_TLS_MESSAGE.test(text)) return 'tls-not-offered';
   if (code && KNOWN_NETWORK_CODES.has(code)) return 'unreachable';
@@ -138,7 +155,7 @@ function failureKind(e) {
 /**
  * @param {string} input          what the person typed
  * @param {{ httpJson: (url: string, init?: object) => Promise<{ ok: boolean, status: number, json: () => Promise<any> }> }} deps
- * @returns {Promise<{ kind: string, origin?: string, host?: string, from?: string, loopback?: boolean }>}
+ * @returns {Promise<{ kind: string, origin?: string, host?: string, from?: string, loopback?: boolean, plainHttp?: boolean, plainHttpAddress?: string }>}
  */
 async function probeServer(input, { httpJson }) {
   const n = normalizeInput(input);
@@ -146,19 +163,25 @@ async function probeServer(input, { httpJson }) {
   const first = await probeOrigin(n, { httpJson });
   if (first.kind !== 'tls-not-offered') return first;
   // The server answered without TLS. On this computer, for an address typed without a scheme, that is a
-  // local server on plain http: it is asked once more over http on the same port. Its answer is taken when
-  // something answered at all (a DockVault server, or one that says what did answer); otherwise the https
-  // outcome stands. A remote address, or one typed with a scheme, is never retried.
-  const plain = n.isLoopback && !n.schemeTyped ? plainHttpOrigin(n.origin) : null;
-  if (!plain) return { ...first, loopback: n.isLoopback === true };
+  // local server on plain http: it is asked once more over http on the same port. Its answer is taken only
+  // when it is a DockVault server (ok or degraded); anything else — nothing on http, something that is not
+  // DockVault, a redirect onto an address that is refused — leaves the https outcome standing, so the screen
+  // never answers for a plain-http address the person did not type. A remote address, or one typed with a
+  // scheme, is never retried.
+  const loopback = n.isLoopback === true;
+  const address = loopback ? plainHttpAddress(n.origin) : null;
+  const outcome = address ? { ...first, loopback, plainHttpAddress: address } : { ...first, loopback };
+  const plain = loopback && !n.schemeTyped ? plainHttpOrigin(n.origin) : null;
+  if (!plain) return outcome;
   const second = await probeOrigin({ origin: plain, host: hostOf(plain), isLoopback: true }, { httpJson });
-  if (second.kind === 'unreachable' || second.kind === 'tls-not-offered') return { ...first, loopback: true };
+  if (second.kind !== 'ok' && second.kind !== 'degraded') return outcome;
   // A redirect is said against what the person typed, not against the http spelling of it: a portless
   // "localhost" asked again on its port is the same server, not a redirect.
   delete second.from;
   if (second.host !== n.host && second.origin !== plain) second.from = n.host;
-  // The person did not choose plain http; the screen says it was used.
-  if ((second.kind === 'ok' || second.kind === 'degraded') && /^http:/i.test(second.origin)) second.plainHttp = true;
+  // The person did not choose plain http; the screen says it was used. A local http server that sends the
+  // check on to https lands there, and nothing is said about plain http.
+  if (/^http:/i.test(second.origin)) second.plainHttp = true;
   return second;
 }
 
@@ -197,4 +220,4 @@ async function probeOrigin(n, { httpJson }) {
   return outcome;
 }
 
-module.exports = { normalizeInput, probeServer, failureKind, plainHttpOrigin, TLS_CODES, NO_TLS_CODES, hostOf };
+module.exports = { normalizeInput, probeServer, failureKind, plainHttpOrigin, plainHttpAddress, TLS_CODES, NO_TLS_CODES, hostOf };

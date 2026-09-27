@@ -3021,14 +3021,11 @@ function buildManageIo() {
     },
     configured: () => storedConfig().map((e) => ({ vaultId: e.vaultId, vaultName: e.vaultName, localFolder: e.localFolder, enabled: e.enabled !== false })),
     liveStatus: () => (syncHub ? syncHub.current() : { vaults: [] }),
-    // Shown on the Computers page only, so both hosts go in their readable form.
-    endpoint: () => {
-      const sftp = serverConfig.readSftpEndpoint(dir);
-      return {
-        serverHost: origin() ? hostName.toDisplayAddress(serverProbe.hostOf(origin())) : '',
-        sftp: sftp ? { host: sftp.host.includes(':') ? `[${sftp.host}]` : hostName.toDisplayHost(sftp.host), port: sftp.port } : null,
-      };
-    },
+    // The ASCII forms, as saved: the Computers page shows each readable with its ASCII form beside it (manage-view.js).
+    endpoint: () => ({
+      serverHost: origin() ? serverProbe.hostOf(origin()) : '',
+      sftp: serverConfig.readSftpEndpoint(dir) || null,
+    }),
     remotePathFor: (vaultId, via, vaultName) => (via === 'device' ? deviceRemotePath(vaultId) : (vaultName ? syncConfig.remotePathForVault(vaultName) : null)),
     revokeGrant: (deviceId, vaultId) => accountCall('POST', `/devices/${encodeURIComponent(deviceId)}/grants/${encodeURIComponent(vaultId)}/revoke`),
     revokeDevice: (deviceId) => accountCall('POST', `/devices/${encodeURIComponent(deviceId)}/revoke`),
@@ -3097,7 +3094,8 @@ function buildWizardIo(win) {
       try {
         const read = deviceSecretStore.readDeviceSecret(safeStorage, dir, origin);
         deviceStatus = (read && read.status) || 'absent';
-        if (read && read.status === 'absent-for-this-server' && read.otherOrigin) otherServerHost = hostName.toDisplayAddress(serverProbe.hostOf(read.otherOrigin));
+        // The server this computer would be moved off: named readable, with its ASCII form beside it when they differ.
+        if (read && read.status === 'absent-for-this-server' && read.otherOrigin) otherServerHost = hostName.addressWithAscii(serverProbe.hostOf(read.otherOrigin));
         if (read && read.secret) { try { deviceSecretStore.zeroizeSecret(read.secret); } catch { /* best-effort */ } read.secret = null; }
       } catch { deviceStatus = 'unreadable'; }
       if (deviceStatus === 'stale' && !deviceIdentityStale) { try { if (deviceSecretStore.hasRotatingMarker(dir)) deviceStatus = 'rechecking'; } catch { /* keep stale */ } }
@@ -3669,8 +3667,9 @@ async function openSignInAfterSetup() {
 // window of its own to take down.
 async function changeServer({ onConsent = null } = {}) {
   const s = serverConfigState();
-  const shownHost = s.origin ? hostName.toDisplayAddress(serverProbe.hostOf(s.origin)) : '';
-  const consent = trayPresentation.changeServerConsent(shownHost);
+  const asciiHost = s.origin ? serverProbe.hostOf(s.origin) : '';
+  // The consent names the server readable, with its ASCII form beside it when the two differ.
+  const consent = trayPresentation.changeServerConsent(hostName.addressWithAscii(asciiHost));
   let res;
   try {
     res = await dialog.showMessageBox(mainWindow, {
@@ -3680,8 +3679,9 @@ async function changeServer({ onConsent = null } = {}) {
   } catch { return false; }
   if (!res || res.response !== 1) return false;
   if (onConsent) { try { onConsent(); } catch { /* the caller's window is not load-bearing */ } }
-  // Pre-fills for the setup screen, in the readable form: whatever is typed back goes through the verify again.
-  changeHost = shownHost || null;
+  // Pre-fills for the setup screen, in the readable form alone (a field holds an address, not a note): whatever
+  // is typed back goes through the verify again.
+  changeHost = hostName.toDisplayAddress(asciiHost) || null;
   changeSftp = s.sftp ? sftpEndpoint.displaySftpEndpoint(s.sftp) : null;
   await forgetServerRelationship(s.origin);
   setupMode = 'change';

@@ -121,13 +121,17 @@
     whatEl.textContent = text;
   }
 
+  // The SFTP address a light names: readable, with the ASCII form the network uses beside it when main says
+  // the two differ ("τεστ:2322 (xn--qxa2abc:2322)"), so a look-alike name is exposed where the door is trusted.
   function endpointText(leg) {
     if (!leg || !leg.host) return 'that address';
     const h = leg.host.includes(':') ? `[${leg.host}]` : leg.host;
-    return `${h}:${leg.port}`;
+    const ascii = typeof leg.ascii === 'string' && leg.ascii && leg.ascii !== leg.host ? ` (${leg.ascii}:${leg.port})` : '';
+    return `${h}:${leg.port}${ascii}`;
   }
 
-  // The API leg's sentence. Only the host of the normalised origin is ever shown, never an error.
+  // The API leg's sentence. Only the host of the normalised origin is ever shown (main gives it with its ASCII
+  // form beside it when the two differ), never an error.
   function apiSentence(outcome) {
     const host = (outcome && outcome.host) || '';
     // Said whenever plain http was used without the person asking for it (a server on this computer that
@@ -142,8 +146,10 @@
       case 'unreachable': return `Couldn't reach ${host}. Check the address and your connection.`;
       case 'tls-untrusted': return "This server's certificate isn't trusted by this computer, so DockVault won't connect. Ask your administrator to install the certificate on this computer.";
       // Something answered, but not over HTTPS: there is no certificate involved, so none is mentioned.
+      // For a server on this computer, main hands over the plain-http address with its port written out
+      // ("http://localhost:443"): the server that answered, never whatever listens on port 80.
       case 'tls-not-offered': return outcome.loopback
-        ? `${host} answered, but not over HTTPS. If it's a test server on this computer that uses plain HTTP, enter http://${host}.`
+        ? `${host} answered, but not over HTTPS. If it's a test server on this computer that uses plain HTTP, ${typeof outcome.plainHttpAddress === 'string' && outcome.plainHttpAddress ? `enter ${outcome.plainHttpAddress}` : 'enter its address with http:// and the port'}.`
         : `${host} answered, but not over HTTPS. A server on another computer must offer HTTPS — check the address and port with whoever runs it.`;
       case 'not-dockvault': return "That address answers, but it isn't a DockVault server. Check the address with whoever runs it.";
       case 'redirected': return 'That address redirects somewhere else. Enter the address it lands on.';
