@@ -120,11 +120,11 @@ app.whenReady().then(async () => {
   row('two-vaults', !!VID_A && !!VID_B, { device: !!VID_A, account: !!VID_B });
   if (!VID_A || !VID_B) { dump(); app.exit(2); return; }
 
-  const reg = await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Lock proof laptop', dir, safeStorage });
+  const reg = await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Lock proof laptop', dir, safeStorage }, { fetchFn: httpJson });
   row('register', reg.ok === true, reg.ok ? 'ok' : reg.reason);
   // Vault A is granted to this computer (device path). Vault B is deliberately NOT granted and NOT recorded
   // here, so it stays on the account path — the vault the lock must pause.
-  const g = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: reg.deviceId, vaultId: VID_A, vaultType: 'standard', vaultName: NAME_A, vaultPassword: VPW, dir, safeStorage });
+  const g = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: reg.deviceId, vaultId: VID_A, vaultType: 'standard', vaultName: NAME_A, vaultPassword: VPW, dir, safeStorage }, { fetchFn: httpJson });
   row('grant-device-vault-only', g.ok === true && g.recorded === true, g.ok ? 'ok' : g.reason);
 
   // ---- the real app pieces --------------------------------------------------------------------------
@@ -313,7 +313,7 @@ app.whenReady().then(async () => {
 
   // ---- clean up ---------------------------------------------------------------------------------------
   autoLock.stop();
-  await forgetDevice({ serverOrigin: API, accountToken: JWT, dir, safeStorage });
+  await forgetDevice({ serverOrigin: API, accountToken: JWT, dir, safeStorage }, { fetchFn: httpJson });
   for (const vid of [VID_A, VID_B]) await api(`/vaults/${vid}/delete`, { method: 'POST', headers: auth(JWT, jsonHeaders()), body: JSON.stringify({ password: VPW }) }).catch(() => null);
   mgr.stop();
   await sleep(500);

@@ -113,11 +113,11 @@ app.whenReady().then(async () => {
   const probe = await checkDeviceSyncSupported({ serverOrigin: API, accountToken: JWT }, recFetch);
   const emptyStore = deviceSecretStore.readDeviceSecret(safeStorage, dir, API).status;
   row('probe-and-empty-store-allow-registration', probe.supported === true && probe.reason === 'ok' && emptyStore === 'absent' && mayRegisterHere(emptyStore) === true, { probe: probe.supported, reason: probe.reason, store: emptyStore });
-  const reg = await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Wiring proof laptop', dir, safeStorage });
+  const reg = await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Wiring proof laptop', dir, safeStorage }, { fetchFn: httpJson });
   const DEV = reg.deviceId;
   row('register-creates-the-identity', reg.ok === true && heldSecret().status === 'ok', reg.ok ? 'ok' : reg.reason);
-  row('a-second-registration-is-refused-over-a-live-identity', mayRegisterHere(heldSecret().status) === false && (await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Second', dir, safeStorage })).reason === 'already-registered');
-  const g1 = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: DEV, vaultId: VID, vaultType: 'standard', vaultName: NAME, vaultPassword: PW1, dir, safeStorage });
+  row('a-second-registration-is-refused-over-a-live-identity', mayRegisterHere(heldSecret().status) === false && (await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Second', dir, safeStorage }, { fetchFn: httpJson })).reason === 'already-registered');
+  const g1 = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: DEV, vaultId: VID, vaultType: 'standard', vaultName: NAME, vaultPassword: PW1, dir, safeStorage }, { fetchFn: httpJson });
   row('grant-is-created-and-recorded', g1.ok === true && g1.recorded === true && !!deviceGrantStore.getGrantMeta(safeStorage, dir, VID), g1.ok ? 'ok' : g1.reason);
   const m1 = await mintNow();
   row('the-vault-mints-on-the-device-identity', m1.minted === true, m1);
@@ -126,7 +126,7 @@ app.whenReady().then(async () => {
   const rot = await api(`/vaults/${VID}/password`, { method: 'PUT', headers: auth(JWT, jsonHeaders()), body: JSON.stringify({ current_password: PW1, new_password: PW2 }) });
   const m2 = await mintNow();
   row('a-changed-vault-password-refuses-the-mint-as-needing-re-proof', rot.ok === true && m2.refused === 'grant-needs-reproof', { rotated: rot.ok, refused: m2.refused });
-  const g2 = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: DEV, vaultId: VID, vaultType: 'standard', vaultName: NAME, vaultPassword: PW2, dir, safeStorage });
+  const g2 = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: DEV, vaultId: VID, vaultType: 'standard', vaultName: NAME, vaultPassword: PW2, dir, safeStorage }, { fetchFn: httpJson });
   const m3 = await mintNow();
   row('proving-the-new-password-once-restores-sync', g2.ok === true && m3.minted === true, { grant: g2.ok, mint: m3 });
 
@@ -211,20 +211,20 @@ app.whenReady().then(async () => {
     { afterRetirement: afterRetirement.map((c) => c.method + ' ' + c.url.replace(API, '')), whileItWasStillCurrent: beforeRetirement.length });
 
   // ---- 6. THE SET-UP-AGAIN DOOR: forget, register, re-grant ------------------------------------------
-  const fg = await forgetDevice({ serverOrigin: API, accountToken: JWT, dir, safeStorage });
+  const fg = await forgetDevice({ serverOrigin: API, accountToken: JWT, dir, safeStorage }, { fetchFn: httpJson });
   const afterForget = deviceSecretStore.readDeviceSecret(safeStorage, dir, API).status;
   row('forget-clears-the-identity-and-its-marks', fg.cleared === true && afterForget === 'absent' && mayRegisterHere(afterForget) === true, { cleared: fg.cleared, status: afterForget });
   const removedDecision = await selectorFor().begin(VID);
   row('before-the-door-runs-the-vault-refuses-as-removed', removedDecision.ok === false && removedDecision.reason === 'device-removed', removedDecision);
-  const reg2 = await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Wiring proof laptop again', dir, safeStorage });
-  const g3 = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: reg2.deviceId, vaultId: VID, vaultType: 'standard', vaultName: NAME, vaultPassword: PW2, dir, safeStorage });
+  const reg2 = await registerDevice({ serverOrigin: API, accountToken: JWT, label: 'Wiring proof laptop again', dir, safeStorage }, { fetchFn: httpJson });
+  const g3 = await deviceGrant.grantAndRecord({ serverOrigin: API, accountToken: JWT, deviceId: reg2.deviceId, vaultId: VID, vaultType: 'standard', vaultName: NAME, vaultPassword: PW2, dir, safeStorage }, { fetchFn: httpJson });
   const afterDoor = await selectorFor().begin(VID);
   const m4 = await mintNow();
   row('the-door-rewrites-the-record-so-the-refusal-clears-and-sync-returns', reg2.ok === true && g3.ok === true && g3.recorded === true && afterDoor.ok === true && afterDoor.via === 'device' && m4.minted === true,
     { register: reg2.ok, grant: g3.ok, recorded: g3.recorded, decision: afterDoor.ok ? afterDoor.via : afterDoor.reason, mint: m4 });
 
   // ---- clean up ---------------------------------------------------------------------------------------
-  await forgetDevice({ serverOrigin: API, accountToken: JWT, dir, safeStorage });
+  await forgetDevice({ serverOrigin: API, accountToken: JWT, dir, safeStorage }, { fetchFn: httpJson });
   await api(`/vaults/${VID}/delete`, { method: 'POST', headers: auth(JWT, jsonHeaders()), body: JSON.stringify({ password: PW2 }) }).catch(() => null);
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 
