@@ -6,8 +6,9 @@
  * guards against a tightened policy silently breaking the reused UI.
  *
  * It reuses the real scheme and policy modules (not a reimplementation), loads dockvault://app/, and
- * asserts: the document rendered (title), the UI's main script ran (a top-level classic-script
- * function became a window global), and there were no policy-violation console errors. Writes
+ * asserts: the document rendered (title), the UI's main script and the Activity page's script ran (each
+ * left its top-level function as a window global), every enabled stylesheet the page links was served and
+ * parsed, and there were no policy-violation console errors. Writes
  * .local/spa-boot-check.json.
  *
  *   node_modules/electron/dist/electron.exe test/spa-boot-check.js
@@ -51,11 +52,20 @@ app.whenReady().then(async () => {
   out.probe = await win.webContents.executeJavaScript(`({
     title: document.title,
     mainScriptRan: typeof window.apiRequest === 'function',  // a top-level UI function => it executed under the policy
+    activityScriptRan: typeof window.initActivity === 'function', // the Activity page's own script, loaded after app.js
+    // Every enabled stylesheet the page links was served and parsed (a missing or mistyped file has no rules).
+    sheets: [...document.querySelectorAll('link[rel="stylesheet"]:not([disabled])')].map((l) => {
+      let rules = -1; try { rules = l.sheet ? l.sheet.cssRules.length : -1; } catch (e) { rules = -2; }
+      return { href: new URL(l.href).pathname, rules };
+    }),
     hasBodyChildren: document.body ? document.body.children.length : 0,
     isSecureContext: window.isSecureContext,
   })`, true);
 
-  out.ok = !!(out.probe && out.probe.mainScriptRan && out.probe.isSecureContext) && out.cspViolations.length === 0;
+  const sheets = (out.probe && out.probe.sheets) || [];
+  out.sheetsOk = sheets.length > 0 && sheets.every((x) => x.rules > 0);
+  out.ok = !!(out.probe && out.probe.mainScriptRan && out.probe.activityScriptRan && out.probe.isSecureContext)
+    && out.sheetsOk && out.cspViolations.length === 0;
   clearTimeout(watchdog);
   dump();
   win.destroy();

@@ -69,3 +69,29 @@ test('proxyRequest does not auto-follow redirects (anti-SSRF)', async () => {
   await proxyRequest({ url: 'dockvault://app/x', method: 'GET', headers: new Headers() }, 'https://v.example', fakeNet);
   assert.strictEqual(seen.redirect, 'manual');
 });
+
+// A change to a zero-knowledge vault's keys carries a proof in the X-ZK-Key-Proof header whose MACs cover
+// the exact bytes of the body, so the forwarder must pass the header untouched and the body byte for byte:
+// an added, dropped or re-encoded byte and the server refuses the change.
+test('a key-proof request reaches the server with its header and its exact body', async () => {
+  const proof = 'v1 c=AbC-123_x; id=dGVzdA; cur=Zm9v; new=YmFy';
+  const body = new Uint8Array([0x7b, 0x22, 0x61, 0x22, 0x3a, 0x22, 0xc3, 0xa9, 0x20, 0x0d, 0x0a, 0x00, 0xff, 0x22, 0x7d]);
+  const req = new Request('dockvault://app/ecc/vaults/7/rekey', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer abc', 'Content-Type': 'application/json', 'X-ZK-Key-Proof': proof },
+    body,
+    duplex: 'half',
+  });
+  let seen;
+  const fakeNet = {
+    fetch: async (target, init) => {
+      seen = { target, init, bytes: new Uint8Array(await new Response(init.body).arrayBuffer()) };
+      return new Response('{}', { status: 200 });
+    },
+  };
+  const res = await proxyRequest(req, 'https://vault.example.com', fakeNet);
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(seen.target, 'https://vault.example.com/ecc/vaults/7/rekey');
+  assert.strictEqual(seen.init.headers.get('x-zk-key-proof'), proof);
+  assert.deepStrictEqual([...seen.bytes], [...body]);
+});
