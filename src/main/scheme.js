@@ -8,6 +8,8 @@
  *   - asset paths ('/', '/index.html', '/static/...') are served from the pinned vendored tree,
  *     contained to the static root (no path traversal), with the shell's own tightened policy header
  *     injected on the HTML document;
+ *   - the interface's download worker ('/download-sw.js') is served from the same pinned tree, never
+ *     forwarded, and it is the only service worker script the scheme ever answers (see below);
  *   - every other path is forwarded to the configured server through the transparent proxy (the UI
  *     computes its API base from its own origin, so its API/auth calls arrive here). With no server
  *     configured yet, those paths return a clean 404.
@@ -31,6 +33,20 @@ const MIME = {
 function contentType(p) { return MIME[path.extname(p).toLowerCase()] || 'application/octet-stream'; }
 
 function isAssetPath(p) { return p === '/' || p === '/index.html' || p.startsWith('/static/'); }
+
+// The streaming-download worker of the bundled interface, at the address the interface registers it
+// under (the server serves it from its root for the same reason: a worker's scope cannot be wider
+// than where its script lives without a header). The interface streams a large download through it,
+// and without it refuses any download larger than it is willing to hold in memory. A service worker
+// controls every page of the origin it is registered on, so this one is served from the pinned tree
+// and nothing else is ever answered as a worker script: a script the server supplied would otherwise
+// sit between the app's pages and everything they load.
+const DOWNLOAD_WORKER_PATH = '/download-sw.js';
+const DOWNLOAD_WORKER_FILE = ['js', 'download-sw.js'];
+// Chromium marks the fetch of a service worker's script (and of every update check) with this header.
+function isWorkerScriptRequest(request) {
+  try { return request.headers.has('service-worker'); } catch { return false; }
+}
 
 // Reserved same-origin path serving a minimal blank page, used by the main process to pre-seed the
 // origin's storage with a restored session before loading the real UI.
@@ -64,6 +80,7 @@ function registerPrivileged() {
       supportFetchAPI: true, // the UI's fetch() resolves against this scheme
       corsEnabled: true,
       stream: true,
+      allowServiceWorkers: true, // the interface's download worker; only the bundled script is served as one
     },
   }]);
 }
@@ -100,12 +117,33 @@ function installHandler(staticRoot, cspHeader, resolveServerOrigin, ses) {
     return new Response(fs.readFileSync(file), { headers });
   }
 
+  function serveDownloadWorker() {
+    const file = path.join(ROOT, ...DOWNLOAD_WORKER_FILE);
+    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
+      return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    }
+    return new Response(fs.readFileSync(file), {
+      headers: {
+        'content-type': 'text/javascript; charset=utf-8',
+        // The same two headers the server sends with it: its scope is the whole origin, and every
+        // registration checks it again instead of keeping a stale copy.
+        'Service-Worker-Allowed': '/',
+        'Cache-Control': 'no-cache',
+      },
+    });
+  }
+
   target.handle(APP_SCHEME, (request) => {
     let pathname;
     try {
       pathname = new URL(request.url).pathname;
     } catch {
       return new Response('bad request', { status: 400 });
+    }
+    if (pathname === DOWNLOAD_WORKER_PATH) return serveDownloadWorker();
+    // No other script may become a service worker of this origin, whoever asks for it.
+    if (isWorkerScriptRequest(request)) {
+      return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } });
     }
     // A minimal, script-free page on the app origin. The main process loads this first when it has a
     // stored session, seeds the session into the origin's storage, then loads the real UI — so the
@@ -132,4 +170,4 @@ function installHandler(staticRoot, cspHeader, resolveServerOrigin, ses) {
   });
 }
 
-module.exports = { registerPrivileged, installHandler, contentType, isAssetPath, resolveShellFile, shellPageUrl, SEED_PATH, SHELL_PATH };
+module.exports = { registerPrivileged, installHandler, contentType, isAssetPath, resolveShellFile, shellPageUrl, SEED_PATH, SHELL_PATH, DOWNLOAD_WORKER_PATH };
