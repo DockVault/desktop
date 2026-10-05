@@ -41,6 +41,8 @@ Windows, macOS, and Linux are treated as first-class targets.
     "Connecting…" and picks up new events within about 15 seconds instead of at once; the notification
     bell catches up within about a minute; and the message that a temporary credential you created has
     just signed in does not pop up (its notification still reaches the bell).
+  - **PDF preview.** A PDF shows as a blank page in the file preview, because the app's window has no PDF
+    viewer. Download the file to read it.
 - **Folder sync** for Standard vaults requires vault 0.28.0 or later, the first release that lets a computer
   sync on its own identity. The client pins the server's SFTP host key and verifies the server with it before
   every sync; it never syncs unverified. Against an older server the app says that the server doesn't
