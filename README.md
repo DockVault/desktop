@@ -21,10 +21,23 @@ Windows, macOS, and Linux are treated as first-class targets.
 
 ## Server requirements
 
-Background sync for Standard vaults requires the server to run DockVault vault 0.27.0 or later — the first
-release that serves its full SFTP host key. The client pins that key to verify the server before it syncs.
-Against an older server, sync degrades gracefully rather than failing: the client pauses and reports that it
-cannot verify the server yet, and never syncs unverified.
+- **The main window** runs the web interface of DockVault vault 0.33.2, bundled with the app. Against vault
+  0.33.2 or later it works as it does in a browser, including the changes to a zero-knowledge vault's keys:
+  creating one, sharing it, rotating its key, and removing a member (which rotates it). From 0.33.2 the
+  server accepts those changes only with a proof the interface makes on this computer, so earlier previews
+  of this app cannot make them against it. Against an older server, sign-in, files and those key changes
+  still work, made the way that server expects them. The Activity page, which holds the audit log since
+  vault 0.33.0, needs vault 0.33.0 or later: against an older server it says it could not load, so use the
+  server's own web page in a browser for the audit log there. The app does not open the server's live
+  connection, so Activity shows "Connecting…" and picks up new events within about 15 seconds instead of
+  at once.
+- **Folder sync** for Standard vaults requires vault 0.28.0 or later, the first release that lets a computer
+  sync on its own identity. The client pins the server's SFTP host key and verifies the server with it before
+  every sync; it never syncs unverified. Against an older server the app says that the server doesn't
+  support syncing folders from this computer, and you can still sign in and use your files.
+- Zero-knowledge vaults are not synced to a folder; they are opened in the main window.
+
+Use the newest vault release: it is the one with every security fix.
 
 ## Repository layout
 
