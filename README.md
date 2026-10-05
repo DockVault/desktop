@@ -26,11 +26,21 @@ Windows, macOS, and Linux are treated as first-class targets.
   creating one, sharing it, rotating its key, and removing a member (which rotates it). From 0.33.2 the
   server accepts those changes only with a proof the interface makes on this computer, so earlier previews
   of this app cannot make them against it. Against an older server, sign-in, files and those key changes
-  still work, made the way that server expects them. The Activity page, which holds the audit log since
-  vault 0.33.0, needs vault 0.33.0 or later: against an older server it says it could not load, so use the
-  server's own web page in a browser for the audit log there. The app does not open the server's live
-  connection, so Activity shows "Connecting…" and picks up new events within about 15 seconds instead of
-  at once.
+  still work, made the way that server expects them. Where it differs:
+  - **Large downloads.** From vault 0.30.0 the interface writes a download to disk as it arrives, through a
+    helper the app serves from its own bundle, so a file of any size downloads in both Standard and
+    zero-knowledge vaults. A server older than 0.30.0 tells the interface to hold each download in memory
+    instead, and the interface then refuses a file larger than 256 MiB. Download such a file from the
+    server's own web page in a browser or, in a Standard vault, through folder sync; or update the server.
+    A server whose administrator has set downloads to be held in memory has the same limit, as it has in a
+    browser.
+  - **Activity.** The Activity page, which holds the audit log since vault 0.33.0, needs vault 0.33.0 or
+    later: against an older server it says it could not load, so use the server's own web page in a browser
+    for the audit log there.
+  - **The live connection.** The app does not open the server's live connection. Activity shows
+    "Connecting…" and picks up new events within about 15 seconds instead of at once; the notification
+    bell catches up within about a minute; and the message that a temporary credential you created has
+    just signed in does not pop up (its notification still reaches the bell).
 - **Folder sync** for Standard vaults requires vault 0.28.0 or later, the first release that lets a computer
   sync on its own identity. The client pins the server's SFTP host key and verifies the server with it before
   every sync; it never syncs unverified. Against an older server the app says that the server doesn't
