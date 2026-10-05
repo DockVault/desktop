@@ -25,7 +25,8 @@ const proxy = require('../src/main/proxy');
 const scheme = require('../src/main/scheme');
 
 const STATIC_ROOT = path.resolve(__dirname, '..', 'vendor', 'vault', 'static');
-const WORKER_SRC = fs.readFileSync(path.join(STATIC_ROOT, 'js', 'download-sw.js'));
+// The app's copy of the pinned worker, with the slot fix (test/download-worker.test.js ties the two).
+const WORKER_SRC = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'web-ui', 'download-sw.js'));
 
 // The handler as installed on a session, with every forward to the server recorded instead of sent.
 function handler() {
@@ -52,12 +53,12 @@ test('the scheme is registered to allow service workers', () => {
   assert.equal(entry.privileges.secure, true, 'and stays a secure context');
 });
 
-test('/download-sw.js is the pinned worker, with the headers the server sends, and never forwarded', async () => {
+test('/download-sw.js is the app\'s worker, with the headers the server sends, and never forwarded', async () => {
   const h = handler();
   for (const headers of [asWorker, {}]) {
     const res = await h(new Request('dockvault://app/download-sw.js', { headers }));
     assert.equal(res.status, 200);
-    assert.ok(Buffer.from(await res.arrayBuffer()).equals(WORKER_SRC), 'the bytes of the pinned file');
+    assert.ok(Buffer.from(await res.arrayBuffer()).equals(WORKER_SRC), 'the bytes of the app\'s copy');
     assert.equal(res.headers.get('content-type'), 'text/javascript; charset=utf-8');
     assert.equal(res.headers.get('service-worker-allowed'), '/');
     assert.equal(res.headers.get('cache-control'), 'no-cache');

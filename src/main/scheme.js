@@ -8,8 +8,9 @@
  *   - asset paths ('/', '/index.html', '/static/...') are served from the pinned vendored tree,
  *     contained to the static root (no path traversal), with the shell's own tightened policy header
  *     injected on the HTML document;
- *   - the interface's download worker ('/download-sw.js') is served from the same pinned tree, never
- *     forwarded, and it is the only service worker script the scheme ever answers (see below);
+ *   - the interface's download worker ('/download-sw.js') is served from the app's own sources (the
+ *     pinned worker with one fix, see below), never forwarded, and it is the only service worker
+ *     script the scheme ever answers;
  *   - every other path is forwarded to the configured server through the transparent proxy (the UI
  *     computes its API base from its own origin, so its API/auth calls arrive here). With no server
  *     configured yet, those paths return a clean 404.
@@ -38,11 +39,14 @@ function isAssetPath(p) { return p === '/' || p === '/index.html' || p.startsWit
 // under (the server serves it from its root for the same reason: a worker's scope cannot be wider
 // than where its script lives without a header). The interface streams a large download through it,
 // and without it refuses any download larger than it is willing to hold in memory. A service worker
-// controls every page of the origin it is registered on, so this one is served from the pinned tree
-// and nothing else is ever answered as a worker script: a script the server supplied would otherwise
-// sit between the app's pages and everything they load.
+// controls every page of the origin it is registered on, so this one is served from the app's own
+// sources and nothing else is ever answered as a worker script: a script the server supplied would
+// otherwise sit between the app's pages and everything they load.
+// The file is the pinned interface's worker with one fix: the pinned worker loses a small download
+// whose bytes are all written before the browser asks for them, so nothing downloads.
+// test/download-worker.test.js holds it to the pinned file plus exactly that fix.
 const DOWNLOAD_WORKER_PATH = '/download-sw.js';
-const DOWNLOAD_WORKER_FILE = ['js', 'download-sw.js'];
+const DOWNLOAD_WORKER_FILE = path.resolve(__dirname, '..', 'web-ui', 'download-sw.js');
 // Chromium marks the fetch of a service worker's script (and of every update check) with this header.
 function isWorkerScriptRequest(request) {
   try { return request.headers.has('service-worker'); } catch { return false; }
@@ -118,7 +122,7 @@ function installHandler(staticRoot, cspHeader, resolveServerOrigin, ses) {
   }
 
   function serveDownloadWorker() {
-    const file = path.join(ROOT, ...DOWNLOAD_WORKER_FILE);
+    const file = DOWNLOAD_WORKER_FILE;
     if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
       return new Response('not found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } });
     }
